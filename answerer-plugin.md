@@ -173,22 +173,23 @@ def search_standard(self):
 | 0 | Plugin pre_search | 最先 | 返回 false 则终止整个搜索 |
 | 1 | External Bang | 最高 | 命中后直接跳转，终止整个搜索流程 |
 | 2 | Answerer | 高 | 命中后**跳过标准搜索**，不调用任何引擎（包括 offline） |
-| 3 | Offline Processor | 中 | 作为标准搜索的一部分，与 online 引擎并行执行 |
-| 4 | Online Processor | 中 | 标准网络搜索 |
+| 3 | Offline Processor | 中 | 作为标准搜索的一部分，与 online 引擎并行执行（如配置了） |
+| 4 | Online Processor | 中 | 标准网络搜索（如配置了 online 引擎） |
 | 5 | Plugin post_search | 最低 | **总是**在所有搜索后执行 |
 
 **关键行为**：
 - `pre_search` 返回 `False` → 终止整个流程，直接跳到 `post_search`
 - Answerer 命中 → 跳过 `search_standard()`，Offline Processor **不会**执行
 - Plugin `post_search` **总是**执行，无论前面发生了什么
+- Online/Offline Processor 是否执行取决于**用户配置的引擎列表**
 
 ### 3.4 三分支执行情况对照表
 
-| 分支场景 | pre_search 结果 | search_standard 执行 | Offline Processor 执行 | post_search 执行 | 网络请求 |
-|----------|----------------|---------------------|------------------------|-----------------|----------|
-| **pre_search 返回 False** | False | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
-| **Answerer 命中** | True | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
-| **Answerer 未命中（正常流程）** | True | ✅ 执行 | ✅ 并行执行 | ✅ 总是执行 | ✅ 有（online 引擎） |
+| 分支场景 | pre_search 结果 | search_standard 执行 | Offline Processor 执行 | Online Processor 执行 | post_search 执行 | 网络请求 |
+|----------|----------------|---------------------|------------------------|-----------------------|-----------------|----------|
+| **pre_search 返回 False** | False | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
+| **Answerer 命中** | True | ❌ 不执行 | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
+| **Answerer 未命中** | True | ✅ 执行 | ✅ 条件执行（如配置） | ✅ 条件执行（如配置） | ✅ 总是执行 | ✅ 条件有（如配置 online 引擎） |
 
 ---
 
