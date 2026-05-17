@@ -75,12 +75,27 @@ Valkey 中存储的所有状态均为**临时状态**，全部带有过期时间
   - 写入：客户端请求 `/client<token>.css` 时调用 `link_token.ping()`
   - 读取：每次 `/search` 请求时调用 `link_token.is_suspicious()` 验证
 
-### 2.4 状态隐私保护
+### 2.4 哈希匿名机制
 
-所有涉及 IP 的 key 均经过 `secret_hash()` 处理（`valkeylib.py:75-87`）：
-- 使用 `server.secret_key` 作为 HMAC-SHA256 密钥
-- 存储的是哈希值而非原始 IP
-- 即使 Valkey 数据泄露也无法反向追溯真实 IP
+**实现细节** (`valkeylib.py:75-87`):
+
+```python
+def secret_hash(name: str):
+    m = hmac.new(bytes(name, encoding='utf-8'), digestmod='sha256')
+    m.update(bytes(get_setting('server.secret_key'), encoding='utf-8'))
+    return m.hexdigest()
+```
+
+**密钥与消息的关系**：
+- 此实现对 HMAC 的使用**非标准**：`name` 作为 HMAC 的密钥，`secret_key` 作为 HMAC 的消息
+- 标准 HMAC 应为 `HMAC(key, message)`，此处实际计算的是 `HMAC(name, secret_key)`
+- 即：待匿名化的标识（如 IP）是密钥，而配置中的 `secret_key` 是被哈希的消息
+
+**可逆风险边界**：
+- **单向性**: HMAC-SHA256 本身是密码学单向函数，无法从哈希输出直接反推输入
+- **暴力破解风险**: 如果 `name` 的取值空间有限（如 IPv4 仅 2^32 种可能），攻击者在**已知 `secret_key`** 的前提下，可以预计算所有可能 `name` 的哈希值，建立彩虹表进行反向匹配
+- **安全前提**: 匿名化的有效性完全依赖 `server.secret_key` 的保密性；若密钥泄露，攻击者可对所有存储的哈希值进行批量脱匿名
+- **隐私保护等级**: 属于"弱匿名化"，而非强加密；可抵御低频偶发查询，但无法对抗有资源的定向攻击
 
 ## 三、与核心功能的协作逻辑
 
@@ -137,63 +152,137 @@ ip_limit.filter_request()  [ip_limit.py:92]
 
 ## 四、后端不可用时的降级路径
 
-### 4.1 连接失败降级
+Valkey 不可用分为两种典型场景，各场景下不同请求路径的异常行为存在显著差异。
 
-**初始化阶段** (`valkeydb.py:61-65`):
-- 捕获 `ValkeyError` 异常
-- 全局 `_CLIENT` 置为 `None`
-- 记录错误日志但不终止应用启动
-- 函数返回 `False`
+### 4.1 场景 A：初始化阶段连接失败
 
-### 4.2 Limiter 降级
+**触发条件**: 应用启动时 `valkey_initialize()` 因连接超时而失败（`valkeydb.py:61-65`）。
 
-**Limiter 初始化** (`limiter.py:236-243`):
-```python
-if not valkey_client:
-    logger.error("The limiter requires Valkey...")
-    if settings['server']['public_instance']:
-        sys.exit(1)  # 公共实例强制要求 Valkey
-    return  # 普通实例静默降级，不启用 limiter
+**全局状态**:
+- `searx.valkeydb._CLIENT = None`
+- `botdetection.valkeydb.CLIENT = None`（因 `botdetection.init()` 仅在 client 为真值时才设置）
+- `limiter._INSTALLED = False`（私有实例）或进程退出（公共实例）
+
+#### 4.1.1 页面主流程异常路径
+
+**首页与搜索页 (`/`, `/search`)**:
+```
+请求到达
+    ↓
+limiter.pre_request 未注册（因 _INSTALLED=False）
+    ↓
+正常执行业务逻辑
+    ↓
+模板渲染调用 link_token.get_token()  [link_token.py:134]
+    ├─> try: get_valkey_client()
+    │   └─> CLIENT is None → raise ValueError
+    └─> except ValueError → return '12345678'
+    ↓
+页面正常渲染，token 固定为 '12345678'
 ```
 
-**降级行为**:
-- `_INSTALLED` 标志保持 `False`
-- `app.before_request(pre_request)` 不会被注册
-- **所有请求直接通过，无限流和机器人检测**
+**结果**: 核心搜索功能**完全正常**，仅失去限流和机器人检测保护。
 
-### 4.3 Link Token 降级
+#### 4.1.2 探针请求异常路径
 
-**Token 获取降级** (`link_token.py:143-148`):
-```python
-try:
-    valkey_client = valkeydb.get_valkey_client()
-except ValueError:
-    return '12345678'  # 返回固定默认值
+**CSS Token 探针 (`/client<token>.css`)**:
+```
+请求到达
+    ↓
+执行 link_token.ping(request, token)  [link_token.py:93]
+    ├─> get_valkey_client()
+    │   └─> CLIENT is None → raise ValueError
+    └─> 异常未被捕获 → 向上抛出
+    ↓
+Flask 返回 500 Internal Server Error
 ```
 
-**降级行为**:
-- Token 固定为 `'12345678'`，失去随机安全性
-- Ping 写入和验证逻辑仍会调用，但因 Valkey 不可用会抛出异常
-- 实际效果等同于机器人检测失效
+**结果**: CSS 探针请求返回 500，但浏览器通常忽略 CSS 加载失败，主页面仍可正常显示。
 
-### 4.4 降级后的系统状态
+**健康检查 (`/healthz`)**:
+- 不经过 limiter 过滤（`limiter.py:154` 特殊处理）
+- 始终返回 200 OK，**无法反映 Valkey 可用性**
 
-| 功能模块 | Valkey 可用时 | Valkey 不可用时 |
-|---------|-------------|----------------|
-| 核心搜索功能 | 正常 | 完全正常，无影响 |
-| 页面渲染 | 正常 | 完全正常，无影响 |
-| 限流功能 | 启用，按阈值限制 | 完全禁用，无任何限制 |
-| 机器人检测 | 启用，拦截可疑请求 | 完全禁用，所有请求放行 |
-| API 限流 | 启用，每小时4次 | 完全禁用，无限制 |
-| 公共实例 | 正常启动 | 启动失败（强制退出） |
-| 私有实例 | 正常启动 | 正常启动（静默降级） |
+#### 4.1.3 降级汇总表
 
-### 4.5 运行时连接中断
+| 请求类型 | 路径 | HTTP 状态 | 用户感知 | 影响程度 |
+|---------|------|----------|---------|---------|
+| 首页 | `/` | 200 | 正常显示 | 无 |
+| 搜索页 | `/search` | 200 | 正常搜索 | 无 |
+| CSS 探针 | `/client<token>.css` | 500 | 无感知（浏览器忽略） | 轻微 |
+| 健康检查 | `/healthz` | 200 | 无 | 无（监控盲点） |
+| API 请求 | `/search?format=json` | 200 | 正常返回 | 无（但无限流） |
 
-当前代码**未实现运行时重连机制**：
-- 初始化成功后，若 Valkey 中途宕机，后续请求会抛出 `ValkeyError`
-- 异常未被业务代码捕获，将导致 500 错误
-- 需重启应用才能重新初始化连接
+### 4.2 场景 B：运行时连接中断
+
+**触发条件**: 初始化成功后 Valkey 服务中途宕机或网络分区。
+
+**全局状态**:
+- `searx.valkeydb._CLIENT` 非空（对象仍存在）
+- `botdetection.valkeydb.CLIENT` 非空
+- `limiter._INSTALLED = True`
+- 但所有 Valkey 命令执行时会抛出 `ValkeyError`
+
+#### 4.2.1 页面主流程异常路径
+
+**所有经过 limiter 的请求**:
+```
+请求到达
+    ↓
+limiter.pre_request() 被调用
+    ↓
+ip_limit.filter_request()  [ip_limit.py:92]
+    ├─> get_valkey_client() → 正常返回客户端对象
+    └─> incr_sliding_window() → 执行 Lua 脚本
+        └─> 连接中断 → raise ValkeyError
+    ↓
+异常未被捕获 → 向上抛出
+    ↓
+Flask 返回 500 Internal Server Error
+```
+
+**结果**: **全站不可用**，所有经过 limiter 的请求均返回 500。
+
+#### 4.2.2 探针请求异常路径
+
+**CSS Token 探针 (`/client<token>.css`)**:
+```
+link_token.ping()
+    ├─> get_valkey_client() → 正常返回
+    └─> valkey_client.set(ping_key, 1, ex=...)
+        └─> 连接中断 → raise ValkeyError
+    ↓
+500 Internal Server Error
+```
+
+**健康检查 (`/healthz`)**:
+- 仍直接返回 200 OK
+- **完全无法检测到此故障**，属于严重监控盲点
+
+#### 4.2.3 降级汇总表
+
+| 请求类型 | 路径 | HTTP 状态 | 用户感知 | 影响程度 |
+|---------|------|----------|---------|---------|
+| 首页 | `/` | 500 | 错误页面 | 严重 |
+| 搜索页 | `/search` | 500 | 错误页面 | 严重 |
+| CSS 探针 | `/client<token>.css` | 500 | 无感知 | 轻微 |
+| 健康检查 | `/healthz` | 200 | 无 | 严重（监控失效） |
+| API 请求 | `/search?format=json` | 500 | 错误响应 | 严重 |
+
+### 4.3 公共实例 vs 私有实例的降级差异
+
+| 场景 | 公共实例 (`public_instance=true`) | 私有实例 (`public_instance=false`) |
+|------|-----------------------------------|-----------------------------------|
+| 初始化失败 | `sys.exit(1)` 强制退出，拒绝启动 | 静默降级，应用正常启动但 limiter 不启用 |
+| 运行时中断 | 全站 500 错误 | 全站 500 错误 |
+| 设计意图 | 安全优先，宁停勿滥 | 可用性优先，降级运行 |
+
+### 4.4 现有降级机制的缺陷
+
+1. **运行时中断无容错**: 初始化成功后的连接中断没有任何重试或降级逻辑，直接全站 500
+2. **健康检查盲点**: `/healthz` 不检查 Valkey 可用性，无法通过常规监控发现故障
+3. **部分失败未隔离**: CSS 探针失败不会影响主流程，但搜索主流程中的 Valkey 失败会导致整体失败
+4. **无熔断机制**: 连续失败后不会自动切断 Valkey 依赖，也不会进入 limp mode
 
 ## 五、关键设计决策分析
 
@@ -222,14 +311,22 @@ except ValueError:
 - 无限流保护可能导致实例被搜索引擎封禁
 - 强制 Valkey 依赖是合理的安全权衡
 
+### 5.4 非标准 HMAC 使用
+
+**决策依据**:
+- 代码可能存在历史原因或笔误导致的参数顺序颠倒
+- 实际效果仍能实现单向映射，但安全假设与标准 HMAC 不同
+- 只要 `secret_key` 不泄露，仍能提供合理的匿名化效果
+
 ## 六、总结
 
 Valkey 在 SearXNG 中扮演**安全防护层**的角色，而非核心业务存储。其状态管理具有以下特征：
 
 1. **状态临时性**: 所有数据均带 TTL，重启即清零
-2. **隐私保护性**: IP 等敏感信息均以哈希形式存储
-3. **优雅降级**: 私有实例可在无 Valkey 环境下正常运行
+2. **隐私保护条件性**: IP 等敏感信息以 HMAC 哈希形式存储，匿名化有效性依赖 `secret_key` 保密性，在密钥泄露或取值空间有限时存在脱匿名风险
+3. **降级不一致性**: 初始化失败时私有实例可优雅降级，但运行时中断会导致全站不可用
 4. **原子性保障**: 计数操作通过 Lua 脚本保证分布式一致性
 5. **功能边界清晰**: 仅用于限流和机器人检测，不涉及查询历史等业务数据
+6. **监控盲点**: 健康检查不覆盖 Valkey 状态，运行时故障难以被及时发现
 
-当 Valkey 不可用时，系统从"安全防护模式"降级为"裸奔模式"，核心搜索功能不受影响，但失去所有反滥用保护。
+当 Valkey 不可用时，系统的表现取决于故障发生时机：初始化阶段失败仅失去安全防护，核心功能仍可用；运行时中断则会导致全站 500 错误。
