@@ -334,11 +334,23 @@ result_container.add_unresponsive_engine(self.engine.name, error_message)
 # error_message 格式："httpx.TimeoutException"
 ```
 
-**入口 2：主线程 join 超时**（`searx/search/__init__.py:157`）
+**入口 2：主线程 join 超时**（双阶段处理）
+
+阶段 1（`searx/search/__init__.py:157`）：主线程立即标记
 ```python
 # 线程仍存活，超过 actual_timeout 时
+th._timeout = True  # 设置标记供子线程读取
 self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
 # error_message 格式："timeout"（纯字符串）
+```
+
+阶段 2（`searx/search/processors/abstract.py:216-218`）：子线程完成后二次处理
+```python
+if getattr(threading.current_thread(), '_timeout', False):
+    # 子线程检测到主线程已放弃等待
+    self.handle_exception(result_container, 'timeout', False)
+    # 再次 add_unresponsive_engine（set 自动去重）
+    # counter_inc 错误计数+1，count_error 记录错误详情
 ```
 
 **入口 3：引擎已被暂停**（`searx/search/processors/abstract.py:227-228`）
@@ -538,11 +550,11 @@ if result_container.redirect_url:
 ```
 
 **关键特性**：
-- ✅ 不创建任何引擎线程
-- ✅ 不调用 `search_standard()`
-- ✅ 不计算 `actual_timeout`
-- ✅ 完全没有网络请求
-- ✅ 零超时风险
+- ✅ 不创建任何引擎线程（源码依据：`search_external_bang()` 返回 `True` 跳过线程创建）
+- ✅ 不调用 `search_standard()`（源码依据：`Search.search()` 短路逻辑）
+- ✅ 不计算 `actual_timeout`（源码依据：`_get_requests()` 未执行）
+- ✅ 无 SearXNG 发起的网络请求（源码依据：`get_bang_url()` 为纯字符串拼接）
+- ✅ 无 SearXNG 侧超时风险（源码依据：不进入网络请求主链）
 
 ### 5.3 Answerers 本地计算绕过
 
