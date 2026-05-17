@@ -182,6 +182,14 @@ def search_standard(self):
 - Answerer 命中 → 跳过 `search_standard()`，Offline Processor **不会**执行
 - Plugin `post_search` **总是**执行，无论前面发生了什么
 
+### 3.4 三分支执行情况对照表
+
+| 分支场景 | pre_search 结果 | search_standard 执行 | Offline Processor 执行 | post_search 执行 | 网络请求 |
+|----------|----------------|---------------------|------------------------|-----------------|----------|
+| **pre_search 返回 False** | False | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
+| **Answerer 命中** | True | ❌ 不执行 | ❌ 不执行 | ✅ 总是执行 | ❌ 无 |
+| **Answerer 未命中（正常流程）** | True | ✅ 执行 | ✅ 并行执行 | ✅ 总是执行 | ✅ 有（online 引擎） |
+
 ---
 
 ## 四、Plugin Hook 执行时序详解
