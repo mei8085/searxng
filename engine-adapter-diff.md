@@ -283,7 +283,32 @@ SearxEngineException
         └── SearxEngineTooManyRequestsException
 ```
 
-### 5.2 各引擎错误检测实现
+### 5.2 错误检测层级架构
+
+SearXNG 采用双层错误检测架构：
+
+```
+┌─────────────────────────────────────────────────┐
+│          网络层通用错误检测 (所有引擎共享)        │
+├─────────────────────────────────────────────────┤
+│ raise_for_httperror()                            │
+│ ├─ Cloudflare CAPTCHA 检测                       │
+│ ├─ ReCAPTCHA 检测                                │
+│ ├─ HTTP 402/403 → AccessDenied                   │
+│ └─ HTTP 429 → TooManyRequests                    │
+└─────────────────────┬───────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────┐
+│          引擎层自定义错误检测 (可选实现)         │
+├─────────────────────────────────────────────────┤
+│ Google: detect_google_sorry()  ✓                │
+│ DuckDuckGo: is_ddg_captcha()  ✓                 │
+│ Bing: (无自定义检测) ✗                           │
+│ Yahoo: (无自定义检测) ✗                          │
+└─────────────────────────────────────────────────┘
+```
+
+### 5.3 各引擎错误检测实现对比
 
 #### Google 的多模式 CAPTCHA 检测
 ```python
@@ -300,6 +325,9 @@ def detect_google_sorry(resp):
         raise SearxEngineCaptchaException()
 ```
 
+**检测时机**：在 `response()` 函数开头调用，优先于结果解析
+**检测粒度**：3 种模式全覆盖，误判率低
+
 #### DuckDuckGo 的表单式 CAPTCHA 检测
 ```python
 # duckduckgo.py:458-462
@@ -311,26 +339,106 @@ if is_ddg_captcha(doc):
     raise SearxEngineCaptchaException(suspended_time=0, message=f"CAPTCHA ({params['data'].get('kl')})")
 ```
 
-#### 通用 HTTP 状态码检测
+**检测时机**：DOM 解析后、结果提取前
+**特殊处理**：设置 `suspended_time=0`，不触发 IP 封禁
+
+#### Bing 的依赖式错误检测
+
+Bing **没有**在引擎层面实现自定义错误检测逻辑，完全依赖网络层的通用错误检测：
+
+1. **通用状态码检测**（网络层自动处理）：
+   - HTTP 402/403 → `SearxEngineAccessDeniedException`
+   - HTTP 429 → `SearxEngineTooManyRequestsException`
+   - Cloudflare / ReCAPTCHA → `SearxEngineCaptchaException`
+
+2. **区域重定向处理**：
 ```python
-# network/raise_for_httperror.py:76-78
-if resp.status_code in [402, 403]:
+# bing.py:115-117
+# 某些地区（如中国）存在地理封锁，www.bing.com 会重定向到区域版本
+params["allow_redirects"] = True
+```
+
+**检测特点**：
+- 无引擎特定错误模式
+- 依赖 HTTP 状态码和通用 CDN 检测
+- 错误粒度较粗，无法识别 Bing 特有的软封禁
+
+#### Yahoo 的极简错误检测
+
+Yahoo **同样没有**实现自定义错误检测，完全依赖网络层通用检测：
+
+1. **通用状态码检测**（网络层自动处理）
+2. **无特殊处理逻辑**：既无 CAPTCHA 检测，也无状态码映射
+3. **静默失败风险**：当 Yahoo 返回空结果或登录页面时，无法识别为错误
+
+**检测特点**：
+- 最简化的错误处理策略
+- 可能出现"伪成功"（返回异常页面但状态码为 200）
+- 错误识别率最低
+
+### 5.4 四引擎错误检测能力矩阵
+
+| 检测维度 | Google | DuckDuckGo | Bing | Yahoo |
+|---------|--------|-----------|------|-------|
+| 自定义 CAPTCHA 检测 | ✓ 多模式 | ✓ 表单检测 | ✗ | ✗ |
+| HTTP 状态码检测 | ✓ | ✓ | ✓ | ✓ |
+| Cloudflare 检测 | ✓ | ✓ | ✓ | ✓ |
+| ReCAPTCHA 检测 | ✓ | ✓ | ✓ | ✓ |
+| 软封禁识别 | ✓ | ✓ | ✗ | ✗ |
+| 响应内容检测 | ✓ | ✓ | ✗ | ✗ |
+| 错误粒度 | 细 | 中 | 粗 | 最粗 |
+| 误报率 | 低 | 低 | 中 | 高 |
+| 漏报率 | 低 | 低 | 中 | 高 |
+
+### 5.5 网络层通用错误检测详解
+
+```python
+# network/raise_for_httperror.py:16-78
+
+# 1. Cloudflare 挑战检测
+def is_cloudflare_challenge(resp):
+    if resp.status_code in [429, 503]:
+        if ('__cf_chl_jschl_tk__=' in resp.text) or \
+           ('/cdn-cgi/challenge-platform/' in resp.text ...):
+            return True
+    if resp.status_code == 403 and '__cf_chl_captcha_tk__=' in resp.text:
+        return True
+    return False
+
+# 2. Cloudflare 防火墙检测
+def is_cloudflare_firewall(resp):
+    return resp.status_code == 403 and \
+           '<span class="cf-error-code">1020</span>' in resp.text
+
+# 3. 通用状态码映射
+if resp.status_code in (402, 403):
     raise SearxEngineAccessDeniedException(message='HTTP error ' + str(resp.status_code))
-elif resp.status_code == 429:
+if resp.status_code == 429:
     raise SearxEngineTooManyRequestsException()
 ```
 
-### 5.3 错误处理策略差异
+**Cloudflare 特殊暂停时间**：
+- Cloudflare CAPTCHA：默认暂停 2 周（`search.suspended_times.cf_SearxEngineCaptcha`）
+- Cloudflare 防火墙：暂停时间更长（`search.suspended_times.cf_SearxEngineAccessDenied`）
+
+### 5.6 错误处理策略差异
 
 | 异常类型 | 默认暂停时间 | 配置项 |
 |---------|-------------|--------|
 | SearxEngineAccessDeniedException | 86400 秒 (1 天) | search.suspended_times.SearxEngineAccessDenied |
 | SearxEngineCaptchaException | 86400 秒 (1 天) | search.suspended_times.SearxEngineCaptcha |
 | SearxEngineTooManyRequestsException | 3660 秒 (约 1 小时) | search.suspended_times.SearxEngineTooManyRequests |
+| Cloudflare CAPTCHA | 1209600 秒 (2 周) | search.suspended_times.cf_SearxEngineCaptcha |
+| Cloudflare Firewall | 更长 | search.suspended_times.cf_SearxEngineAccessDenied |
 
-**特殊策略：**
-- DuckDuckGo 的 CAPTCHA 异常设置 `suspended_time=0`，不会导致 IP 被封锁
+**引擎特定策略**：
+- DuckDuckGo：CAPTCHA 异常设置 `suspended_time=0`，不会导致 IP 被封锁
+- Google：多层检测，一旦触发即严格封禁
+- Bing/Yahoo：无自定义策略，完全遵循通用规则
+
+**通用递增策略**：
 - 连续错误会导致暂停时间递增（`search.ban_time_on_fail` → `search.max_ban_time_on_fail`）
+- 成功请求后重置错误计数
 
 ## 6. 适配框架的抽象统一机制
 
