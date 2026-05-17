@@ -413,8 +413,10 @@ processor_types = {
 | 引擎模块加载发生 `SyntaxError`/`ImportError`/`RuntimeError` 等 | `searx/engines/__init__.py:126` | `sys.exit(1)` |
 | 引擎名称重复冲突 | `searx/engines/__init__.py:254` | `sys.exit(1)` |
 | 引擎快捷方式重复冲突 | `searx/engines/__init__.py:259` | `sys.exit(1)` |
-| 插件配置中指定的类不存在 | `searx/plugins/_core.py:227` | `raise ValueError` |
-| 插件 ID 冲突 | `searx/plugins/_core.py:239` | `raise KeyError` |
+| 插件模块导入失败后 cls 为空并抛 ValueError 终止 | `searx/plugins/_core.py:225-227` | `raise ValueError` |
+| 插件实例化失败（构造函数抛异常） | `searx/plugins/_core.py:228` | 异常未捕获，向上传播 |
+| 插件 ID 冲突 | `searx/plugins/_core.py:236-239` | `raise KeyError` |
+| 插件 `init()` 方法抛出异常 | `searx/plugins/_core.py:249-250` | 异常未捕获，向上传播 |
 | limiter 初始化失败（特定条件） | `searx/limiter.py:242` | `sys.exit(1)` |
 
 ### 9.2 可回退场景（记录错误，继续运行）
