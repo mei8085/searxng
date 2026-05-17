@@ -538,11 +538,21 @@ result_container.close()
 
 ### 7.4 多来源共存场景
 
-当查询同时产生多个来源的答案时：
-1. Answerer 结果先加入 answers 集合
-2. Offline Processor 结果在 search_standard 中加入
+**核心前提（无例外）**：
+- **Answerer 命中时**：`search_standard()` 被完全跳过，Offline Processor 不执行，只有 Answerer + Plugin 可能产生结果
+- **Answerer 未命中时**：进入标准搜索流程，Offline Processor 执行，才可能出现 Offline + Online + Plugin 多来源共存
+
+**两种场景的结果来源对比**：
+
+| 场景 | Offline 结果 | Online 结果 | Plugin 结果 | Answerer 结果 |
+|------|-------------|-------------|-------------|---------------|
+| Answerer 命中 | ❌ 无 | ❌ 无 | ✅ 有（post_search） | ✅ 有 |
+| Answerer 未命中 | ✅ 有（如配置了 offline 引擎） | ✅ 有 | ✅ 有（post_search） | ❌ 无 |
+
+**当 Answerer 未命中时，答案加入顺序为**：
+1. Offline Processor 结果在 search_standard 中加入
+2. Online Processor 中的 Answer 结果在 search_standard 中加入
 3. Plugin 结果在 post_search 中最后加入
-4. 所有结果按 template 字段排序后渲染
 
 **最终 answers 集合的顺序**：按 `answer.template` 字符串排序，与加入顺序无关。
 
