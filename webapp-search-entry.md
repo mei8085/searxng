@@ -346,11 +346,24 @@ suspended_time = min(
 - **结果丢弃**: 超时后即使引擎返回结果也会被丢弃，标记为 timeout 错误
 
 ### 5. 插件拦截点
-| 钩子 | 可执行操作 | 返回值影响 |
-|-----|-----------|-----------|
-| `pre_search` | 修改查询、添加条件 | 返回 False 可终止整个搜索 |
-| `on_result` | 修改结果字段、过滤结果 | 返回 False 丢弃该结果 |
-| `post_search` | 后处理结果集、添加答案 | 无返回值 |
+| 钩子 | 可执行操作 | 返回值影响 | 异常处理 |
+|-----|-----------|-----------|---------|
+| `pre_search` | 修改查询、添加条件 | 返回 `False` 可终止整个搜索 | 异常被捕获并记录日志，跳过该插件，继续执行后续插件 |
+| `on_result` | 修改结果字段、过滤结果 | 返回 `False` 丢弃该结果 | 异常被捕获并记录日志，跳过该插件，结果保留 |
+| `post_search` | 后处理结果集、添加答案/结果 | 返回 `list[Result]` 添加到结果集，返回 `None` 不添加 | 异常被捕获并记录日志，跳过该插件，**主流程继续** |
+
+#### post_search 执行细节
+```python
+# PluginStorage.post_search() 内部实现
+for plugin in enabled_plugins:
+    try:
+        results = plugin.post_search(request, search) or []
+        # 结果被添加到容器: engine_name 标记为 "plugin: <plugin_id>"
+        search.result_container.extend(f"plugin: {plugin.id}", results)
+    except Exception:
+        plugin.log.exception("Exception while calling post_search")
+        continue  # 异常插件被跳过，不影响其他插件和主流程
+```
 
 ### 6. 顶层异常兜底
 ```python
@@ -381,7 +394,8 @@ HTTP 请求
         └─ 构建 SearchQuery
     ↓
 [search/__init__.py] SearchWithPlugins.search()
-    ├─ pre_search 插件钩子 → False 则终止
+    ├─ pre_search 插件钩子 → 返回 False 则终止搜索
+    │   └─ 异常: 捕获+日志+跳过该插件，继续下一个
     ├─ search_external_bang() → 命中则 redirect
     ├─ search_answerers() → 命中则直接返回
     └─ search_standard()
@@ -396,15 +410,21 @@ HTTP 请求
     ↓
 [results.py] ResultContainer
     ├─ extend() → 去重合并
-    ├─ on_result 插件钩子
+    ├─ on_result 插件钩子 → 返回 False 丢弃该结果
+    │   └─ 异常: 捕获+日志+跳过该插件，结果保留
     └─ close() → 计算分数
     ↓
+[search/__init__.py] post_search 插件钩子
+    ├─ 可返回 list[Result] 添加到结果集 (engine 标记为 "plugin: <id>")
+    ├─ 返回 None 不添加结果
+    └─ 异常: 捕获+日志+跳过该插件，主流程继续 ✓
+    ↓
 [webapp.py] 结果渲染
-    ├─ post_search 插件钩子
     ├─ 格式分支 (html/json/csv/rss)
+    ├─ 包含插件添加的结果
     └─ 模板渲染 / 序列化
     ↓
-HTTP 响应
+HTTP 响应（插件异常不影响页面返回）
 ```
 
 ---
