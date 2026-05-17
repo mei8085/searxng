@@ -70,10 +70,23 @@ class SearchQuery:
     ):
 ```
 
+**重要修正 - 关于可变性**：
+
+> ⚠️ **`@typing.final` 装饰器仅表示「禁止被继承」，不代表对象不可变**
+> 
+> SearchQuery 对象实际上是**可变**的：
+> - 未使用 `frozen=True` (msgspec) 或 `__slots__` 进行不可变约束
+> - 所有属性（query, lang, pageno 等）均可直接修改
+> - 提供 `__copy__` 方法暗示需要复制而非直接复用
+> - 实现 `__hash__` 和 `__eq__` 是为了支持缓存键比较，与不可变性无关
+> 
+> **设计意图**：SearchQuery 在单次搜索生命周期内保持一致，但不强制不可变，便于插件和中间件在 `pre_search` 钩子中调整参数。
+
 **核心特性**：
-- 不可变（final 装饰器）
-- 支持哈希，可用于缓存
+- 禁止继承（`@typing.final`）
+- 支持哈希，可用于缓存键
 - 包含完整的搜索上下文
+- 支持浅拷贝（`__copy__`）
 
 ---
 
@@ -84,11 +97,19 @@ class SearchQuery:
 **文件**：`searx/result_types/_base.py`
 
 ```
-Result (抽象基类)
+Result (msgspec.Struct, kw_only=True)
 ├── MainResult (主搜索结果)
 ├── Answer (问答类结果)
-├── LegacyResult (兼容层，字典包装)
-└── ... (其他类型)
+│   ├── Translations
+│   └── WeatherAnswer
+├── KeyValue (键值对结果)
+├── Code (代码片段)
+├── Paper (学术论文)
+├── File (文件结果)
+└── LegacyResult (dict 子类，向后兼容)
+
+EngineResults (结果列表容器)
+└── 内部维护 types 命名空间，便于引擎开发者使用
 ```
 
 ### 3.2 MainResult 核心结构
@@ -100,8 +121,8 @@ class MainResult(Result):
     content: str = ""                   # 内容摘要
     img_src: str = ""                   # 图片源
     publishedDate: datetime | None = None  # 发布时间
-    engines: set[str] = set()           # 来源引擎集合
-    positions: list[int] = []           # 在各引擎中的排名
+    engines: set[str] = set()           # 来源引擎集合（合并后）
+    positions: list[int] = []           # 在各引擎中的排名位置
     score: float = 0                    # 计算得分
     category: str = ""                  # 分类
 ```
@@ -128,10 +149,11 @@ def __hash__(self) -> int:
 - 仅使用 `netloc + path + params + query + fragment`
 - **忽略 URL scheme** (http/https 视为相同)
 - 结合 `template` 和 `img_src` 进一步区分
+- LegacyResult 对图片结果有特殊哈希逻辑（包含完整 URL）
 
 ---
 
-## 四、网络层协作机制
+## 四、网络层协作机制详解
 
 ### 4.1 Network 核心类
 
@@ -173,21 +195,92 @@ NETWORKS['image_proxy'] = Network(enable_http2=False)  # 图片代理专用
 - 支持独立源 IP 绑定
 - 支持独立重试策略
 
-### 4.3 在线处理器流程
+### 4.3 线程本地上下文与超时链路
+
+**文件**：`searx/network/__init__.py` (第 28-108 行)
+
+```python
+THREADLOCAL = threading.local()  # 线程本地存储
+```
+
+**关键链路函数**：
+
+```python
+# 1. 初始化线程上下文（处理器层调用）
+def init_network_in_thread(self, start_time, timeout_limit):
+    searx.network.set_timeout_for_thread(timeout_limit, start_time=start_time)
+    searx.network.reset_time_for_thread()
+    searx.network.set_context_network_name(self.engine.name)
+
+# 2. 动态计算实际超时
+def _get_timeout(start_time, kwargs):
+    timeout = kwargs.get('timeout') or getattr(THREADLOCAL, 'timeout', None) or 120
+    timeout += 0.2  # 预留开销
+    if start_time:
+        timeout -= default_timer() - start_time  # 减去已消耗时间
+    return timeout
+
+# 3. 请求执行（同步 → 异步桥接）
+def request(method, url, **kwargs):
+    with _record_http_time() as start_time:
+        network = get_context_network()  # 从线程本地获取网络实例
+        timeout = _get_timeout(start_time, kwargs)
+        future = asyncio.run_coroutine_threadsafe(
+            network.request(method, url, **kwargs),
+            get_loop(),  # 全局异步事件循环
+        )
+        try:
+            return future.result(timeout)  # 阻塞等待异步结果
+        except concurrent.futures.TimeoutError as e:
+            raise httpx.TimeoutException('Timeout', request=None) from e
+```
+
+### 4.4 在线处理器完整流程
 
 **文件**：`searx/search/processors/online.py`
 
 ```
 search() 入口
     ├─ init_network_in_thread()  # 线程级网络初始化
-    │   ├─ set_timeout_for_thread()
-    │   ├─ reset_time_for_thread()
-    │   └─ set_context_network_name()
+    │   ├─ set_timeout_for_thread(limit, start_time)  # 写入线程本地
+    │   ├─ reset_time_for_thread()                    # 清零 HTTP 计时
+    │   └─ set_context_network_name(engine_name)      # 绑定网络实例
     │
     └─ _search_basic()
-        ├─ engine.request()      # 引擎自定义请求构建
-        ├─ _send_http_request()  # 发送 HTTP 请求
-        └─ engine.response()     # 解析响应
+        ├─ engine.request(query, params)  # 引擎自定义请求构建
+        ├─ _send_http_request(params)     # 发送 HTTP 请求
+        │   └─ searx.network.get/post(...)  # 调用网络层
+        │       └─ _record_http_time 上下文
+        │           ├─ 动态计算剩余超时
+        │           └─ 异步桥接执行
+        └─ engine.response(response)     # 解析响应 → EngineResults
+```
+
+### 4.5 全局事件循环模型
+
+```
+┌─────────────────────────────────────────────────┐
+│  主线程 (Flask 请求处理)                        │
+│  ├─ Search.search_standard()                    │
+│  │  └─ 为每个引擎启动独立线程                    │
+│  │     └─ thread.join(actual_timeout)           │
+│  │                                               │
+└─────────────────────┬───────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────┐
+│  引擎线程 (每个引擎一个)                         │
+│  ├─ init_network_in_thread()  ← 线程本地上下文   │
+│  ├─ engine.request()                            │
+│  ├─ network.request()                            │
+│  │  └─ asyncio.run_coroutine_threadsafe()       │
+│  │     └─ 桥接至全局事件循环                     │
+│  └─ engine.response()                           │
+└─────────────────────┬───────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────┐
+│  全局异步事件循环线程 (唯一)                     │
+│  └─ 执行所有 httpx.AsyncClient 请求              │
+└─────────────────────────────────────────────────┘
 ```
 
 ---
@@ -200,7 +293,7 @@ search() 入口
 
 ```python
 class ResultContainer:
-    main_results_map: dict[int, MainResult | LegacyResult]  # 哈希 -> 结果
+    main_results_map: dict[int, MainResult | LegacyResult]  # 哈希 → 结果
     infoboxes: list[LegacyResult]
     suggestions: set[str]
     answers: AnswerSet
@@ -215,13 +308,15 @@ extend(engine_name, results) 入口
     ├─ 遍历每个结果
     │   ├─ Result 类型 → normalize_result_fields()
     │   ├─ LegacyResult 类型 → 向后兼容处理
-    │   └─ _merge_main_result() / _merge_infobox()
+    │   └─ 检查 on_result 插件钩子
     │
     └─ 按类型分发:
         ├─ 建议 → suggestions 集合（自动去重）
         ├─ 答案 → answers.add()
         ├─ 修正 → corrections 集合
         ├─ 信息框 → _merge_infobox()
+        ├─ engine_data → 存储到 engine_data 字典
+        ├─ number_of_results → 追加到统计列表
         └─ 主结果 → _merge_main_result()
 ```
 
@@ -232,7 +327,7 @@ extend(engine_name, results) 入口
 def _merge_main_result(self, result: MainResult | LegacyResult, position: int):
     result_hash = hash(result)  # 计算哈希键
     
-    with self._lock:  # 线程安全
+    with self._lock:  # 线程安全（多引擎并发写入）
         merged = self.main_results_map.get(result_hash)
         if not merged:
             # 无重复，直接添加
@@ -399,17 +494,16 @@ def get_ordered_results(self) -> list:
 
 ---
 
-## 七、大结果量与异常回退机制
+## 七、异常回退与信号传播机制
 
-### 7.1 超时控制
+### 7.1 多级超时控制
 
-**多级超时机制** (`search/__init__.py`):
+**超时优先级（从高到低）** (`search/__init__.py:111-126`):
 
 ```python
-# 超时优先级（从高到低）：
-# 1. 查询参数 timeout_limit
-# 2. 配置 outgoing.max_request_timeout
-# 3. 各引擎自身 timeout 配置
+# 优先级1：查询参数 timeout_limit
+# 优先级2：配置 outgoing.max_request_timeout
+# 优先级3：各引擎自身 timeout 配置
 
 actual_timeout = min(default_timeout, query_timeout, max_request_timeout)
 ```
@@ -426,7 +520,62 @@ for th in threading.enumerate():
             result_container.add_unresponsive_engine(th._engine_name, 'timeout')
 ```
 
-### 7.2 引擎熔断机制
+**双重超时保护**：
+1. **线程 join 超时**：主线程最多等待 actual_timeout 秒
+2. **HTTP 动态超时**：网络层动态计算剩余可用时间
+
+### 7.2 异常层级与信号传播
+
+```
+HTTP 层异常
+    │
+    ├─ httpx.TimeoutException
+    │   └─ 捕获于 network/__init__.py:107-108
+    │      └─ 封装为 httpx.TimeoutException 重新抛出
+    │
+    ├─ httpx.RemoteProtocolError (服务器断开)
+    │   └─ 捕获于 network/network.py:288-295
+    │      └─ 自动重试（不计入重试次数）
+    │
+    └─ httpx.HTTPStatusError (>= 400)
+        └─ 捕获于 network/network.py:298-300
+            └─ 进入重试逻辑
+                └─ 重试耗尽后抛出
+                    │
+                    ▼
+        raise_for_httperror()  ← 检查响应内容
+            │
+            ├─ 检测 Cloudflare CAPTCHA → SearxEngineCaptchaException (15天)
+            ├─ 检测 Cloudflare 防火墙 → SearxEngineAccessDeniedException (1天)
+            ├─ 检测 ReCAPTCHA → SearxEngineCaptchaException (7天)
+            ├─ HTTP 402/403 → SearxEngineAccessDeniedException (180秒)
+            ├─ HTTP 429 → SearxEngineTooManyRequestsException (180秒)
+            └─ 其他 → 抛出 httpx.HTTPStatusError
+                │
+                ▼
+        处理器层捕获 (online.py:253-282)
+            │
+            ├─ ssl.SSLError → handle_exception(..., suspend=True)
+            ├─ httpx.TimeoutException → handle_exception(..., suspend=True)
+            ├─ httpx.HTTPError → handle_exception(..., suspend=True)
+            ├─ SearxEngineCaptchaException → handle_exception(..., suspend=True)
+            ├─ SearxEngineTooManyRequestsException → handle_exception(..., suspend=True)
+            ├─ SearxEngineAccessDeniedException → handle_exception(..., suspend=True)
+            └─ 其他 Exception → handle_exception(..., suspend=False)
+                │
+                ▼
+        handle_exception() (abstract.py:165-191)
+            ├─ 记录到 result_container.unresponsive_engines
+            ├─ metrics 计数
+            └─ 调用 suspended_status.suspend()  ← 熔断信号
+                │
+                ▼
+        下次搜索时
+            └─ extend_container_if_suspended() 检查
+                └─ 若熔断中 → 跳过引擎并标记
+```
+
+### 7.3 引擎熔断机制
 
 **文件**：`searx/search/processors/abstract.py` (第 77-108 行)
 
@@ -445,20 +594,30 @@ class SuspendedStatus:
     def suspend(self, suspended_time, suspend_reason):
         with self.lock:
             self.continuous_errors += 1
-            # 熔断时间 = min(ban_fail × 连续错误次数, max_ban)
+            
+            # 基础熔断时间计算（仅通用异常使用）
+            if suspended_time is None:
+                max_ban = get_setting("search.max_ban_time_on_fail")  # 默认 120s
+                ban_fail = get_setting("search.ban_time_on_fail")     # 默认 5s
+                suspended_time = min(max_ban, ban_fail * self.continuous_errors)
+            
             self.suspend_end_time = default_timer() + suspended_time
             self.suspend_reason = suspend_reason
 ```
 
-**触发熔断的异常类型** (`online.py:253-282`):
-1. `ssl.SSLError` - SSL 证书错误
-2. `httpx.TimeoutException` - 连接/读取超时
-3. `httpx.HTTPError` - 通用 HTTP 错误
-4. `SearxEngineCaptchaException` - 遇到验证码
-5. `SearxEngineTooManyRequestsException` - 请求限流
-6. `SearxEngineAccessDeniedException` - 访问被拒绝
+**熔断时间配置** (`settings.yml:69-81`):
 
-### 7.3 HTTP 请求重试机制
+| 异常类型 | 默认熔断时间 | 说明 |
+|---------|-------------|------|
+| `SearxEngineAccessDenied` | 180 秒 | 访问被拒绝、HTTP 403 |
+| `SearxEngineCaptcha` | 3600 秒 | 遇到 CAPTCHA |
+| `SearxEngineTooManyRequests` | 180 秒 | 请求限流、HTTP 429 |
+| `cf_SearxEngineCaptcha` | 1296000 秒 (15天) | Cloudflare CAPTCHA |
+| `cf_SearxEngineAccessDenied` | 86400 秒 (1天) | Cloudflare 防火墙 |
+| `recaptcha_SearxEngineCaptcha` | 604800 秒 (7天) | Google ReCAPTCHA |
+| 通用异常 (超时、网络错误) | 5 × 连续错误次数，上限 120 秒 | 指数退避 |
+
+### 7.4 HTTP 请求重试机制
 
 **文件**：`searx/network/network.py` (第 272-301 行)
 
@@ -489,7 +648,7 @@ async def call_client(self, stream, method, url, **kwargs):
         retries -= 1
 ```
 
-### 7.4 结果数量统计
+### 7.5 结果数量统计
 
 ```python
 @property
@@ -523,7 +682,7 @@ def number_of_results(self) -> int:
      ▼
   SearchWithPlugins
      │
-     ├─ pre_search() 插件钩子
+     ├─ pre_search() 插件钩子（可修改 SearchQuery）
      │
      ├─ search_external_bang() 外部跳转
      │
@@ -532,21 +691,28 @@ def number_of_results(self) -> int:
      └─ search_standard()
          │
          ├─ _get_requests()  ◄── 实际超时计算
-         │   └─ 收集各引擎请求参数
+         │   ├─ 收集各引擎请求参数
+         │   └─ actual_timeout = min(default, query, max)
          │
          └─ search_multiple_requests()  ◄── 多线程执行
              │
              ├─ 每个线程：OnlineProcessor.search()
-             │   ├─ init_network_in_thread()
+             │   ├─ init_network_in_thread()  ← 线程本地上下文
              │   ├─ engine.request() 构建请求
              │   ├─ _send_http_request()
+             │   │   └─ network.request()
+             │   │       ├─ 动态超时计算
+             │   │       └─ 异步桥接执行
              │   └─ engine.response() 解析结果
              │
              └─ 线程 join 超时控制
-                 │
-                 ▼
+                 ├─ th.join(remaining_time)
+                 └─ 超时则标记 th._timeout = True
+                     │
+                     ▼
             ResultContainer.extend()  ◄── 结果合并入口
                  │
+                 ├─ on_result 插件钩子
                  ├─ 结果类型分发
                  │   ├─ suggestions (set 去重)
                  │   ├─ answers
@@ -554,40 +720,103 @@ def number_of_results(self) -> int:
                  │   ├─ infoboxes 合并
                  │   └─ main_results 哈希去重 + 合并
                  │
-                 └─ close()  ◄── 计算得分
-                     │
-                     ▼
-                calculate_score()
-                     │
-                     ▼
-                get_ordered_results()
-                     ├─ 按 score 降序排序
-                     └─ 分组重排优化展示
+                 └─ post_search() 插件钩子
+                     └─ close()  ◄── 计算得分
+                         │
+                         ▼
+                    calculate_score()
+                         │
+                         ▼
+                    get_ordered_results()
+                         ├─ 按 score 降序排序
+                         └─ 分组重排优化展示
 ```
 
 ---
 
-## 九、关键设计要点总结
+## 九、机制协同与可靠性判断
 
-### 9.1 去重设计亮点
-1. **URL 规范化忽略协议**：http/https 视为同一结果
-2. **多维度哈希键**：template + url + img_src 确保准确
-3. **智能字段合并**：选择更丰富的内容、优先 HTTPS
+### 9.1 异常对去重的影响
 
-### 9.2 排序设计亮点
-1. **多引擎信任累积**：引擎权重累乘，多来源增强可信度
-2. **位置敏感打分**：排名越靠前权重越高（1/position 衰减）
-3. **多样性分组**：避免同类结果连续展示，提升体验
+**熔断机制保护去重可靠性**：
 
-### 9.3 可靠性保障
-1. **多级超时控制**：全局、引擎、查询三层超时
-2. **线程级隔离**：每个引擎独立线程，互不影响
-3. **熔断机制**：连续错误自动暂停，保护上游服务
-4. **自动重试**：网络异常透明重试
+1. **避免部分失败导致的去重遗漏**：
+   - 若引擎 A 超时，其结果未进入容器
+   - 但相同 URL 被引擎 B、C 返回，仍能正确去重
+   - 缺少 A 的位置信息仅影响得分，不影响去重本身
+
+2. **熔断后的静默期避免重复失败**：
+   - 连续失败的引擎被暂停，不再参与后续请求
+   - 避免因同一引擎反复失败导致结果集中缺失
+   - 保持结果多样性，间接维持去重池的丰富度
+
+3. **HTTPS 优先策略的边界情况**：
+   - 去重时忽略 scheme，http://x 和 https://x 视为同一结果
+   - 合并时优先使用 HTTPS URL
+   - 但若两个 URL 有不同 query 参数（即使指向同一资源），仍视为不同结果
+
+### 9.2 异常对排序的影响
+
+**得分计算的鲁棒性设计**：
+
+1. **多源投票机制**：
+   - 即使部分引擎失败，只要有多个引擎返回同一结果
+   - 引擎权重乘积仍能反映可信度
+   - 单引擎结果因权重乘积较小，排名自然靠后
+
+2. **位置信息的降权效应**：
+   - 超时导致某些引擎的位置信息缺失
+   - `positions` 列表长度减小，`weight *= len(positions)` 乘数降低
+   - 得分自动下降，反映信息不完整
+
+3. **熔断对排序多样性的间接影响**：
+   - 高权重引擎熔断后，低权重引擎结果比例上升
+   - 分组排序算法确保结果仍保持类别多样性
+   - 避免同类结果聚集
+
+### 9.3 可靠性边界与降级策略
+
+| 场景 | 系统行为 | 用户感知 |
+|------|---------|---------|
+| 单个引擎超时 | 跳过该引擎，结果可能减少 | 无明显感知，结果仍可用 |
+| 多个引擎超时 | 结果数量减少，得分分布偏移 | 可能看到不常见结果排名上升 |
+| 高权重引擎熔断 | 该引擎结果全部缺失，排名重排 | 结果相关性可能下降 |
+| 所有在线引擎熔断 | 仅返回本地 answerer 结果 | 提示 "无结果" 或极少结果 |
+| 网络层重试触发 | 响应延迟增加但结果完整 | 仅表现为查询变慢 |
+| 部分结果去重遗漏 | 重复结果偶尔出现 | 罕见场景，可手动刷新 |
+
+**设计原则**：
+- **优雅降级**：优先返回部分可用结果，而非完全失败
+- **信息透明**：通过 `unresponsive_engines` 列表向用户披露失败引擎
+- **自我修复**：熔断期过后自动恢复，无需人工干预
+- **统计置信度**：`number_of_results` 在统计不可靠时返回 0，避免误导
 
 ---
 
-## 十、核心代码位置速查
+## 十、关键设计要点总结
+
+### 10.1 去重设计亮点
+1. **URL 规范化忽略协议**：http/https 视为同一结果
+2. **多维度哈希键**：template + url + img_src 确保准确
+3. **智能字段合并**：选择更丰富的内容、优先 HTTPS
+4. **线程安全**：`RLock` 保护并发写入
+
+### 10.2 排序设计亮点
+1. **多引擎信任累积**：引擎权重累乘，多来源增强可信度
+2. **位置敏感打分**：排名越靠前权重越高（1/position 衰减）
+3. **多样性分组**：避免同类结果连续展示，提升体验
+4. **插件可扩展**：`priority` 字段支持插件调整排名
+
+### 10.3 可靠性保障
+1. **多级超时控制**：全局、引擎、查询三层超时
+2. **线程级隔离**：每个引擎独立线程，互不影响
+3. **分级熔断机制**：不同异常类型对应不同熔断时长
+4. **自动重试**：网络异常透明重试，特殊断开不计重试
+5. **全局事件循环**：同步/异步桥接，高效复用 HTTP 连接
+
+---
+
+## 十一、核心代码位置速查
 
 | 功能模块 | 文件位置 | 关键行号 |
 |---------|---------|---------|
@@ -600,8 +829,13 @@ def number_of_results(self) -> int:
 | 搜索执行器 | `searx/search/__init__.py` | 47-179 |
 | 在线处理器 | `searx/search/processors/online.py` | 113-282 |
 | 网络核心类 | `searx/network/network.py` | 45-441 |
+| 线程本地网络上下文 | `searx/network/__init__.py` | 28-108 |
+| HTTP 错误检测 | `searx/network/raise_for_httperror.py` | 61-79 |
 | 引擎熔断状态 | `searx/search/processors/abstract.py` | 77-108 |
+| 异常类型定义 | `searx/exceptions.py` | 60-111 |
+| 熔断时间配置 | `searx/settings.yml` | 66-81 |
 
 ---
 
 *报告生成时间：2026-05-17*
+*修订版本：v2.0*
