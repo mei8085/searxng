@@ -247,6 +247,7 @@ class ResultContainer:
    score = sum(weight / position for position in positions)
    # weight = product of engine weights * len(positions)
    ```
+   > **注意**: `close()` 在 `post_search` 之后调用，插件 `post_search` 返回的结果也参与分数计算
 2. **第一遍排序**: 按 score 降序
 3. **第二遍分组**: 按 `category:template:has_image` 分组，避免同类结果聚集
    - 每组最多 8 个结果
@@ -285,7 +286,7 @@ for result in results:
 
 #### 7.3 HTML 模板上下文
 传递给模板的关键数据:
-- `results`: 排序后的结果列表
+- `results`: **排序后的最终结果列表**（已通过 `ResultContainer.close()` 计算分数并排序，包含引擎返回结果和 `post_search` 插件添加的结果）
 - `suggestions`: 搜索建议 (带 URL)
 - `answers`: 直接答案
 - `corrections`: 拼写修正
@@ -293,6 +294,8 @@ for result in results:
 - `unresponsive_engines`: 失败的引擎列表 (已翻译)
 - `timings`: 各引擎响应时间
 - `number_of_results`: 结果总数 (格式化)
+
+> **执行时序对齐**: `get_ordered_results()` 在 `close()` 之后调用，此时 post_search 插件添加的结果已完成分数计算和排序，与引擎结果无区别地融入结果列表。
 
 ---
 
