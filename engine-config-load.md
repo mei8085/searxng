@@ -294,6 +294,7 @@ if cls is None:
 **阶段一失败场景（全部终止，无可回退分支）**：
 - 模块导入失败（任何 Exception）→ cls 为 None → **立即终止**（`ValueError`）
 - 模块导入成功但类不存在 → cls 为 None → **立即终止**（`ValueError`）
+- 插件实例化失败（构造函数抛异常）→ 异常未捕获 → **立即终止**
 - 插件 ID 冲突 → **立即终止**（`KeyError`，未被捕获）
 
 #### 阶段二：init(app) - 初始化与过滤 [searx/plugins/_core.py:244-251]
@@ -515,13 +516,13 @@ STORAGE: PluginStorage = PluginStorage()   # 插件集合
 插件初始化阶段
     │
     ├─ load_settings() 注册插件
-    │   ├─ 插件类不存在 → ValueError → 终止
-    │   ├─ 插件 ID 冲突 → KeyError → 终止
-    │   └─ 导入异常 → 记录日志，跳过
+    │   ├─ 模块导入失败 OR 类不存在 → cls 为 None → ValueError → 终止
+    │   ├─ 插件实例化失败 → 异常未捕获 → 终止
+    │   └─ 插件 ID 冲突 → KeyError → 终止
     │
     └─ init(app) 初始化插件
-        ├─ init() 返回 False → 移除插件
-        └─ init() 抛出异常 → 终止
+        ├─ init() 返回 False → 移除插件（回退继续）
+        └─ init() 抛出异常 → 未捕获 → 终止
     │
 搜索引擎初始化阶段
     │
