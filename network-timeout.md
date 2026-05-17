@@ -629,61 +629,100 @@ def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]
                 PROCESSORS[th._engine_name].logger.error('engine timeout')
 ```
 
-### 6.2 _timeout 标记的去向
+### 6.2 _timeout 标记的完整读取链路
 
-**重要发现**：`th._timeout` 标记设置后，**没有任何代码读取这个标记**。
+**关键发现**：`th._timeout` 标记不是死代码！它会在子线程的 `extend_container()` 阶段被读取。
 
-全代码库搜索 `._timeout` 仅出现在两处：
-1. `th._timeout = False` - 初始化（`searx/search/__init__.py:149`）
-2. `th._timeout = True` - 标记超时（`searx/search/__init__.py:156`）
+**标记读取位置**（`searx/search/processors/abstract.py:216-223`）：
+```python
+def extend_container(self, result_container, start_time, search_results):
+    if getattr(threading.current_thread(), '_timeout', False):
+        # the main thread is not waiting anymore
+        self.handle_exception(result_container, 'timeout', False)
+    else:
+        if search_results is not None:
+            self._extend_container_basic(result_container, start_time, search_results)
+        self.suspended_status.resume()
+```
 
-**没有任何读取操作**，这个标记实际上是**死代码**。
+### 6.3 完整时序与双阶段处理
 
-### 6.3 实际生效的三条路径
+**时序图**：
+```
+主线程                          子线程
+  │                              │
+  ├─ th._timeout = False         │
+  ├─ th.start()                  ├─ 执行 _search_basic()
+  │                              │  发送 HTTP 请求...
+  ├─ th.join(remaining_time)     │
+  │  等待超时...                 │
+  ├─ th.is_alive() == True       │
+  ├─ th._timeout = True ◀───┐    │
+  ├─ add_unresponsive_engine()  │  请求仍在进行...
+  ├─ logger.error()             │
+  │  主线程继续                 │  请求最终完成
+  │                              ├─ 调用 extend_container()
+  │                              │  读取 current_thread()._timeout → True
+  │                              └─ 调用 handle_exception('timeout', False)
+```
 
-当主线程检测到超时后，实际执行的操作只有三条：
+**阶段 1：主线程立即处理**（`searx/search/__init__.py:156-158`）
+```python
+if th.is_alive():
+    th._timeout = True  # 设置标记，供子线程后续读取
+    self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')  # 立即标记无响应
+    PROCESSORS[th._engine_name].logger.error('engine timeout')  # 立即记录日志
+```
 
-| 操作 | 代码位置 | 影响 |
-|-----|---------|------|
-| `th._timeout = True` | L156 | 无实际影响（死代码） |
-| `add_unresponsive_engine(engine_name, 'timeout')` | L157 | ✅ 用户可见，JSON/页面展示 |
-| `logger.error('engine timeout')` | L158 | ✅ 日志记录 |
+**阶段 2：子线程延迟处理**（`searx/search/processors/abstract.py:216-218`）
+```python
+if getattr(threading.current_thread(), '_timeout', False):
+    # 子线程检测到主线程已超时放弃等待
+    self.handle_exception(result_container, 'timeout', False)
+```
+
+**handle_exception 执行内容**（`suspend=False`）：
+```python
+def handle_exception(..., suspend=False):
+    result_container.add_unresponsive_engine(...)  # 再次添加（set 自动去重）
+    counter_inc('engine', name, 'search', 'count', 'error')  # ✅ 错误计数+1
+    count_error(name, 'timeout')  # ✅ 记录错误详情（用于 /stats）
+    # suspend=False → 不暂停引擎
+```
 
 ### 6.4 与处理器内部超时的统计差异
 
 **路径 A：处理器内部捕获超时**（`httpx.TimeoutException`）
 ```python
-# searx/search/processors/abstract.py:165-191
-def handle_exception(...):
-    result_container.add_unresponsive_engine(...)  # ✅ 用户可见
-    counter_inc('engine', name, 'search', 'count', 'error')  # ✅ 错误计数+1
-    count_exception(name, exc)  # ✅ 记录异常栈（用于 /stats 页面）
-    self.suspended_status.suspend(...)  # ✅ 可能暂停引擎
+# searx/search/processors/online.py:257-259
+except (httpx.TimeoutException, asyncio.TimeoutError) as e:
+    self.handle_exception(result_container, e, suspend=True)
+    # suspend=True → 可能触发引擎暂停
 ```
 
-**路径 B：主线程 join 超时**（`searx/search/__init__.py:156-158`）
+**路径 B：主线程 join 超时**（两阶段处理）
 ```python
-if th.is_alive():
-    th._timeout = True  # ❌ 无实际作用
-    self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')  # ✅ 用户可见
-    PROCESSORS[th._engine_name].logger.error('engine timeout')  # ✅ 日志
-    # ❌ 缺少 counter_inc
-    # ❌ 缺少 count_error
-    # ❌ 缺少 suspended_status.suspend
+# 阶段1：主线程立即标记无响应和记录日志
+# 阶段2：子线程后续调用 handle_exception(..., suspend=False)
+# suspend=False → 不会触发引擎暂停
 ```
 
 **统计差异对比表**：
 
 | 统计项 | 内部捕获 (Path A) | 主线程超时 (Path B) |
 |-------|------------------|-------------------|
-| 用户可见错误 | ✅ | ✅ |
-| `search.count.error` 计数 | ✅ +1 | ❌ 无 |
-| `/stats` 异常详情 | ✅ 有栈信息 | ❌ 无 |
-| 引擎自动暂停 | ✅ 可能 | ❌ 不会 |
-| 日志记录 | ✅ | ✅ |
+| 用户可见错误 | ✅ | ✅（阶段1添加） |
+| `search.count.error` 计数 | ✅ +1 | ✅ +1（阶段2 handle_exception） |
+| `/stats` 异常详情 | ✅ 有完整栈信息 | ✅ 有错误记录（无栈） |
+| 引擎自动暂停 | ✅ 可能（suspend=True） | ❌ 不会（suspend=False） |
+| 日志记录 | ✅ | ✅（阶段1记录） |
 
-**设计意图推测**：
-`th._timeout` 可能是为了后续在线程退出时做清理或统计，但从未实现。主线程超时路径缺少统计计数可能是一个设计疏忽。
+**设计意图**：
+`th._timeout` 标记实现了"超时后子线程继续运行但结果被忽略"的模式：
+1. 主线程超时后立即响应用户，不再等待
+2. 子线程继续运行直到完成，通过 `_timeout` 标记知道主线程已放弃
+3. 子线程完成后不添加结果，而是调用 `handle_exception` 计入统计
+4. 不暂停引擎（suspend=False），因为这是超时不是引擎错误
 
 ---
 
