@@ -257,12 +257,15 @@ def initialize(app):
   ├─ 解析 FQN（完全限定名），分离模块名和类名
   │
   ├─ 动态导入模块: importlib.import_module(mod_name)
-  │   ├─ 导入异常 → 记录日志，继续下一个（仅 BaseException）
-  │   └─ 导入成功 → 获取类对象
-  │       ├─ 类不存在 → raise ValueError("plugin {fqn} is not implemented")
-  │       │                          ↓
-  │       │                     进程终止
-  │       └─ 类存在 → 实例化插件对象
+  │   ├─ 导入异常 → 记录日志，但 cls 仍为 None
+  │   └─ 导入成功 → 获取类对象: getattr(mod, cls_name, None)
+  │
+  ├─ 检查 cls 是否为 None（导入失败 OR 类不存在）
+  │   └─ 是 → raise ValueError("plugin {fqn} is not implemented")
+  │                                  ↓
+  │                            进程终止
+  │
+  ├─ 实例化插件对象: cls(PluginCfg(**plg_settings))
   │
   └─ 注册插件: self.register(plg)
       ├─ 检查 ID 冲突
@@ -272,10 +275,26 @@ def initialize(app):
       │   └─ 不冲突 → 添加到 self.plugin_list 集合
 ```
 
-**阶段一失败场景**：
-- 插件类不存在 → **立即终止**（`ValueError`，未被捕获）
+**代码证据链（模块导入失败 → 终止）**：
+```python
+# 第 217 行: cls 初始化为 None
+cls = None
+# 第 219-223 行: 导入异常被捕获，但 cls 仍为 None
+try:
+    mod = importlib.import_module(mod_name)
+    cls = getattr(mod, cls_name, None)
+except Exception as exc:
+    log.exception(exc)  # 仅记录日志，不 continue
+# 第 225-227 行: 无论导入失败还是类不存在，只要 cls 为 None 就抛异常
+if cls is None:
+    msg = f"plugin {fqn} is not implemented"
+    raise ValueError(msg)  # 未被捕获，终止进程
+```
+
+**阶段一失败场景（全部终止，无可回退分支）**：
+- 模块导入失败（任何 Exception）→ cls 为 None → **立即终止**（`ValueError`）
+- 模块导入成功但类不存在 → cls 为 None → **立即终止**（`ValueError`）
 - 插件 ID 冲突 → **立即终止**（`KeyError`，未被捕获）
-- 模块导入异常（非 BaseException）→ **回退继续**（记录日志，跳过该插件）
 
 #### 阶段二：init(app) - 初始化与过滤 [searx/plugins/_core.py:244-251]
 
