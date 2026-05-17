@@ -11,8 +11,8 @@ SearXNG 的错误处理机制围绕 **异常类继承层次** 和 **挂起时长
 | **L1 - 致命阻塞** | CAPTCHA / 防火墙封禁 | Cloudflare CAPTCHA、Cloudflare 防火墙 1020、ReCAPTCHA | 长时挂起（1天 ~ 15天）| ⭐⭐⭐⭐⭐ |
 | **L2 - 访问拒绝** | 权限类错误 | HTTP 402 / 403、主动拒绝访问 | 中时挂起（180秒）| ⭐⭐⭐⭐ |
 | **L3 - 限流触发** | 请求频率超限 | HTTP 429 Too Many Requests | 中时挂起（180秒）| ⭐⭐⭐⭐ |
-| **L4 - 传输故障** | 网络协议错误 | SSL 错误、DNS 失败、连接重置、HTTP 5xx | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
-| **L5 - 响应超时** | 性能类错误 | 连接超时、读取超时、引擎响应过慢 | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
+| **L4 - 传输故障** | 网络协议错误 | SSL 证书错误、连接失败、协议错误、HTTP 5xx | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
+| **L5 - 响应超时** | 性能类错误 | 连接超时、读取超时、写入超时 | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
 | **L6 - 解析异常** | 数据处理错误 | JSON 解析失败、XPATH 不匹配、API 格式变更 | 不挂起（仅统计）| ⭐⭐ |
 | **L7 - 次要告警** | 非预期行为 | 重定向次数超限、软限制触发 | 不挂起（仅统计，标记 secondary）| ⭐ |
 
@@ -149,52 +149,110 @@ def resume(self):
 
 ---
 
-## 4. 对整体响应和用户提示的影响
+## 4. 用户提示与页面展示（按真实实现校准）
 
-### 4.1 限流与访问拒绝的具体影响
+### 4.1 错误信息展示流程
+
+错误信息从后端到前端的完整流程：
+
+1. **错误捕获**：`handle_exception` 调用 `result_container.add_unresponsive_engine(engine_name, error_type, suspended)`
+   - `error_type` 是异常类名（如 `httpx.TimeoutException`）或特殊字符串（如 `timeout`）
+   - `suspended` 标记该错误是否触发了引擎挂起
+
+2. **翻译映射**：`webutils.get_translated_errors()` 通过 `exception_classname_to_text` 字典将异常类名映射为用户可见文本
+
+3. **前缀添加**：如果 `suspended=True`，在翻译后的文本前添加 "Suspended: " 前缀
+
+4. **页面渲染**：在搜索结果页侧边栏的 "Response time" 区域展示
+
+**关键说明：**
+- 用户界面 **不会** 显示异常 message 中的 `suspended_time=180` 等内部参数
+- 所有挂起的错误统一添加 "Suspended: " 前缀，而非 "Engine X is suspended" 格式
+- 未挂起的错误直接显示翻译后的文本，无前缀
+
+[searx/webutils.py:70-82](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L70-L82)
+
+### 4.2 异常类名到用户文本的映射
+
+| 异常类名 | 用户可见文本（英文） | 中文翻译示例 | 挂起时展示 |
+|----------|----------------------|--------------|------------|
+| `timeout` | `timeout` | 超时 | `Suspended: timeout` |
+| `httpx.TimeoutException` | `timeout` | 超时 | `Suspended: timeout` |
+| `httpx.ConnectTimeout` | `timeout` | 超时 | `Suspended: timeout` |
+| `httpx.ReadTimeout` | `timeout` | 超时 | `Suspended: timeout` |
+| `ssl.SSLCertVerificationError` | `SSL error: certificate validation has failed` | SSL错误：证书验证失败 | `Suspended: SSL error: certificate validation has failed` |
+| `httpx.ConnectError` | `HTTP connection error` | HTTP连接错误 | `Suspended: HTTP connection error` |
+| `httpx.HTTPStatusError` | `HTTP error` | HTTP错误 | `Suspended: HTTP error` |
+| `httpx.ProxyError` | `proxy error` | 代理错误 | `Suspended: proxy error` |
+| `searx.exceptions.SearxEngineCaptchaException` | `CAPTCHA` | 人机验证 | `Suspended: CAPTCHA` |
+| `searx.exceptions.SearxEngineTooManyRequestsException` | `too many requests` | 请求过多 | `Suspended: too many requests` |
+| `searx.exceptions.SearxEngineAccessDeniedException` | `access denied` | 访问被拒绝 | `Suspended: access denied` |
+| `json.decoder.JSONDecodeError` | `parsing error` | 解析错误 | `parsing error`（不挂起） |
+| `KeyError` | `parsing error` | 解析错误 | `parsing error`（不挂起） |
+| 其他未匹配 | `unexpected crash` | 意外崩溃 | 视 suspended 参数而定 |
+
+[searx/webutils.py:36-67](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L36-L67)
+
+### 4.3 各错误等级的实际用户提示
+
+#### L1 - CAPTCHA / 防火墙封禁
+
+- **挂起时长**：1天 ~ 15天（视具体类型）
+- **用户提示**：
+  - Cloudflare CAPTCHA：`Suspended: CAPTCHA`
+  - ReCAPTCHA：`Suspended: CAPTCHA`
+  - Cloudflare 防火墙 1020：`Suspended: access denied`
+- **展示位置**：搜索结果页侧边栏 "Response time" 表格中
+- **后续请求**：挂起期间直接跳过该引擎，不再发送请求
+- **健康度影响**：严重影响引擎可用性，需要管理员介入
 
 #### L2 - 访问拒绝（HTTP 402/403）
 
 - **挂起时长**：180秒（3分钟）
-- **用户提示**：搜索结果页显示 "Engine X is suspended: Access denied (suspended_time=180)"
-- **后续请求**：挂起期间直接跳过该引擎，不再发送请求
+- **用户提示**：`Suspended: access denied`
+- **后续请求**：挂起期间直接跳过该引擎
 - **健康度影响**：错误计数 +1，成功率下降，可靠性评分降低
 
 #### L3 - 限流触发（HTTP 429）
 
 - **挂起时长**：180秒（3分钟）
-- **用户提示**：搜索结果页显示 "Engine X is suspended: Too many request (suspended_time=180)"
+- **用户提示**：`Suspended: too many requests`
 - **后续请求**：挂起期间直接跳过该引擎，避免进一步触发源站限流
 - **健康度影响**：错误计数 +1，成功率下降，管理员可能需要考虑降低请求频率或更换出口IP
 
-#### L1 - CAPTCHA / 防火墙封禁
+#### L4 - 传输故障
 
-- **挂起时长**：1天 ~ 15天（视具体类型）
-- **用户提示**：搜索结果页显示 "Engine X is suspended: Cloudflare CAPTCHA (suspended_time=1296000)"
-- **后续请求**：长时间挂起，相当于临时禁用该引擎
-- **健康度影响**：严重影响引擎可用性，需要管理员介入（更换代理、解决IP信誉问题等）
-
-### 4.2 超时与协议错误的具体影响
-
-#### L4 - 传输故障（SSL错误、连接错误等）
+| 具体错误类型 | 用户提示（挂起时） |
+|--------------|-------------------|
+| SSL证书验证失败 | `Suspended: SSL error: certificate validation has failed` |
+| HTTP连接错误 | `Suspended: HTTP connection error` |
+| 代理错误 | `Suspended: proxy error` |
+| 其他HTTP错误 | `Suspended: HTTP error` |
 
 - **挂起时长**：固定 5 秒（默认配置）
-- **用户提示**：搜索结果页显示 "Engine X: ssl.SSLError" 或具体错误类名
 - **后续请求**：5秒后自动恢复，可继续接受请求
 - **健康度影响**：错误计数 +1，短时波动不影响长期评分，频繁发生需检查网络
 
 #### L5 - 响应超时
 
 - **挂起时长**：固定 5 秒（默认配置）
-- **用户提示**：搜索结果页显示 "Engine X: httpx.TimeoutException"
+- **用户提示**：`Suspended: timeout`
+- **注意**：所有类型的超时（连接超时、读取超时、写入超时、asyncio超时）统一展示为 "timeout"
 - **后续请求**：5秒后自动恢复
 - **健康度影响**：错误计数 +1，若持续超时需检查引擎响应速度或增大 timeout 配置
 
-### 4.3 结果完整性影响
+#### L6 - 解析异常
 
-- **单引擎失败**：不影响整体搜索，仅缺少该引擎结果，用户可能看到轻微提示
+- **挂起时长**：不挂起
+- **用户提示**：`parsing error`（无前缀）
+- **后续请求**：不影响，下次请求继续尝试
+- **健康度影响**：错误计数 +1，通常表示引擎API格式变更，需维护引擎解析规则
+
+### 4.4 结果完整性影响
+
+- **单引擎失败**：不影响整体搜索，仅缺少该引擎结果，用户在 "Response time" 区域看到错误提示
 - **多引擎同类错误**：如多个引擎同时出现SSL错误，可能是出口网络问题
-- **全引擎失败**：页面显示 "Sorry, we didn't find any results"，并列出所有失败引擎
+- **全引擎失败**：页面显示 "Sorry, we didn't find any results"，并在侧边栏列出所有失败引擎
 - **挂起期间**：引擎完全不可用，结果中不会包含该引擎的任何内容
 
 ---
@@ -364,7 +422,8 @@ SearXNG 的错误处理体系采用 **"分级挂起 + 固定时长恢复 + 成�
 **关键校准点：**
 1. **普通错误挂起时长固定**：超时、SSL错误等普通错误挂起时长为 `min(max_ban_time_on_fail, ban_time_on_fail)`，默认 5 秒，不随连续错误次数递增
 2. **指标统计受开关控制**：`general.enable_metrics` 控制详细错误上下文的记录和可靠性计算
-3. **限流与访问拒绝影响明确**：L2/L3 级错误挂起 180 秒，L1 级错误挂起 1 天以上，期间完全跳过该引擎
+3. **用户提示经过翻译映射**：异常类名通过 `exception_classname_to_text` 映射为用户友好文本，挂起时添加 "Suspended: " 前缀，不显示 `suspended_time` 等内部参数
+4. **限流与访问拒绝影响明确**：L2/L3 级错误挂起 180 秒，L1 级错误挂起 1 天以上，期间完全跳过该引擎
 
 **核心设计原则：**
 1. **故障隔离**：单个引擎故障不影响全局搜索
