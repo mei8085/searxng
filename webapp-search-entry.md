@@ -106,7 +106,7 @@ def search(self) -> ResultContainer:
     if searx.plugins.STORAGE.pre_search(self.request, self):
         super().search()  # 执行实际搜索
     
-    # 插件后置钩子: 可修改结果
+    # 插件后置钩子: 可添加结果，异常被捕获不中断主流程
     searx.plugins.STORAGE.post_search(self.request, self)
     self.result_container.close()  # 关闭并计算分数
     return self.result_container
