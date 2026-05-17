@@ -291,20 +291,22 @@ def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]
             args=(query, request_params, self.result_container, self.start_time, self.actual_timeout),
             name=search_id,
         )
-        th._timeout = False
+        th._timeout = False  # 初始化超时标记
         th._engine_name = engine_name
         th.start()
     
-    # 监控线程超时
+    # 监控线程超时（阶段1：主线程立即处理）
     for th in threading.enumerate():
         if th.name == search_id:
             remaining_time = max(0.0, self.actual_timeout - (default_timer() - self.start_time))
             th.join(remaining_time)
             if th.is_alive():
-                th._timeout = True  # 标记线程超时
+                th._timeout = True  # 设置标记，子线程后续会读取
                 self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
                 PROCESSORS[th._engine_name].logger.error('engine timeout')
 ```
+
+> **注意**：主线程设置 `th._timeout = True` 后立即返回响应用户，但子线程仍在运行。子线程完成后会在 `extend_container()` 中读取此标记，调用 `handle_exception('timeout', False)` 进入错误统计流程（详见第六章）。
 
 ---
 
@@ -886,10 +888,17 @@ future.result(timeout) 超时
 Search.search_multiple_requests()
 └── th.join(remaining_time)
     └── 线程仍存活
-        ├── th._timeout = True        # 标记（死代码）
-        ├── add_unresponsive_engine() # 用户可见
-        └── logger.error()            # 日志记录
-        # 注意：不增加 error 计数，不记录异常栈，不暂停引擎
+        ├── th._timeout = True        # 设置标记供子线程读取
+        ├── add_unresponsive_engine() # 立即标记无响应（用户可见）
+        └── logger.error()            # 立即记录日志
+
+        [子线程继续运行...]
+        └── OnlineProcessor.extend_container()
+            └── getattr(current_thread(), '_timeout') → True
+                └── handle_exception('timeout', False)
+                    ├── counter_inc(error)      # 错误计数+1
+                    ├── count_error('timeout')   # 记录错误详情
+                    └── 不暂停引擎（suspend=False）
 ```
 
 ### 8.4 External Bang 绕过链
