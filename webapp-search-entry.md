@@ -106,9 +106,9 @@ def search(self) -> ResultContainer:
     if searx.plugins.STORAGE.pre_search(self.request, self):
         super().search()  # 执行实际搜索
     
-    # 插件后置钩子: 可添加结果，异常被捕获不中断主流程
+    # 插件后置钩子: 可添加结果 (返回 list[Result])，异常被捕获不中断主流程
     searx.plugins.STORAGE.post_search(self.request, self)
-    self.result_container.close()  # 关闭并计算分数
+    self.result_container.close()  # 关闭并计算分数 (post_search 结果也参与排序)
     return self.result_container
 ```
 
@@ -409,19 +409,21 @@ HTTP 请求
     └─ extend_container() → 结果入容器
     ↓
 [results.py] ResultContainer
-    ├─ extend() → 去重合并
-    ├─ on_result 插件钩子 → 返回 False 丢弃该结果
-    │   └─ 异常: 捕获+日志+跳过该插件，结果保留
-    └─ close() → 计算分数
+    ├─ extend() → 去重合并 (on_result 插件钩子在此触发)
+    │   └─ on_result 异常: 捕获+日志+跳过该插件，结果保留
+    └─ 结果收集完成，等待 post_search 添加结果
     ↓
 [search/__init__.py] post_search 插件钩子
     ├─ 可返回 list[Result] 添加到结果集 (engine 标记为 "plugin: <id>")
     ├─ 返回 None 不添加结果
     └─ 异常: 捕获+日志+跳过该插件，主流程继续 ✓
     ↓
+[results.py] ResultContainer.close() → 计算分数 + 排序
+    └─ post_search 添加的结果也参与分数计算和排序
+    ↓
 [webapp.py] 结果渲染
     ├─ 格式分支 (html/json/csv/rss)
-    ├─ 包含插件添加的结果
+    ├─ 包含插件添加的结果 (已参与排序)
     └─ 模板渲染 / 序列化
     ↓
 HTTP 响应（插件异常不影响页面返回）
