@@ -253,6 +253,9 @@ def handle_exception(self, result_container: "ResultContainer",
                      exception_or_message: BaseException | str, suspend: bool = False):
     # 1. 标记引擎无响应
     if isinstance(exception_or_message, BaseException):
+        exception_class = exception_or_message.__class__
+        module_name = getattr(exception_class, '__module__', 'builtins')
+        module_name = '' if module_name == 'builtins' else module_name + '.'
         error_message = module_name + exception_class.__qualname__
     else:
         error_message = exception_or_message
@@ -305,9 +308,388 @@ def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]
 
 ---
 
-## 四、不同引擎/场景的分支差异
+## 四、超时异常到用户可见结果的完整映射
 
-### 4.1 处理器类型概览
+### 4.1 unresponsive_engines 数据结构
+
+**位置**：`searx/results.py:47-50`
+
+```python
+class UnresponsiveEngine(t.NamedTuple):
+    engine: str          # 引擎名称
+    error_type: str      # 错误类型（类名或自定义消息）
+    suspended: bool      # 是否已被暂停
+```
+
+存储位置：`ResultContainer.unresponsive_engines: set[UnresponsiveEngine]`
+
+### 4.2 添加无响应引擎的三个入口
+
+**入口 1：处理器内部异常捕获**（`searx/search/processors/abstract.py:179`）
+```python
+# 处理 httpx.TimeoutException 等异常时
+result_container.add_unresponsive_engine(self.engine.name, error_message)
+# error_message 格式："httpx.TimeoutException"
+```
+
+**入口 2：主线程 join 超时**（`searx/search/__init__.py:157`）
+```python
+# 线程仍存活，超过 actual_timeout 时
+self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
+# error_message 格式："timeout"（纯字符串）
+```
+
+**入口 3：引擎已被暂停**（`searx/search/processors/abstract.py:227-228`）
+```python
+# 搜索前检查到引擎已被暂停
+result_container.add_unresponsive_engine(
+    self.engine.name, self.suspended_status.suspend_reason, suspended=True
+)
+```
+
+### 4.3 错误类型翻译映射
+
+**位置**：`searx/webutils.py:36-67`
+
+```python
+timeout_text = gettext('timeout')
+exception_classname_to_text = {
+    None: gettext('unexpected crash'),
+    'timeout': timeout_text,
+    'asyncio.TimeoutError': timeout_text,
+    'httpx.TimeoutException': timeout_text,
+    'httpx.ConnectTimeout': timeout_text,
+    'httpx.ReadTimeout': timeout_text,
+    'httpx.WriteTimeout': timeout_text,
+    'httpx.HTTPStatusError': gettext('HTTP error'),
+    'httpx.ConnectError': gettext("HTTP connection error"),
+    'ssl.SSLCertVerificationError': gettext("SSL error: certificate validation has failed"),
+    'searx.exceptions.SearxEngineCaptchaException': gettext("CAPTCHA"),
+    'searx.exceptions.SearxEngineTooManyRequestsException': gettext("too many requests"),
+    'searx.exceptions.SearxEngineAccessDeniedException': gettext("access denied"),
+    ...
+}
+```
+
+### 4.4 JSON 输出落点
+
+**位置**：`searx/webutils.py:162-175`
+
+```python
+def get_json_response(sq: "SearchQuery", rc: "ResultContainer") -> str:
+    data = {
+        'query': sq.query,
+        'number_of_results': rc.number_of_results,
+        'results': [_.as_dict() for _ in rc.get_ordered_results()],
+        'answers': [_.as_dict() for _ in rc.answers],
+        'corrections': list(rc.corrections),
+        'infoboxes': rc.infoboxes,
+        'suggestions': list(rc.suggestions),
+        'unresponsive_engines': get_translated_errors(rc.unresponsive_engines),
+    }
+    return json.dumps(data, cls=JSONEncoder)
+```
+
+**翻译函数**（`searx/webutils.py:70-82`）：
+```python
+def get_translated_errors(unresponsive_engines: "Iterable[UnresponsiveEngine]"):
+    translated_errors = []
+    for unresponsive_engine in unresponsive_engines:
+        error_user_text = exception_classname_to_text.get(
+            unresponsive_engine.error_type,
+            exception_classname_to_text[None]  # fallback: unexpected crash
+        )
+        error_msg = gettext(error_user_text)
+        if unresponsive_engine.suspended:
+            error_msg = gettext('Suspended') + ': ' + error_msg
+        translated_errors.append((unresponsive_engine.engine, error_msg))
+    return sorted(translated_errors, key=lambda e: e[0])
+```
+
+**JSON 输出示例**：
+```json
+{
+  "query": "test",
+  "unresponsive_engines": [
+    ["google", "timeout"],
+    ["bing", "Suspended: access denied"]
+  ],
+  ...
+}
+```
+
+### 4.5 页面渲染落点
+
+**位置**：`searx/webapp.py:771-773`
+
+```python
+return render(
+    ...
+    unresponsive_engines = webutils.get_translated_errors(
+        result_container.unresponsive_engines
+    ),
+    ...
+)
+```
+
+**模板渲染**（`searx/templates/simple/elements/engines_msg.html:10-20`）：
+```html
+<table class="engine-stats" id="engines_msg-table">
+  {%- for engine_name, error_type in unresponsive_engines -%}
+  <tr>
+    <td class="engine-name">
+      <a href="{{ url_for('stats', engine=engine_name|e) }}"
+         title="{{ _('View error logs and submit a bug report') }}">
+         {{- engine_name -}}
+      </a>
+    </td>
+    <td class="response-error">{{- error_type -}}</td>
+  </tr>
+  {%- endfor -%}
+  ...
+</table>
+```
+
+### 4.6 完整映射链
+
+```
+异常发生
+    │
+    ├─→ add_unresponsive_engine(engine_name, error_type, suspended)
+    │     └─→ 存入 ResultContainer.unresponsive_engines 集合
+    │
+    └─→ 输出阶段
+          ├─→ JSON: get_translated_errors() → 翻译 → unresponsive_engines 字段
+          │     格式: [["engine1", "timeout"], ["engine2", "Suspended: access denied"]]
+          │
+          └─→ HTML: get_translated_errors() → 翻译 → 模板渲染
+                格式: 表格行展示，引擎名可链接到统计页面
+```
+
+---
+
+## 五、绕过网络超时主链的场景
+
+### 5.1 搜索主流程总览
+
+**位置**：`searx/search/__init__.py:174-179`
+
+```python
+def search(self) -> ResultContainer:
+    self.start_time = default_timer()
+    if not self.search_external_bang():      # 分支 1: external bang
+        if not self.search_answerers():      # 分支 2: answerers
+            self.search_standard()           # 主链: 正常网络搜索
+    return self.result_container
+```
+
+**优先级**：External Bang > Answerers > 标准搜索
+
+### 5.2 External Bang 完全绕过
+
+**触发条件**：用户输入 `!!g test`（双感叹号前缀）
+
+**位置**：`searx/search/__init__.py:59-69`
+
+```python
+def search_external_bang(self) -> bool:
+    """Check if there is a external bang.  If yes, update
+    self.result_container and return True."""
+    if self.search_query.external_bang:
+        self.result_container.redirect_url = get_bang_url(self.search_query)
+        # 有效 bang，直接返回 True，跳过后续所有搜索
+        if isinstance(self.result_container.redirect_url, str):
+            return True
+    return False
+```
+
+**解析流程**（`searx/query.py:151-175`）：
+```python
+class ExternalBangParser(QueryPartParser):
+    @staticmethod
+    def check(raw_value):
+        return raw_value.startswith('!!') and len(raw_value) > 2
+    
+    def _parse(self, value):
+        bang_definition, bang_ac_list = get_bang_definition_and_autocomplete(value)
+        if bang_definition is not None:
+            self.raw_text_query.external_bang = value  # 标记 external bang
+            found = True
+        return found, bang_ac_list
+```
+
+**URL 生成**（`searx/external_bang.py:93-109`）：
+```python
+def get_bang_url(search_query: "SearchQuery", ...) -> str | None:
+    if search_query.external_bang:
+        bang_definition, _ = get_bang_definition_and_ac(EXTERNAL_BANGS, search_query.external_bang)
+        if bang_definition and isinstance(bang_definition, str):
+            ret_val = resolve_bang_definition(bang_definition, search_query.query)[0]
+    return ret_val
+```
+
+**Web 层重定向**（`searx/webapp.py:666-667`）：
+```python
+# 1. check if the result is a redirect for an external bang
+if result_container.redirect_url:
+    return redirect(result_container.redirect_url)
+```
+
+**关键特性**：
+- ✅ 不创建任何引擎线程
+- ✅ 不调用 `search_standard()`
+- ✅ 不计算 `actual_timeout`
+- ✅ 完全没有网络请求
+- ✅ 零超时风险
+
+### 5.3 Answerers 本地计算绕过
+
+**触发条件**：查询第一个词匹配 answerer 关键词（如 `calc 1+1`, `weather beijing`）
+
+**位置**：`searx/search/__init__.py:71-75`
+
+```python
+def search_answerers(self):
+    results = searx.answerers.STORAGE.ask(self.search_query.query)
+    self.result_container.extend(None, results)
+    return bool(results)  # 有结果返回 True，跳过标准搜索
+```
+
+**Answerer 调度**（`searx/answerers/_core.py:143-164`）：
+```python
+def ask(self, query: str) -> list[BaseAnswer]:
+    results = []
+    keyword = None
+    for keyword in query.split():
+        if keyword:
+            break
+    
+    if not keyword or keyword not in self:
+        return results
+    
+    for answerer in self[keyword]:
+        for answer in answerer.answer(query):
+            answer.engine = f"answerer: {keyword}"
+            results.append(answer)
+    
+    return results
+```
+
+**Answerer 基类**（`searx/answerers/_core.py:43-55`）：
+```python
+class Answerer(abc.ABC):
+    keywords: list[str]
+    
+    @abc.abstractmethod
+    def answer(self, query: str) -> list[BaseAnswer]:
+        """纯本地计算，无网络请求"""
+```
+
+**关键特性**：
+- ✅ 不创建引擎线程
+- ✅ 不调用 `search_standard()`
+- ✅ 纯本地计算，无网络 I/O
+- ✅ 无超时概念
+- ✅ 结果直接进入 `result_container.answers`
+
+### 5.4 两类绕过对比
+
+| 特性 | External Bang | Answerers | 标准搜索 |
+|-----|--------------|-----------|---------|
+| 触发条件 | `!!keyword` 前缀 | 首词匹配关键词 | 默认路径 |
+| 线程创建 | ❌ 无 | ❌ 无 | ✅ 每个引擎一个线程 |
+| 网络请求 | ❌ 无（仅重定向） | ❌ 纯本地 | ✅ 大量 |
+| 超时处理 | ❌ 无 | ❌ 无 | ✅ 完整超时链 |
+| 结果来源 | 外部网站跳转 | 本地计算 | 引擎搜索结果 |
+| 响应速度 | 极快（<10ms） | 快（<100ms） | 慢（取决于引擎） |
+
+---
+
+## 六、主线程 join 超时后的 _timeout 标记分析
+
+### 6.1 标记设置点
+
+**位置**：`searx/search/__init__.py:148-158`
+
+```python
+def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]]):
+    # ... 创建线程 ...
+    th._timeout = False  # 初始标记
+    th._engine_name = engine_name
+    th.start()
+    
+    # ... 监控超时 ...
+    for th in threading.enumerate():
+        if th.name == search_id:
+            remaining_time = max(0.0, self.actual_timeout - (default_timer() - self.start_time))
+            th.join(remaining_time)
+            if th.is_alive():
+                th._timeout = True  # 关键：设置超时标记
+                self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
+                PROCESSORS[th._engine_name].logger.error('engine timeout')
+```
+
+### 6.2 _timeout 标记的去向
+
+**重要发现**：`th._timeout` 标记设置后，**没有任何代码读取这个标记**。
+
+全代码库搜索 `._timeout` 仅出现在两处：
+1. `th._timeout = False` - 初始化（`searx/search/__init__.py:149`）
+2. `th._timeout = True` - 标记超时（`searx/search/__init__.py:156`）
+
+**没有任何读取操作**，这个标记实际上是**死代码**。
+
+### 6.3 实际生效的三条路径
+
+当主线程检测到超时后，实际执行的操作只有三条：
+
+| 操作 | 代码位置 | 影响 |
+|-----|---------|------|
+| `th._timeout = True` | L156 | 无实际影响（死代码） |
+| `add_unresponsive_engine(engine_name, 'timeout')` | L157 | ✅ 用户可见，JSON/页面展示 |
+| `logger.error('engine timeout')` | L158 | ✅ 日志记录 |
+
+### 6.4 与处理器内部超时的统计差异
+
+**路径 A：处理器内部捕获超时**（`httpx.TimeoutException`）
+```python
+# searx/search/processors/abstract.py:165-191
+def handle_exception(...):
+    result_container.add_unresponsive_engine(...)  # ✅ 用户可见
+    counter_inc('engine', name, 'search', 'count', 'error')  # ✅ 错误计数+1
+    count_exception(name, exc)  # ✅ 记录异常栈（用于 /stats 页面）
+    self.suspended_status.suspend(...)  # ✅ 可能暂停引擎
+```
+
+**路径 B：主线程 join 超时**（`searx/search/__init__.py:156-158`）
+```python
+if th.is_alive():
+    th._timeout = True  # ❌ 无实际作用
+    self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')  # ✅ 用户可见
+    PROCESSORS[th._engine_name].logger.error('engine timeout')  # ✅ 日志
+    # ❌ 缺少 counter_inc
+    # ❌ 缺少 count_error
+    # ❌ 缺少 suspended_status.suspend
+```
+
+**统计差异对比表**：
+
+| 统计项 | 内部捕获 (Path A) | 主线程超时 (Path B) |
+|-------|------------------|-------------------|
+| 用户可见错误 | ✅ | ✅ |
+| `search.count.error` 计数 | ✅ +1 | ❌ 无 |
+| `/stats` 异常详情 | ✅ 有栈信息 | ❌ 无 |
+| 引擎自动暂停 | ✅ 可能 | ❌ 不会 |
+| 日志记录 | ✅ | ✅ |
+
+**设计意图推测**：
+`th._timeout` 可能是为了后续在线程退出时做清理或统计，但从未实现。主线程超时路径缺少统计计数可能是一个设计疏忽。
+
+---
+
+## 七、不同引擎/场景的分支差异
+
+### 7.1 处理器类型概览
 
 **位置**：`searx/search/processors/__init__.py:39-45`
 
@@ -321,7 +703,7 @@ processor_types: dict[str, type[EngineProcessor]] = {
 }
 ```
 
-### 4.2 OnlineProcessor（在线引擎）
+### 7.2 OnlineProcessor（在线引擎）
 
 **适用场景**：绝大多数网络搜索引擎（Google、Bing、Wikipedia 等）
 
@@ -333,7 +715,7 @@ processor_types: dict[str, type[EngineProcessor]] = {
 
 **关键代码**：`searx/search/processors/online.py:113-282`
 
-### 4.3 OfflineProcessor（离线引擎）
+### 7.3 OfflineProcessor（离线引擎）
 
 **适用场景**：本地数据库、SQLite、Elasticsearch 等不需要网络请求的引擎
 
@@ -358,7 +740,7 @@ class OfflineProcessor(EngineProcessor):
             self.handle_exception(result_container, e)  # 不暂停
 ```
 
-### 4.4 OnlineDictionaryProcessor（字典翻译）
+### 7.4 OnlineDictionaryProcessor（字典翻译）
 
 **适用场景**：在线字典、翻译引擎（如 Lingva、LibreTranslate）
 
@@ -369,7 +751,7 @@ class OfflineProcessor(EngineProcessor):
 
 **关键代码**：`searx/search/processors/online_dictionary.py:37-102`
 
-### 4.5 OnlineCurrencyProcessor（货币转换）
+### 7.5 OnlineCurrencyProcessor（货币转换）
 
 **适用场景**：货币汇率查询引擎
 
@@ -380,7 +762,7 @@ class OfflineProcessor(EngineProcessor):
 
 **关键代码**：`searx/search/processors/online_currency.py:50-109`
 
-### 4.6 OnlineUrlSearchProcessor（URL 搜索）
+### 7.6 OnlineUrlSearchProcessor（URL 搜索）
 
 **适用场景**：直接 URL 查询（TinEye 等）
 
@@ -391,7 +773,7 @@ class OfflineProcessor(EngineProcessor):
 
 **关键代码**：`searx/search/processors/online_url_search.py:32-64`
 
-### 4.7 各类处理器对比
+### 7.7 各类处理器对比
 
 | 处理器类型 | 网络请求 | 超时处理 | 引擎暂停 | 特殊处理 |
 |-----------|---------|---------|---------|---------|
@@ -401,7 +783,7 @@ class OfflineProcessor(EngineProcessor):
 | OnlineCurrencyProcessor | ✅ | ✅ 完整 | ✅ | 货币格式解析 |
 | OnlineUrlSearchProcessor | ✅ | ✅ 完整 | ✅ | URL 模式匹配 |
 
-### 4.8 特殊场景：Tor 网络引擎
+### 7.8 特殊场景：Tor 网络引擎
 
 **位置**：`searx/engines/__init__.py:196-199`
 
@@ -423,9 +805,9 @@ outgoing:
 
 ---
 
-## 五、完整调用链总结
+## 八、完整调用链总结
 
-### 5.1 超时设置调用链
+### 8.1 标准搜索超时设置调用链
 
 ```
 Search.search()
@@ -445,7 +827,7 @@ Search.search()
                                         └── future.result(timeout)  # 应用超时
 ```
 
-### 5.2 超时异常传递链
+### 8.2 处理器内部超时异常传递链
 
 ```
 future.result(timeout) 超时
@@ -454,26 +836,55 @@ future.result(timeout) 超时
         └── OnlineProcessor.search() 捕获
             └── handle_exception()
                 ├── add_unresponsive_engine()  # 标记无响应
-                ├── count_error()              # 统计指标
+                ├── counter_inc(error)         # 错误计数
+                ├── count_exception()          # 记录异常栈
                 └── suspended_status.suspend() # 暂停引擎（可选）
 ```
 
-### 5.3 主线程超时监控链
+### 8.3 主线程超时监控链
 
 ```
 Search.search_multiple_requests()
 └── th.join(remaining_time)
     └── 线程仍存活
-        ├── th._timeout = True
-        ├── add_unresponsive_engine()
-        └── logger.error('engine timeout')
+        ├── th._timeout = True        # 标记（死代码）
+        ├── add_unresponsive_engine() # 用户可见
+        └── logger.error()            # 日志记录
+        # 注意：不增加 error 计数，不记录异常栈，不暂停引擎
+```
+
+### 8.4 External Bang 绕过链
+
+```
+用户输入 !!g test
+└── RawTextQuery._parse_query()
+    └── ExternalBangParser.__call__()
+        └── raw_text_query.external_bang = 'g'
+            └── Search.search()
+                └── search_external_bang()
+                    └── get_bang_url() → 生成重定向 URL
+                        └── 返回 True → 跳过 search_answerers() 和 search_standard()
+                            └── webapp.py → redirect()
+```
+
+### 8.5 Answerers 绕过链
+
+```
+用户输入 calc 1+1
+└── Search.search()
+    ├── search_external_bang() → 返回 False
+    └── search_answerers()
+        └── AnswerStorage.ask('calc 1+1')
+            └── Calculator.answer('calc 1+1') → 返回结果
+                └── 返回 True → 跳过 search_standard()
+                    └── 结果直接渲染
 ```
 
 ---
 
-## 六、关键配置参考
+## 九、关键配置参考
 
-### 6.1 settings.yml 超时相关配置
+### 9.1 settings.yml 超时相关配置
 
 ```yaml
 outgoing:
@@ -486,7 +897,7 @@ search:
   max_ban_time_on_fail: 120   # 最大暂停时间（秒）
 ```
 
-### 6.2 引擎级配置示例
+### 9.2 引擎级配置示例
 
 ```yaml
 engines:
@@ -500,19 +911,40 @@ engines:
     inactive: true
 ```
 
+### 9.3 用户查询语法
+
+| 语法 | 含义 | 单位 |
+|-----|------|------|
+| `<3` | 3 秒超时 | 秒 |
+| `<850` | 850 毫秒超时 | 毫秒 |
+| `!!g test` | External Bang，跳转到 Google | 无超时 |
+| `calc 1+1` | 触发 answerer，本地计算 | 无超时 |
+
 ---
 
-## 七、代码位置索引
+## 十、代码位置索引
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
 | 全局默认配置 | `searx/settings.yml` | 179-182 |
 | 引擎默认参数 | `searx/engines/__init__.py` | 30-49 |
 | 用户超时解析 | `searx/query.py` | 43-69 |
+| External Bang 解析 | `searx/query.py` | 151-175 |
 | 超时计算逻辑 | `searx/search/__init__.py` | 78-134 |
+| External Bang 检测 | `searx/search/__init__.py` | 59-69 |
+| Answerers 检测 | `searx/search/__init__.py` | 71-75 |
+| 主线程超时监控 | `searx/search/__init__.py` | 136-158 |
+| 搜索主流程分支 | `searx/search/__init__.py` | 174-179 |
 | 线程超时设置 | `searx/network/__init__.py` | 28-44 |
 | 超时应用逻辑 | `searx/network/__init__.py` | 73-108 |
 | 在线处理器超时 | `searx/search/processors/online.py` | 257-282 |
 | 异常处理 | `searx/search/processors/abstract.py` | 165-191 |
-| 主线程超时监控 | `searx/search/__init__.py` | 136-158 |
+| UnresponsiveEngine 定义 | `searx/results.py` | 47-50 |
+| add_unresponsive_engine | `searx/results.py` | 274-280 |
+| 错误翻译映射 | `searx/webutils.py` | 36-67 |
+| JSON 输出 | `searx/webutils.py` | 162-175 |
+| 页面模板 | `searx/templates/simple/elements/engines_msg.html` | 1-34 |
 | Tor 超时调整 | `searx/engines/__init__.py` | 196-199 |
+| Answerer 核心 | `searx/answerers/_core.py` | 143-164 |
+| External Bang URL 生成 | `searx/external_bang.py` | 93-109 |
+| Web 层重定向 | `searx/webapp.py` | 666-667 |
