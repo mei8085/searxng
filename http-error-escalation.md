@@ -149,111 +149,154 @@ def resume(self):
 
 ---
 
-## 4. 用户提示与页面展示（按真实实现校准）
+## 4. 用户提示与页面展示（按时序校准）
 
-### 4.1 错误信息展示流程
+### 4.1 两种错误展示时机的核心差异
 
-错误信息从后端到前端的完整流程：
+SearXNG 有两条独立的代码路径会产生用户可见的错误提示，二者的展示形式有本质区别：
 
-1. **错误捕获**：`handle_exception` 调用 `result_container.add_unresponsive_engine(engine_name, error_type, suspended)`
-   - `error_type` 是异常类名（如 `httpx.TimeoutException`）或特殊字符串（如 `timeout`）
-   - `suspended` 标记该错误是否触发了引擎挂起
+| 时机 | 触发场景 | 代码路径 | suspended 参数 | 用户提示前缀 |
+|------|----------|----------|----------------|-------------|
+| **时机A：首次请求报错** | 当前查询执行失败，引擎刚被挂起 | `handle_exception` → `add_unresponsive_engine(name, error_type)` | `False`（默认值）| 无前缀 |
+| **时机B：后续请求命中挂起** | 引擎已处于挂起状态，新查询直接跳过 | `extend_container_if_suspended` → `add_unresponsive_engine(name, reason, suspended=True)` | `True`（显式传入） | `Suspended: ` 前缀 |
 
-2. **翻译映射**：`webutils.get_translated_errors()` 通过 `exception_classname_to_text` 字典将异常类名映射为用户可见文本
+**关键代码对比：**
 
-3. **前缀添加**：如果 `suspended=True`，在翻译后的文本前添加 "Suspended: " 前缀
+```python
+# 时机A：首次请求报错 - handle_exception 第179行
+# 注意：没有传第三个参数，suspended 默认是 False
+result_container.add_unresponsive_engine(self.engine.name, error_message)
 
-4. **页面渲染**：在搜索结果页侧边栏的 "Response time" 区域展示
+# 时机B：后续请求命中挂起 - extend_container_if_suspended 第227-228行
+# 注意：显式传入 suspended=True
+result_container.add_unresponsive_engine(
+    self.engine.name, self.suspended_status.suspend_reason, suspended=True
+)
+```
 
-**关键说明：**
-- 用户界面 **不会** 显示异常 message 中的 `suspended_time=180` 等内部参数
-- 所有挂起的错误统一添加 "Suspended: " 前缀，而非 "Engine X is suspended" 格式
-- 未挂起的错误直接显示翻译后的文本，无前缀
+[searx/search/processors/abstract.py:179](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L179)
+[searx/search/processors/abstract.py:225-231](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L225-L231)
+
+### 4.2 翻译映射与前缀生成
+
+无论哪种时机，`error_type` 都是异常类名（如 `httpx.TimeoutException`），经过 `exception_classname_to_text` 字典翻译后，再根据 `suspended` 参数决定是否加前缀：
+
+```python
+def get_translated_errors(unresponsive_engines):
+    for unresponsive_engine in unresponsive_engines:
+        # 1. 通过字典映射为用户友好文本
+        error_user_text = exception_classname_to_text.get(unresponsive_engine.error_type)
+        error_msg = gettext(error_user_text)
+        # 2. 只有 suspended=True 时才加前缀
+        if unresponsive_engine.suspended:
+            error_msg = gettext('Suspended') + ': ' + error_msg
+        translated_errors.append((unresponsive_engine.engine, error_msg))
+```
 
 [searx/webutils.py:70-82](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L70-L82)
 
-### 4.2 异常类名到用户文本的映射
+### 4.3 异常类名到用户文本的映射
 
-| 异常类名 | 用户可见文本（英文） | 中文翻译示例 | 挂起时展示 |
-|----------|----------------------|--------------|------------|
-| `timeout` | `timeout` | 超时 | `Suspended: timeout` |
-| `httpx.TimeoutException` | `timeout` | 超时 | `Suspended: timeout` |
-| `httpx.ConnectTimeout` | `timeout` | 超时 | `Suspended: timeout` |
-| `httpx.ReadTimeout` | `timeout` | 超时 | `Suspended: timeout` |
-| `ssl.SSLCertVerificationError` | `SSL error: certificate validation has failed` | SSL错误：证书验证失败 | `Suspended: SSL error: certificate validation has failed` |
-| `httpx.ConnectError` | `HTTP connection error` | HTTP连接错误 | `Suspended: HTTP connection error` |
-| `httpx.HTTPStatusError` | `HTTP error` | HTTP错误 | `Suspended: HTTP error` |
-| `httpx.ProxyError` | `proxy error` | 代理错误 | `Suspended: proxy error` |
-| `searx.exceptions.SearxEngineCaptchaException` | `CAPTCHA` | 人机验证 | `Suspended: CAPTCHA` |
-| `searx.exceptions.SearxEngineTooManyRequestsException` | `too many requests` | 请求过多 | `Suspended: too many requests` |
-| `searx.exceptions.SearxEngineAccessDeniedException` | `access denied` | 访问被拒绝 | `Suspended: access denied` |
-| `json.decoder.JSONDecodeError` | `parsing error` | 解析错误 | `parsing error`（不挂起） |
-| `KeyError` | `parsing error` | 解析错误 | `parsing error`（不挂起） |
-| 其他未匹配 | `unexpected crash` | 意外崩溃 | 视 suspended 参数而定 |
+| 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
+|----------|-------------------|----------------------|----------------------|
+| `searx.exceptions.SearxEngineAccessDeniedException` | `access denied` | `access denied` | `Suspended: access denied` |
+| `searx.exceptions.SearxEngineTooManyRequestsException` | `too many requests` | `too many requests` | `Suspended: too many requests` |
+| `searx.exceptions.SearxEngineCaptchaException` | `CAPTCHA` | `CAPTCHA` | `Suspended: CAPTCHA` |
+| `httpx.TimeoutException` / `httpx.ConnectTimeout` | `timeout` | `timeout` | `Suspended: timeout` |
+| `ssl.SSLCertVerificationError` | `SSL error: certificate validation has failed` | `SSL error: certificate validation has failed` | `Suspended: SSL error: certificate validation has failed` |
+| `httpx.ConnectError` | `HTTP connection error` | `HTTP connection error` | `Suspended: HTTP connection error` |
+| `httpx.HTTPStatusError` | `HTTP error` | `HTTP error` | `Suspended: HTTP error` |
+| `json.decoder.JSONDecodeError` | `parsing error` | `parsing error` | （不会挂起，无时机B） |
+| 其他未匹配 | `unexpected crash` | 视 suspended 参数而定 | - |
 
 [searx/webutils.py:36-67](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L36-L67)
 
-### 4.3 各错误等级的实际用户提示
+> **重要澄清**：用户界面 **不会** 显示异常 message 中的 `suspended_time=180` 等内部参数，也不会显示 "Engine X is suspended" 格式。
 
-#### L1 - CAPTCHA / 防火墙封禁
+### 4.4 四类典型场景的时序对齐
 
-- **挂起时长**：1天 ~ 15天（视具体类型）
-- **用户提示**：
-  - Cloudflare CAPTCHA：`Suspended: CAPTCHA`
-  - ReCAPTCHA：`Suspended: CAPTCHA`
-  - Cloudflare 防火墙 1020：`Suspended: access denied`
-- **展示位置**：搜索结果页侧边栏 "Response time" 表格中
-- **后续请求**：挂起期间直接跳过该引擎，不再发送请求
-- **健康度影响**：严重影响引擎可用性，需要管理员介入
+#### 场景1：访问拒绝（L2 - HTTP 403）
 
-#### L2 - 访问拒绝（HTTP 402/403）
+**时序过程：**
+1. **请求 N（首次报错）**：引擎返回 403，触发 `SearxEngineAccessDeniedException`
+   - 代码路径：`handle_exception` → `add_unresponsive_engine(engine, "searx.exceptions.SearxEngineAccessDeniedException")`
+   - `suspended=False`（默认）
+   - **用户看到**：`access denied`
+   - 同时引擎被挂起 180 秒
 
-- **挂起时长**：180秒（3分钟）
-- **用户提示**：`Suspended: access denied`
-- **后续请求**：挂起期间直接跳过该引擎
-- **健康度影响**：错误计数 +1，成功率下降，可靠性评分降低
+2. **请求 N+1（5秒后，仍在挂起期内）**：新查询到达
+   - 代码路径：`extend_container_if_suspended` 检测到挂起 → `add_unresponsive_engine(engine, reason, suspended=True)`
+   - **用户看到**：`Suspended: access denied`
+   - 不发送实际 HTTP 请求
 
-#### L3 - 限流触发（HTTP 429）
+3. **请求 N+K（180秒后，挂起已结束）**：新查询到达
+   - 引擎恢复正常，重新发送请求
 
-- **挂起时长**：180秒（3分钟）
-- **用户提示**：`Suspended: too many requests`
-- **后续请求**：挂起期间直接跳过该引擎，避免进一步触发源站限流
-- **健康度影响**：错误计数 +1，成功率下降，管理员可能需要考虑降低请求频率或更换出口IP
+#### 场景2：限流触发（L3 - HTTP 429）
 
-#### L4 - 传输故障
+**时序过程：**
+1. **请求 N（首次报错）**：引擎返回 429，触发 `SearxEngineTooManyRequestsException`
+   - 代码路径：`handle_exception` → `add_unresponsive_engine(engine, "searx.exceptions.SearxEngineTooManyRequestsException")`
+   - `suspended=False`（默认）
+   - **用户看到**：`too many requests`
+   - 同时引擎被挂起 180 秒
 
-| 具体错误类型 | 用户提示（挂起时） |
-|--------------|-------------------|
-| SSL证书验证失败 | `Suspended: SSL error: certificate validation has failed` |
-| HTTP连接错误 | `Suspended: HTTP connection error` |
-| 代理错误 | `Suspended: proxy error` |
-| 其他HTTP错误 | `Suspended: HTTP error` |
+2. **请求 N+1（挂起期内）**：新查询到达
+   - 代码路径：`extend_container_if_suspended` → `add_unresponsive_engine(engine, reason, suspended=True)`
+   - **用户看到**：`Suspended: too many requests`
+   - 不发送实际 HTTP 请求
 
-- **挂起时长**：固定 5 秒（默认配置）
-- **后续请求**：5秒后自动恢复，可继续接受请求
-- **健康度影响**：错误计数 +1，短时波动不影响长期评分，频繁发生需检查网络
+#### 场景3：响应超时（L5）
 
-#### L5 - 响应超时
+**时序过程：**
+1. **请求 N（首次报错）**：HTTP 请求超时，触发 `httpx.TimeoutException`
+   - 代码路径：`handle_exception` → `add_unresponsive_engine(engine, "httpx.TimeoutException")`
+   - `suspended=False`（默认）
+   - **用户看到**：`timeout`
+   - 同时引擎被挂起 5 秒
 
-- **挂起时长**：固定 5 秒（默认配置）
-- **用户提示**：`Suspended: timeout`
-- **注意**：所有类型的超时（连接超时、读取超时、写入超时、asyncio超时）统一展示为 "timeout"
-- **后续请求**：5秒后自动恢复
-- **健康度影响**：错误计数 +1，若持续超时需检查引擎响应速度或增大 timeout 配置
+2. **请求 N+1（3秒后，仍在挂起期内）**：新查询到达
+   - 代码路径：`extend_container_if_suspended` → `add_unresponsive_engine(engine, reason, suspended=True)`
+   - **用户看到**：`Suspended: timeout`
+   - 不发送实际 HTTP 请求
 
-#### L6 - 解析异常
+3. **请求 N+2（6秒后，挂起已结束）**：新查询到达
+   - 引擎恢复正常，重新发送请求
 
-- **挂起时长**：不挂起
-- **用户提示**：`parsing error`（无前缀）
-- **后续请求**：不影响，下次请求继续尝试
-- **健康度影响**：错误计数 +1，通常表示引擎API格式变更，需维护引擎解析规则
+#### 场景4：协议错误（L4 - SSL证书错误）
 
-### 4.4 结果完整性影响
+**时序过程：**
+1. **请求 N（首次报错）**：HTTPS 握手失败，触发 `ssl.SSLCertVerificationError`
+   - 代码路径：`handle_exception` → `add_unresponsive_engine(engine, "ssl.SSLCertVerificationError")`
+   - `suspended=False`（默认）
+   - **用户看到**：`SSL error: certificate validation has failed`
+   - 同时引擎被挂起 5 秒
+
+2. **请求 N+1（挂起期内）**：新查询到达
+   - 代码路径：`extend_container_if_suspended` → `add_unresponsive_engine(engine, reason, suspended=True)`
+   - **用户看到**：`Suspended: SSL error: certificate validation has failed`
+   - 不发送实际 HTTP 请求
+
+### 4.5 特殊场景：不挂起的错误（L6 解析异常）
+
+**时序过程：**
+1. **请求 N（报错）**：JSON 解析失败，触发 `json.decoder.JSONDecodeError`
+   - 代码路径：`handle_exception`（`suspend=False`）→ `add_unresponsive_engine(engine, "json.decoder.JSONDecodeError")`
+   - `suspended=False`
+   - **用户看到**：`parsing error`
+   - 引擎不被挂起
+
+2. **请求 N+1（任意时间后）**：新查询到达
+   - 不会命中挂起逻辑，直接发送请求
+   - 如果再次失败，用户仍然看到 `parsing error`（无前缀）
+
+### 4.6 结果完整性影响
 
 - **单引擎失败**：不影响整体搜索，仅缺少该引擎结果，用户在 "Response time" 区域看到错误提示
 - **多引擎同类错误**：如多个引擎同时出现SSL错误，可能是出口网络问题
 - **全引擎失败**：页面显示 "Sorry, we didn't find any results"，并在侧边栏列出所有失败引擎
 - **挂起期间**：引擎完全不可用，结果中不会包含该引擎的任何内容
+- **前缀识别**：用户可通过是否有 "Suspended: " 前缀判断该引擎是本次查询失败，还是之前就已被挂起
 
 ---
 
