@@ -11,8 +11,8 @@ SearXNG 的错误处理机制围绕 **异常类继承层次** 和 **挂起时长
 | **L1 - 致命阻塞** | CAPTCHA / 防火墙封禁 | Cloudflare CAPTCHA、Cloudflare 防火墙 1020、ReCAPTCHA | 长时挂起（1天 ~ 15天）| ⭐⭐⭐⭐⭐ |
 | **L2 - 访问拒绝** | 权限类错误 | HTTP 402 / 403、主动拒绝访问 | 中时挂起（180秒）| ⭐⭐⭐⭐ |
 | **L3 - 限流触发** | 请求频率超限 | HTTP 429 Too Many Requests | 中时挂起（180秒）| ⭐⭐⭐⭐ |
-| **L4 - 传输故障** | 网络协议错误 | SSL 错误、DNS 失败、连接重置、HTTP 5xx | 短时挂起（5秒 ~ 120秒递增）| ⭐⭐⭐ |
-| **L5 - 响应超时** | 性能类错误 | 连接超时、读取超时、引擎响应过慢 | 短时挂起（5秒 ~ 120秒递增）| ⭐⭐⭐ |
+| **L4 - 传输故障** | 网络协议错误 | SSL 错误、DNS 失败、连接重置、HTTP 5xx | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
+| **L5 - 响应超时** | 性能类错误 | 连接超时、读取超时、引擎响应过慢 | 固定短时挂起（默认5秒）| ⭐⭐⭐ |
 | **L6 - 解析异常** | 数据处理错误 | JSON 解析失败、XPATH 不匹配、API 格式变更 | 不挂起（仅统计）| ⭐⭐ |
 | **L7 - 次要告警** | 非预期行为 | 重定向次数超限、软限制触发 | 不挂起（仅统计，标记 secondary）| ⭐ |
 
@@ -60,13 +60,13 @@ try:
     search_results = self._search_basic(query, params)
     self.extend_container(result_container, start_time, search_results)
 except ssl.SSLError as e:
-    self.handle_exception(result_container, e, suspend=True)  # L4
+    self.handle_exception(result_container, e, suspend=True)  # L4, 挂起
 except (httpx.TimeoutException, asyncio.TimeoutError) as e:
-    self.handle_exception(result_container, e, suspend=True)  # L5
+    self.handle_exception(result_container, e, suspend=True)  # L5, 挂起
 except (httpx.HTTPError, httpx.StreamError) as e:
-    self.handle_exception(result_container, e, suspend=True)  # L4
+    self.handle_exception(result_container, e, suspend=True)  # L4, 挂起
 except (SearxEngineCaptchaException, SearxEngineTooManyRequestsException, SearxEngineAccessDeniedException) as e:
-    self.handle_exception(result_container, e, suspend=True)  # L1/L2/L3
+    self.handle_exception(result_container, e, suspend=True)  # L1/L2/L3, 挂起
 except Exception as e:
     self.handle_exception(result_container, e)  # L6, 不挂起
 ```
@@ -75,7 +75,7 @@ except Exception as e:
 
 ---
 
-## 3. 错误升级策略
+## 3. 错误挂起策略（按真实实现校准）
 
 ### 3.1 挂起时长阶梯配置
 
@@ -83,7 +83,7 @@ except Exception as e:
 
 ```yaml
 search:
-  ban_time_on_fail: 5           # 普通错误初始挂起时间（秒）
+  ban_time_on_fail: 5           # 普通错误挂起时间（秒）
   max_ban_time_on_fail: 120     # 普通错误最大挂起时间（秒）
   suspended_times:
     SearxEngineAccessDenied: 180          # L2: 访问拒绝
@@ -96,41 +96,47 @@ search:
 
 [searx/settings.yml:66-81](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/settings.yml#L66-L81)
 
-### 3.2 连续错误递增机制
+### 3.2 挂起时间计算逻辑（关键校准）
 
-对于 L4/L5 级别的传输和超时错误，挂起时间随连续错误次数递增：
+**重要说明：普通错误的挂起时间是固定的，不随连续错误次数递增。**
 
 ```python
 def suspend(self, suspended_time: int | None, suspend_reason: str):
     with self.lock:
+        # continuous_errors 仅用于计数，不参与挂起时长计算
         self.continuous_errors += 1
         if suspended_time is None:
-            # 普通错误使用递增策略
-            max_ban: int = get_setting("search.max_ban_time_on_fail")  # 120
-            ban_fail: int = get_setting("search.ban_time_on_fail")    # 5
-            # 实际挂起时间 = min(ban_fail * continuous_errors, max_ban)
-            suspended_time = min(max_ban, ban_fail * self.continuous_errors)
+            # 普通错误（超时、SSL错误、HTTP错误等）使用固定时长
+            # 取 ban_time_on_fail 和 max_ban_time_on_fail 中的较小值
+            max_ban: int = get_setting("search.max_ban_time_on_fail")  # 默认 120
+            ban_fail: int = get_setting("search.ban_time_on_fail")    # 默认 5
+            suspended_time = min(max_ban, ban_fail)  # 默认 min(120, 5) = 5 秒
+
         self.suspend_end_time = default_timer() + suspended_time
+        self.suspend_reason = suspend_reason
+        logger.debug("Suspend for %i seconds", suspended_time)
 ```
 
 [searx/search/processors/abstract.py:90-101](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L90-L101)
 
-**递增示例：**
-- 第1次超时：挂起 `min(120, 5*1) = 5` 秒
-- 第2次超时：挂起 `min(120, 5*2) = 10` 秒
-- 第3次超时：挂起 `min(120, 5*3) = 15` 秒
-- ...
-- 第24次及以上：挂起 `min(120, 5*24) = 120` 秒（封顶）
+**真实行为：**
+- 默认配置下，所有普通错误（L4/L5）统一挂起 `min(120, 5) = 5` 秒
+- 连续错误仅增加 `continuous_errors` 计数，但挂起时长保持不变
+- 若修改 `ban_time_on_fail: 10`，`max_ban_time_on_fail: 30`，则挂起 `min(30, 10) = 10` 秒
+- L1/L2/L3 级错误使用异常类自带的 `suspended_time`，不受上述两个参数影响
 
 ### 3.3 错误降级与恢复
 
-当引擎成功返回结果时，连续错误计数会被重置：
+当引擎成功返回结果时，连续错误计数和挂起状态会被重置：
 
 ```python
 def extend_container(self, result_container, start_time, search_results):
-    if search_results is not None:
-        self._extend_container_basic(result_container, start_time, search_results)
-    self.suspended_status.resume()  # 重置连续错误计数和挂起状态
+    if getattr(threading.current_thread(), '_timeout', False):
+        self.handle_exception(result_container, 'timeout', False)
+    else:
+        if search_results is not None:
+            self._extend_container_basic(result_container, start_time, search_results)
+        self.suspended_status.resume()  # 成功响应后立即重置
 
 def resume(self):
     with self.lock:
@@ -143,70 +149,111 @@ def resume(self):
 
 ---
 
-## 4. 对整体响应的影响
+## 4. 对整体响应和用户提示的影响
 
-### 4.1 用户可见提示
+### 4.1 限流与访问拒绝的具体影响
 
-当引擎发生错误时，错误信息会被添加到 `ResultContainer` 的无响应引擎列表中：
+#### L2 - 访问拒绝（HTTP 402/403）
 
-```python
-def handle_exception(self, result_container, exception_or_message, suspend=False):
-    # 将引擎标记为无响应，前端会展示给用户
-    result_container.add_unresponsive_engine(self.engine.name, error_message)
-```
+- **挂起时长**：180秒（3分钟）
+- **用户提示**：搜索结果页显示 "Engine X is suspended: Access denied (suspended_time=180)"
+- **后续请求**：挂起期间直接跳过该引擎，不再发送请求
+- **健康度影响**：错误计数 +1，成功率下降，可靠性评分降低
 
-[searx/search/processors/abstract.py:165-191](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L165-L191)
+#### L3 - 限流触发（HTTP 429）
 
-**用户体验表现：**
-- **L1/L2/L3 级错误**：搜索结果页显示 "Engine X is suspended" 提示
-- **L4/L5 级错误**：搜索结果页显示 "Engine X timeout" 或连接错误提示
-- **L6/L7 级错误**：仅缺少该引擎的搜索结果，无明显错误提示（除非所有引擎都失败）
+- **挂起时长**：180秒（3分钟）
+- **用户提示**：搜索结果页显示 "Engine X is suspended: Too many request (suspended_time=180)"
+- **后续请求**：挂起期间直接跳过该引擎，避免进一步触发源站限流
+- **健康度影响**：错误计数 +1，成功率下降，管理员可能需要考虑降低请求频率或更换出口IP
 
-### 4.2 引擎跳过逻辑
+#### L1 - CAPTCHA / 防火墙封禁
 
-在后续查询中，挂起状态的引擎会被直接跳过，避免浪费资源：
+- **挂起时长**：1天 ~ 15天（视具体类型）
+- **用户提示**：搜索结果页显示 "Engine X is suspended: Cloudflare CAPTCHA (suspended_time=1296000)"
+- **后续请求**：长时间挂起，相当于临时禁用该引擎
+- **健康度影响**：严重影响引擎可用性，需要管理员介入（更换代理、解决IP信誉问题等）
 
-```python
-def extend_container_if_suspended(self, result_container) -> bool:
-    if self.suspended_status.is_suspended:
-        result_container.add_unresponsive_engine(
-            self.engine.name, self.suspended_status.suspend_reason, suspended=True
-        )
-        return True  # 已挂起，跳过执行
-    return False
-```
+### 4.2 超时与协议错误的具体影响
 
-[searx/search/processors/abstract.py:225-231](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L225-L231)
+#### L4 - 传输故障（SSL错误、连接错误等）
+
+- **挂起时长**：固定 5 秒（默认配置）
+- **用户提示**：搜索结果页显示 "Engine X: ssl.SSLError" 或具体错误类名
+- **后续请求**：5秒后自动恢复，可继续接受请求
+- **健康度影响**：错误计数 +1，短时波动不影响长期评分，频繁发生需检查网络
+
+#### L5 - 响应超时
+
+- **挂起时长**：固定 5 秒（默认配置）
+- **用户提示**：搜索结果页显示 "Engine X: httpx.TimeoutException"
+- **后续请求**：5秒后自动恢复
+- **健康度影响**：错误计数 +1，若持续超时需检查引擎响应速度或增大 timeout 配置
 
 ### 4.3 结果完整性影响
 
-- **单引擎失败**：不影响整体搜索，仅缺少该引擎结果，用户无感知或仅见轻微提示
-- **多引擎同类错误**：可能触发对特定网络出口/代理的健康度检查
+- **单引擎失败**：不影响整体搜索，仅缺少该引擎结果，用户可能看到轻微提示
+- **多引擎同类错误**：如多个引擎同时出现SSL错误，可能是出口网络问题
 - **全引擎失败**：页面显示 "Sorry, we didn't find any results"，并列出所有失败引擎
+- **挂起期间**：引擎完全不可用，结果中不会包含该引擎的任何内容
 
 ---
 
-## 5. 健康度统计与监控
+## 5. 健康度统计与监控（含指标开关前提）
 
-### 5.1 错误计数体系
+### 5.1 指标开关控制前提
 
-SearXNG 通过 `metrics` 模块对引擎错误进行多维度统计：
+**所有统计功能受 `general.enable_metrics` 配置控制：**
+
+```yaml
+general:
+  enable_metrics: true   # 设为 false 则完全关闭指标统计
+```
+
+**两层控制机制：**
+
+1. **初始化层**：指标系统启动时决定使用真实存储还是空实现
+   ```python
+   def initialize(engine_names, enabled=True):
+       if enabled:
+           counter_storage = CounterStorage()          # 真实存储
+           histogram_storage = HistogramStorage()
+       else:
+           counter_storage = VoidCounterStorage()      # 空实现，不存储任何数据
+           histogram_storage = HistogramStorage(histogram_class=VoidHistogram)
+   ```
+   [searx/metrics/__init__.py:70-81](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/metrics/__init__.py#L70-L81)
+
+2. **错误记录层**：详细错误上下文记录前检查开关
+   ```python
+   def count_exception(engine_name: str, exc: BaseException, secondary: bool = False):
+       if not settings['general']['enable_metrics']:
+           return  # 直接返回，不记录任何错误上下文
+       # ... 后续记录逻辑
+   ```
+   [searx/metrics/error_recorder.py:174-176](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/metrics/error_recorder.py#L174-L176)
+
+> **注意**：即使 `enable_metrics: false`，`counter_inc` 仍会被调用，但由于使用 `VoidCounterStorage`，实际不会存储任何数据，不产生性能开销。
+
+### 5.2 错误计数体系
+
+当指标开启时，SearXNG 通过多维度统计引擎健康度：
 
 ```python
-# 指标计数器
+# 指标计数器 - 每次错误调用
 counter_inc('engine', engine_name, 'search', 'count', 'error')    # 错误次数计数
 counter_inc('engine', engine_name, 'search', 'count', 'successful')  # 成功次数计数
 
-# 响应时间直方图
+# 响应时间直方图 - 每次成功调用
 histogram_observe(engine_time, 'engine', engine_name, 'time', 'total')
 histogram_observe(page_load_time, 'engine', engine_name, 'time', 'http')
 ```
 
 [searx/search/processors/abstract.py:181-208](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/abstract.py#L181-L208)
 
-### 5.2 错误上下文记录
+### 5.3 错误上下文记录
 
-每个错误都会记录详细的上下文信息，便于排查：
+每个错误都会记录详细的上下文信息（仅当 `enable_metrics: true` 时）：
 
 ```python
 class ErrorContext:
@@ -227,23 +274,25 @@ class ErrorContext:
 errors_per_engines: dict[str, dict[ErrorContext, int]] = {}
 ```
 
-### 5.3 与后台监控的关系
+### 5.4 与后台监控的关系
 
 1. **Prometheus / OpenMetrics 集成**
    - 当 `open_metrics` 配置启用时，`/metrics` 端点暴露所有引擎指标
-   - 可通过 `engine_search_count_error_total` 等指标配置告警规则
+   - 关键指标：`searxng_engines_reliability_total`、`searxng_engines_response_time_http_seconds`
+   - 可通过配置告警规则监控引擎健康度趋势
 
 2. **健康检查端点**
-   - `/healthz` 端点返回实例健康状态
-   - 可基于引擎成功率配置外部监控（如 UptimeRobot、Kubernetes livenessProbe）
+   - `/healthz` 端点返回实例健康状态（不受 `enable_metrics` 影响）
+   - 可用于 Kubernetes livenessProbe 或外部监控服务
 
 3. **日志系统**
-   - 所有错误通过 `engine.logger.error()` / `logger.exception()` 记录
+   - 所有错误通过 `engine.logger.error()` / `logger.exception()` 记录（不受 `enable_metrics` 影响）
    - 可接入 ELK / Loki 等日志系统进行趋势分析
-   - 关键错误（L1 级 CAPTCHA/封禁）会记录完整异常栈
+   - L1 级错误（CAPTCHA/封禁）会记录完整异常栈
 
 4. **管理后台可见性**
-   - 管理员可通过统计面板查看各引擎的错误率、平均响应时间
+   - 管理员统计面板显示各引擎的错误率、平均响应时间、可靠性评分
+   - 可靠性计算基于 `errors_per_engines` 统计（需 `enable_metrics: true`）
    - 持续高错误率的引擎建议管理员检查配置或暂时禁用
 
 ---
@@ -252,7 +301,7 @@ errors_per_engines: dict[str, dict[ErrorContext, int]] = {}
 
 ### 6.1 同类错误合并
 
-相同 `ErrorContext` 的错误会被合并计数，避免日志爆炸：
+相同 `ErrorContext` 的错误会被合并计数，避免日志和统计爆炸：
 
 ```python
 def add_error_context(engine_name: str, error_context: ErrorContext) -> None:
@@ -264,18 +313,26 @@ def add_error_context(engine_name: str, error_context: ErrorContext) -> None:
 
 ### 6.2 主要/次要错误区分
 
-`secondary=True` 的错误（如重定向次数超限）不会触发引擎挂起，仅作为告警统计：
+`secondary=True` 的错误不会触发引擎挂起，仅作为告警统计：
 
 ```python
 count_error(
     self.engine.name,
     "{} redirects, maximum: {}".format(len(response.history), soft_max_redirects),
     (status_code, reason, hostname),
-    secondary=True,  # 标记为次要错误
+    secondary=True,  # 标记为次要错误，不影响可靠性评分
 )
 ```
 
 [searx/search/processors/online.py:214-219](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/search/processors/online.py#L214-L219)
+
+可靠性计算时会排除次要错误：
+```python
+# 仅统计非次要错误的百分比
+reliability = 100 - sum([error['percentage'] for error in errors if not error.get('secondary')])
+```
+
+[searx/metrics/__init__.py:156](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/metrics/__init__.py#L156)
 
 ---
 
@@ -286,15 +343,15 @@ count_error(
 | 实例类型 | 建议配置 | 理由 |
 |----------|----------|------|
 | 私有实例（单用户） | `ban_time_on_fail: 2`, `max_ban_time_on_fail: 30` | 误封禁概率低，快速恢复 |
-| 公共实例（高并发） | `ban_time_on_fail: 10`, `max_ban_time_on_fail: 300` | 避免触发源站限流，保护IP信誉 |
-| 多代理部署 | 可适当降低挂起时长 | 可通过切换出口快速恢复 |
+| 公共实例（高并发） | `ban_time_on_fail: 10`, `max_ban_time_on_fail: 60` | 避免频繁重试，减少源站压力 |
+| 多代理部署 | `ban_time_on_fail: 3`, `max_ban_time_on_fail: 10` | 可通过切换出口快速恢复 |
 
 ### 7.2 监控告警阈值建议
 
 | 指标 | 警告阈值 | 严重阈值 | 说明 |
 |------|----------|----------|------|
 | 单引擎错误率 | > 30% | > 70% | 5分钟滑动窗口 |
-| 单引擎超时率 | > 20% | > 50% | 可能是网络问题 |
+| 单引擎超时率 | > 20% | > 50% | 可能是网络或引擎性能问题 |
 | 全引擎平均错误率 | > 10% | > 25% | 可能是出口网络故障 |
 | L1级错误（CAPTCHA） | 单引擎1小时内 > 5次 | 单引擎1小时内 > 20次 | 需检查IP信誉或更换代理 |
 
@@ -302,10 +359,15 @@ count_error(
 
 ## 8. 总结
 
-SearXNG 的错误处理体系采用 **"分级挂起 + 连续错误递增 + 成功自动恢复"** 的策略，既保证了用户体验（避免长时间等待不可用引擎），又保护了源站和出口IP的信誉（避免频繁触发限流）。后台监控通过多维度指标采集，为管理员提供了充分的可观测性，便于及时发现和定位问题。
+SearXNG 的错误处理体系采用 **"分级挂起 + 固定时长恢复 + 成功自动重置"** 的策略，既保证了用户体验（避免长时间等待不可用引擎），又保护了源站和出口IP的信誉（避免频繁触发限流）。
+
+**关键校准点：**
+1. **普通错误挂起时长固定**：超时、SSL错误等普通错误挂起时长为 `min(max_ban_time_on_fail, ban_time_on_fail)`，默认 5 秒，不随连续错误次数递增
+2. **指标统计受开关控制**：`general.enable_metrics` 控制详细错误上下文的记录和可靠性计算
+3. **限流与访问拒绝影响明确**：L2/L3 级错误挂起 180 秒，L1 级错误挂起 1 天以上，期间完全跳过该引擎
 
 **核心设计原则：**
 1. **故障隔离**：单个引擎故障不影响全局搜索
 2. **自动降级**：根据错误严重程度自动调整挂起时长
-3. **快速恢复**：成功响应立即重置错误计数
-4. **可观测性**：完整的错误上下文和指标统计
+3. **快速恢复**：成功响应立即重置错误计数和挂起状态
+4. **可观测性**：完整的错误上下文和指标统计（可通过配置开关）
