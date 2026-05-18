@@ -1,6 +1,6 @@
 # Answerer 执行路径分析
 
-本文档详细说明 SearXNG 中本地 answerer 的工作机制，包括注册形态、命中判定、短路逻辑、与缓存和插件的执行先后关系，以及结果合并展示逻辑。
+本文档严格按照 SearXNG 代码契约说明本地 answerer 的工作机制，包括注册形态、命中判定、短路逻辑、缓存边界、插件执行顺序，以及结果展示规则。
 
 ## 一、注册形态
 
@@ -20,6 +20,10 @@ class Answerer(abc.ABC):
     def info(self) -> AnswererInfo:
         ...
 ```
+
+**接口契约**：
+- `answer()` 方法返回值类型声明为 `list[BaseAnswer]`
+- 按照代码契约，answerer 应仅返回 `BaseAnswer` 及其子类（如 `Answer`、`Translations`、`WeatherAnswer`）
 
 ### 1.2 注册方式
 
@@ -44,7 +48,7 @@ Answerer 通过 `AnswerStorage` 单例进行管理，注册流程如下：
            self[_kw].append(answerer)
    ```
 
-### 1.3 实现示例
+### 1.3 标准实现示例
 
 以 `random.py` 为例 (`searx/answerers/random.py:50-79`)：
 
@@ -126,9 +130,9 @@ def search(self) -> ResultContainer:
 | 2 | `search_answerers()` | 调用本地 answerer | 返回 `True`（有结果）则**跳过标准搜索** |
 | 3 | `search_standard()` | 传统搜索引擎检索 | 仅当前面都未命中时执行 |
 
-> **重要结论**：默认情况下，answerer 命中后不会发起任何网络请求到外部搜索引擎，也不会有传统搜索结果。answerer 结果与传统检索结果是**互斥**的，不存在并行合并。
+> **标准契约结论**：默认情况下，answerer 命中后不会发起任何网络请求到外部搜索引擎，也不会有传统搜索结果。answerer 结果与传统检索结果是**互斥**的，不存在并行合并。
 
-## 三、与插件的执行先后关系
+## 三、插件执行顺序
 
 ### 3.1 插件包装层
 
@@ -160,10 +164,10 @@ post_search 插件钩子
 result_container.close()
 ```
 
-关键点：
+关键点（代码契约）：
 - `pre_search` 在 answerer 之前执行，可通过返回 `False` 阻止整个搜索
 - `on_result` 钩子在 answerer 结果添加到容器时被调用
-- `post_search` 在所有搜索完成后执行
+- `post_search` 在所有搜索完成后执行，**是框架契约内唯一可追加结果的扩展点**
 
 ## 四、缓存边界
 
@@ -199,9 +203,9 @@ Answerer.answer(query)
 1. **引擎级缓存**：部分在线引擎可能有自己的缓存机制（与 answerer 无关）
 2. **HTTP 请求头**：在线处理器设置 `Cache-Control: no-cache` (`searx/search/processors/online.py:145`)，避免 HTTP 层缓存
 
-> **缓存边界总结**：缓存是 answerer 内部实现细节，主搜索链路不感知、不干预。不同 answerer 之间缓存独立，互不影响。
+> **缓存边界结论**：缓存是 answerer 内部实现细节，主搜索链路不感知、不干预。不同 answerer 之间缓存独立，互不影响。
 
-## 五、结果展示与合并场景
+## 五、结果展示与契约边界
 
 ### 5.1 结果添加流程
 
@@ -233,7 +237,7 @@ for result in list(results):
             self._merge_main_result(result, main_count)
 ```
 
-关键点：
+**契约边界**：
 - Answer 结果被 `on_result` 插件钩子过滤
 - 命中的 Answer 存入 `self.answers`（`AnswerSet` 类型），而非主结果列表
 - `AnswerSet` 自动去重（基于 hash）并按 template 排序
@@ -283,22 +287,21 @@ class AnswerSet:
 </div>
 ```
 
-### 5.5 Answers 与普通 Results 同时出现的场景
+### 5.5 契约内并存场景：插件追加
 
-如前所述，默认情况下 answerer 命中后会跳过 `search_standard()`，因此页面只会显示 answers 区域，不会有普通搜索结果。但以下特殊场景可能导致两者同时出现：
+按照代码契约，**唯一标准的扩展路径**是通过 `SearchWithPlugins` 的 `post_search` 钩子追加结果：
 
-| 场景 | 说明 | 触发方式 |
-|------|------|----------|
-| **后置插件追加** | `post_search` 插件钩子在 answerer 执行完成后，可主动向 `result_container` 添加 `MainResult` 类型结果 | 自定义插件实现 `post_search()` 方法，调用 `result_container.extend()` 追加结果 |
-| **on_result 钩子追加** | `on_result` 插件钩子在 answerer 结果被处理时，可触发其他结果添加逻辑 | 自定义插件在 `on_result()` 中检测到 answer 类型后，追加主结果 |
-| **Answerer 自身追加** | answerer 的 `answer()` 方法理论上可同时返回 `BaseAnswer` 和 `MainResult` 类型（但不推荐） | answerer 实现中返回非 Answer 类型的 Result 子类 |
-| **pre_search 预添加** | `pre_search` 钩子在 answerer 执行前就添加了主结果，answerer 命中后这些结果会保留 | 自定义插件在 `pre_search()` 中预先添加结果 |
+| 路径类型 | 场景 | 触发方式 | 契约合规性 |
+|----------|------|----------|------------|
+| **标准路径** | answerer 命中 → 仅显示 answers | 默认流程 | ✅ 标准 |
+| **扩展路径** | answerer 命中 + post_search 插件追加 MainResult | 自定义插件实现 `post_search()` 方法，调用 `result_container.extend()` 追加结果 | ✅ 框架契约内 |
+| **非标准路径** | answerer 直接返回 MainResult 类型 | answerer 的 `answer()` 方法违反接口声明，返回非 `BaseAnswer` 类型 | ⚠️ 不符合接口契约，不保证兼容 |
 
-> **设计意图**：SearXNG 设计 answerer 短路机制是为了性能优化。如果业务需要同时展示 answer 和传统搜索结果，应通过插件机制实现，而非修改 answerer 核心逻辑。
+> **设计意图**：SearXNG 设计 answerer 短路机制是为了性能优化。如果业务需要同时展示 answer 和传统搜索结果，**必须通过插件机制在 `post_search` 中实现**，这是框架契约内唯一支持的方式。
 
-## 六、完整执行路径图
+## 六、完整执行路径图（按契约分层）
 
-### 6.1 默认路径（Answerer 命中 → 短路）
+### 6.1 标准路径（Answerer 命中 → 短路 → 仅 Answers）
 
 ```
 用户查询
@@ -315,13 +318,13 @@ Search.search()
    └─→ search_answerers()
          ├─→ AnswerStorage.ask(query)
          │     ├─ 提取第一个关键词
-         │     └─ 调用匹配的 Answerer.answer()
+         │     └─ 调用匹配的 Answerer.answer()  [返回 list[BaseAnswer]]
          ├─→ ResultContainer.extend(None, results)
          │     ├─ on_result 插件过滤
          │     └─ 存入 answers 集合（去重）
          └─(有结果)──→ 短路：跳过 search_standard()
    ↓
-plugins.post_search()
+plugins.post_search()  [标准路径下不追加结果]
    ↓
 result_container.close()
    ↓
@@ -329,7 +332,7 @@ result_container.close()
    └─ 仅显示 answers 区域（顶部）
 ```
 
-### 6.2 插件追加场景（Answerer 命中 + 插件追加结果）
+### 6.2 扩展路径（Answerer 命中 + post_search 插件追加）
 
 ```
 用户查询
@@ -342,10 +345,11 @@ plugins.pre_search()
    ↓
 Search.search()
    └─→ search_answerers() 命中
-         └─→ 存入 answers 集合
+         └─→ 存入 answers 集合  [仅 BaseAnswer 类型]
    ↓
 plugins.post_search()
-   └─→ 插件主动调用 result_container.extend() 追加 MainResult
+   └─→ 插件主动调用 result_container.extend(engine_name, [MainResult...])
+         └─→ 主结果存入 main_results_map
    ↓
 result_container.close()
    ↓
@@ -354,39 +358,46 @@ result_container.close()
    └─ 主结果列表（插件追加的结果）
 ```
 
-### 6.3 Answerer 未命中路径（走常规检索）
+### 6.3 非标准路径（Answerer 违反接口契约）
 
 ```
 用户查询
    ↓
-webapp.search() 视图
-   ↓
 SearchWithPlugins.search()
    ↓
-plugins.pre_search()
-   ↓
 Search.search()
-   ├─→ search_external_bang() 未命中
-   │     ↓
-   ├─→ search_answerers() 未命中（返回空）
-   │     ↓
-   └─→ search_standard()
-         └─ 多引擎并发检索 → 主结果列表
+   └─→ search_answerers()
+         └─→ Answerer.answer()  [违反契约：返回 MainResult 而非 BaseAnswer]
+               └─→ ResultContainer.extend() 中进入 _merge_main_result 分支
    ↓
 plugins.post_search()
    ↓
 result_container.close()
    ↓
 模板渲染
-   └─ 仅显示主结果列表
+   ├─ answers 区域（可能为空，取决于 answerer 返回类型）
+   └─ 主结果列表（含 answerer 返回的非标准结果）
 ```
 
-## 七、关键设计特点
+> ⚠️ **非标准路径说明**：此路径依赖 `ResultContainer.extend()` 对 `Result` 基类的宽泛处理，不属于 answerer 接口契约。answerer 实现应严格返回 `list[BaseAnswer]`，否则可能在未来版本中出现兼容性问题。
 
-1. **短路优化**：Answerer 命中后跳过传统搜索，显著降低延迟和网络请求
-2. **关键词驱动**：仅匹配查询首词，判定逻辑简单高效
-3. **结果隔离**：Answer 与传统搜索结果分开展示，避免干扰
-4. **插件协同**：完整接入插件生命周期，支持过滤和扩展
-5. **无全局缓存**：主搜索链路不做查询结果缓存，Answerer 按需自主实现局部缓存
+## 七、关键契约总结
+
+| 层级 | 结论 | 代码依据 |
+|------|------|----------|
+| **标准契约** | answerer 命中后短路，不执行传统检索 | `searx/search/__init__.py:176-178` |
+| **标准契约** | answerer 接口返回类型为 `list[BaseAnswer]` | `searx/answerers/_core.py:50` |
+| **标准契约** | answerer 结果存入 `answers` 集合，与主结果分离 | `searx/results.py:99-100` |
+| **扩展契约** | `post_search` 是框架内唯一可追加结果的合法扩展点 | `searx/search/__init__.py:206` |
+| **缓存契约** | 主搜索链路无缓存，answerer 缓存为内部实现 | 主流程无缓存调用 |
+| **非标准** | answerer 返回 `MainResult` 可工作但违反接口 | 依赖 `ResultContainer.extend()` 的宽松处理 |
+
+## 八、设计原则
+
+1. **短路优化优先**：Answerer 命中后跳过传统搜索，显著降低延迟和网络请求
+2. **接口契约明确**：Answerer 应严格返回 `BaseAnswer` 类型结果
+3. **结果隔离展示**：Answer 与传统搜索结果分开展示，避免干扰
+4. **插件扩展唯一**：`post_search` 是框架契约内追加结果的唯一合法路径
+5. **缓存边界清晰**：主搜索链路不做查询结果缓存，Answerer 按需自主实现局部缓存
 6. **可扩展性**：通过新增 `searx/answerers/` 下的模块即可扩展 answerer
-7. **互斥默认，扩展灵活**：默认 answerer 与传统检索互斥，特殊需求可通过插件机制实现两者并存
+7. **互斥默认，扩展灵活**：默认 answerer 与传统检索互斥，特殊需求通过插件机制实现
