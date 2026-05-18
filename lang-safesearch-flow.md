@@ -169,9 +169,9 @@ data["kl"] = eng_region  # DDG 的区域参数
 |------|-----------|----------|----------|----------|
 | Google | `filter_mapping` | `{0: "off", 1: "medium", 2: "high"}` | URL 参数 | `safe=xxx` |
 | Yahoo | `safesearch_dict` | `{0: "p", 1: "i", 2: "r"}` | Cookie | `sB` 中的 `vm` 字段 |
-| **Brave** | `safesearch_map` | `{2: "strict", 1: "moderate", 0: "off"}` | **Cookie** | **`safesearch=xxx`** |
-| Wallhaven | `safesearch_map` | `{0: "111", 1: "110", 2: "100"}` | URL 参数 | 自定义参数 |
-| XPath 引擎 | `safe_search_map` | 可配置 | URL 参数拼接 | 自定义参数 |
+| Brave | `safesearch_map` | `{2: "strict", 1: "moderate", 0: "off"}` | Cookie | `safesearch=xxx` |
+| Wallhaven | `safesearch_map` | `{0: "111", 1: "110", 2: "100"}` | URL 参数 | `purity=xxx` |
+| XPath 引擎 | `safe_search_map` | 可配置 | URL 参数拼接 | `safe_search` 格式化字符串 |
 
 **Google 引擎示例** ([engines/google.py:65,340-341](searx/engines/google.py#L65-L341))：
 ```python
@@ -318,7 +318,8 @@ def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: 
 | 语言匹配 | `searx/locales.py` | `get_engine_locale` |
 | 结果合并 | `searx/results.py` | `ResultContainer.extend`, `add_unresponsive_engine` |
 | 引擎配置默认值 | `searx/engines/__init__.py` | `display_error_messages` 默认值定义 |
-| Google 引擎 | `searx/engines/google.py` | `get_google_info`, `request` |
+| Google 引擎 | `searx/engines/google.py` | `filter_mapping`, `request` |
+| Yahoo 引擎 | `searx/engines/yahoo.py` | `safesearch_dict`, `request` |
 | Brave 引擎 | `searx/engines/brave.py` | `safesearch_map`, `request` |
 | DuckDuckGo 引擎 | `searx/engines/duckduckgo.py` | `request` |
 | XPath 引擎 | `searx/engines/xpath.py` | `request` |
