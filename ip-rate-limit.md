@@ -301,10 +301,10 @@ ip_limit.filter_request(network, request, cfg)
    └─ 否 → 继续
   ↓
 2. API 请求检测（format != html）
-   ├─ 是 → 计数 API_WINDOW
-   │     ├─ > API_MAX → 返回 429 → [拦截]
-   │     └─ ≤ API_MAX → [放行]
-   └─ 否 → 继续
+   ├─ 否 → 继续
+   └─ 是 → 计数 API_WINDOW
+         ├─ > API_MAX → 返回 429 → [拦截]
+         └─ ≤ API_MAX → 继续后续检测
   ↓
 3. link_token 已启用？
    ├─ 否 → 进入【普通限流模式】
@@ -360,7 +360,7 @@ ip_limit.filter_request(network, request, cfg)
 | http_accept_language | 通过 | 不通过 | 429 |
 | http_user_agent（search） | 通过 | 不通过 | 429 |
 | http_sec_fetch | 通过 | 不通过 | 429 |
-| API_WINDOW | ≤ 4 | > 4 | 429 |
+| API_WINDOW | ≤ 4（继续后续检测） | > 4 | 429 |
 | SUSPICIOUS_IP_WINDOW | ≤ 3 | > 3 | 302 重定向 / |
 | BURST_WINDOW（普通） | ≤ 15 | > 15 | 429 |
 | BURST_WINDOW（可疑） | ≤ 2 | > 2 | 429 |
