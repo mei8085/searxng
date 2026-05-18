@@ -95,6 +95,8 @@ else:
 - 当 `is_locked('categories') == False`（分类未被管理员锁定）**且** `raw_text_query.specific == True`（用户使用了 `!` 前缀）时，使用快捷前缀指定的引擎
 - 否则使用 `parse_generic()` 从表单或偏好设置中获取分类
 
+> **重要**：只要 `specific == True`，就会直接使用 `raw_text_query.enginerefs`，**即使该列表为空也不会回退到默认分类**。详见第 5.3 节。
+
 ### 4.2 语言协同
 
 在 `searx/webadapter.py:55-72` 中实现完整的优先级链：
@@ -185,8 +187,9 @@ def get_selected_categories(preferences, form):
 1. 分类未被管理员锁定（`is_locked('categories') == False`）
 2. 表单中未指定任何分类参数（无 `categories` 参数，也无 `category_xxx=on` 参数）
 3. 用户偏好中也未设置任何分类（cookie 为空或未设置）
+4. **且用户未使用 `!` 快捷前缀**（`raw_text_query.specific == False`）
 
-**注意**：当用户使用 `!` 快捷前缀时，`raw_text_query.specific == True`，此时会绕过 `get_selected_categories()` 的回退逻辑，直接使用快捷前缀指定的引擎。
+> **重要**：当用户使用 `!` 快捷前缀时，`raw_text_query.specific == True`，此时会**绕过** `get_selected_categories()` 的回退逻辑，直接使用快捷前缀指定的引擎（即使该引擎列表为空）。
 
 ## 5. 快捷词冲突与回退策略
 
@@ -221,9 +224,60 @@ def register_engine(engine):
 
 **设计意图**：配置错误是严重问题，必须在系统启动时暴露，避免运行时出现不可预测的行为。
 
-### 5.3 查询阶段：快捷词命中失败的回退链路
+### 5.3 查询阶段：分类快捷词命中但引擎不可用的行为
 
-这是最关键的回退逻辑，在 `searx/query.py:292-306` 中实现：
+**关键结论**：分类快捷词命中后，若该分类下引擎因禁用或校验不可用导致 `enginerefs` 为空，**不会回退到默认分类**，而是执行一次空搜索。
+
+**代码证据链**：
+
+1. **第一步：`BangParser._parse()` 匹配分类成功，但 `enginerefs` 为空**
+   ```python
+   # query.py:203-212
+   if value in categories:
+       self.raw_text_query.enginerefs.extend(
+           EngineRef(engine.name, value)
+           for engine in categories[value]
+           if (engine.name, value) not in self.raw_text_query.disabled_engines
+       )
+       return True  # ⚠️ 即使 enginerefs 为空也返回 True！
+   ```
+
+2. **第二步：`specific` 被设置为 True**
+   ```python
+   # query.py:187-188
+   if found and raw_value[0] == '!':
+       self.raw_text_query.specific = True  # ⚠️ 即使 enginerefs 为空也设置
+   ```
+
+3. **第三步：webadapter 直接使用空的 enginerefs**
+   ```python
+   # webadapter.py:269-272
+   if not is_locked('categories') and raw_text_query.specific:
+       query_engineref_list = raw_text_query.enginerefs  # ⚠️ 可能是空列表！
+   ```
+
+4. **第四步：validate 后 valid 仍然为空**
+   ```python
+   # webadapter.py:279-281
+   query_engineref_list, _, _ = validate_engineref_list(
+       query_engineref_list, preferences
+   )  # ⚠️ 如果所有引擎都验证失败，valid 为空
+   ```
+
+5. **第五步：搜索阶段无引擎可用**
+   ```python
+   # search/__init__.py:86
+   for engineref in self.search_query.engineref_list:
+       # 空列表，循环不执行
+       ...
+   requests = []  # 保持为空
+   ```
+
+**最终结果**：返回一个没有搜索结果的页面，不触发任何回退机制。
+
+### 5.4 查询阶段：快捷词命中失败的回退链路
+
+这是最常见的回退逻辑，在 `searx/query.py:292-306` 中实现：
 
 ```python
 for i, query_part in enumerate(raw_query_parts):
@@ -287,7 +341,52 @@ webadapter 中:
 3. `raw_text_query.specific` 保持 `False`（只有 `BangParser` 成功解析时才会设为 `True`）
 4. 最终使用默认分类进行搜索，用户输入的 `!unknown` 作为查询文本的一部分
 
-### 5.4 禁用引擎的回退策略
+### 5.5 validate 后 valid 为空的后续行为
+
+**关键结论**：`validate_engineref_list()` 返回的 `valid` 为空时，系统不会回退到默认分类，而是静默返回空结果。
+
+**完整代码路径**：
+
+```
+webadapter.py: get_search_query_from_webapp()
+    ↓
+query_engineref_list = raw_text_query.enginerefs  # 可能为空
+    ↓
+query_engineref_list = deduplicate_engineref_list(query_engineref_list)
+    ↓
+query_engineref_list, _, _ = validate_engineref_list(query_engineref_list, preferences)
+    ↓ valid = []（空列表）
+    ↓
+SearchQuery(query, query_engineref_list, ...)  # engineref_list = []
+    ↓
+search/__init__.py: Search.search()
+    ↓
+search_standard()
+    ↓
+_get_requests()
+    ↓
+for engineref in self.search_query.engineref_list:
+    # 空列表，循环体不执行
+    ↓
+requests = []
+    ↓
+if requests:  # False
+    search_multiple_requests(requests)  # 不执行
+    ↓
+返回空的 ResultContainer
+    ↓
+webapp.py 渲染结果页面
+    ↓
+显示 "无结果" 页面
+```
+
+**行为总结**：
+- 系统不会崩溃或抛出异常
+- 不会自动回退到默认分类
+- 不会有任何日志警告（静默失败）
+- 用户看到一个没有搜索结果的页面
+
+### 5.6 禁用引擎的过滤策略
 
 在 `searx/query.py:207-211` 中实现：
 
@@ -299,34 +398,7 @@ self.raw_text_query.enginerefs.extend(
 )
 ```
 
-**策略**：分类匹配时自动过滤掉用户禁用的引擎。如果分类下所有引擎都被禁用，则 `enginerefs` 为空，后续会使用默认分类。
-
-### 5.5 验证阶段的回退
-
-在 `searx/webadapter.py:21-45` 中实现：
-
-```python
-def validate_engineref_list(engineref_list, preferences):
-    valid = []
-    unknown = []
-    no_token = []
-    for engineref in engineref_list:
-        if engineref.name not in engines:
-            unknown.append(engineref)    # 未知引擎：单独收集
-            continue
-        engine = engines[engineref.name]
-        if not preferences.validate_token(engine):
-            no_token.append(engineref)   # Token 验证失败：单独收集
-            continue
-        valid.append(engineref)         # 验证通过：参与搜索
-    return valid, unknown, no_token
-```
-
-**策略**：
-- 未知引擎：放入 `unknown` 列表，不参与搜索
-- Token 验证失败：放入 `no_token` 列表，不参与搜索
-- 只有 `valid` 列表中的引擎会实际执行搜索
-- 如果 `valid` 为空，将使用默认分类
+**策略**：分类匹配时自动过滤掉用户禁用的引擎。如果分类下所有引擎都被禁用，则 `enginerefs` 为空，后续行为如第 5.3 节所述。
 
 ## 6. 完整解析流程图
 
@@ -359,7 +431,7 @@ query.py: RawTextQuery._parse_query()
         │   │       └─ 否 → 直接检查 engines
         │   │           ├─ 是 → 加入 enginerefs → special_part = True
         │   │           └─ 否 → 检查 categories
-        │   │               ├─ 是 → 加入 enginerefs → special_part = True
+        │   │               ├─ 是 → 加入 enginerefs（过滤禁用引擎）→ special_part = True
         │   │               └─ 否 → special_part = False
         │   └─ 否 → 继续下一个解析器
         ├─ FeelingLuckyParser.check(part)?
@@ -371,11 +443,13 @@ query.py: RawTextQuery._parse_query()
     ↓
 webadapter.py: 组装 SearchQuery
     ├─ 语言: 锁定? → 管理员配置 → 否则: 查询前缀 > 表单 > 偏好
-    ├─ 引擎: 未锁定且 specific==True? → 快捷前缀指定 → 否则: 表单/分类偏好 → 都空? → general
+    ├─ 引擎: 未锁定且 specific==True? → 快捷前缀指定（可能为空）→ 否则: 表单/分类偏好 → 都空? → general
     ├─ 超时: 查询前缀 > 表单 > 默认
     └─ 安全级别: 锁定? → 管理员配置 → 否则: 表单 > 偏好
     ↓
-执行搜索
+validate_engineref_list() → 过滤未知引擎和 Token 验证失败的引擎
+    ↓
+执行搜索（engineref_list 为空时返回空结果）
 ```
 
 ## 7. 关键数据结构
@@ -413,16 +487,16 @@ engine_shortcuts = {}
 |------|------|------|
 | `query_parts` | list | 成功解析的特殊前缀列表（如 `['!g', ':en']`） |
 | `user_query_parts` | list | 实际搜索的文本部分列表（如 `['python', 'tutorial']`） |
-| `enginerefs` | list[EngineRef] | 解析出的引擎引用列表 |
+| `enginerefs` | list[EngineRef] | 解析出的引擎引用列表（可能为空） |
 | `languages` | list | 解析出的语言列表 |
-| `specific` | bool | 是否通过 `!` 前缀指定了特定引擎/分类 |
+| `specific` | bool | 是否通过 `!` 前缀指定了特定引擎/分类（与 enginerefs 是否为空无关） |
 | `timeout_limit` | float/None | 解析出的超时限制 |
 
 ## 8. 总结
 
-SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松**的设计哲学：
+### 8.1 核心设计原则
 
-### 核心设计原则
+SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松**的设计哲学：
 
 1. **配置阶段**：零容忍策略
    - 重复的快捷词或引擎名被视为严重配置错误
@@ -430,7 +504,7 @@ SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶�
 
 2. **查询阶段**：最大可用性策略
    - 无法识别的前缀不报错，作为普通文本继续搜索
-   - 确保用户总能得到搜索结果，即使输入有误
+   - 但识别了前缀但引擎不可用时，**不做回退**，直接返回空结果
 
 3. **优先级设计**：用户意图优先
    - 查询前缀（`:语言`、`<超时`、`!引擎`）优先级最高
@@ -438,9 +512,19 @@ SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶�
    - 最后是用户偏好和系统默认
    - 管理员锁定配置具有最高优先级（覆盖所有用户输入）
 
-4. **多层回退机制**：
-   - 快捷词 → 引擎名 → 分类名 → 普通文本
-   - 表单分类 → 用户偏好分类 → general 分类
-   - 验证失败的引擎静默过滤，不影响整体搜索
+### 8.2 关键行为澄清
 
-这种设计既保证了系统配置的正确性，又提供了良好的容错性和用户体验，使用户可以通过简单的前缀语法快速切换搜索范围。
+| 场景 | 实际行为 | 常见误解 |
+|------|---------|---------|
+| `!分类` 但分类下引擎全被禁用 | 返回空结果，不回退 | ❌ 误以为会回退到 general |
+| `!引擎` 但引擎 Token 验证失败 | 返回空结果，不回退 | ❌ 误以为会尝试其他引擎 |
+| validate 后 valid 为空 | 返回空结果，静默失败 | ❌ 误以为会有错误提示或回退 |
+| `!unknown` 无法匹配 | 作为普通文本搜索 | ✅ 正确 |
+
+### 8.3 多层回退机制（仅限特定场景）
+
+- **快捷词匹配失败时**：快捷词 → 引擎名 → 分类名 → 普通文本
+- **无快捷词时**：表单分类 → 用户偏好分类 → general 分类
+- **引擎验证失败时**：静默过滤，不影响整体搜索（但可能导致空结果）
+
+这种设计在配置正确性和用户体验之间做了权衡：对于用户输入错误保持宽容，但对于已识别的用户意图（即使无法执行）保持忠实，不做静默的行为改变。
