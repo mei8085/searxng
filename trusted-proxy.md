@@ -187,13 +187,13 @@ environ['wsgi.url_scheme'] = scheme  # 'http' 或 'https'
 **代码证据核查结论**：
 
 1. **直接写入**：`ReverseProxyPathFix.__call__()` 在 `flaskfix.py:64` 直接写入 `environ['wsgi.url_scheme']`
-2. **框架层间接读取**：Flask 框架内部通过 `request.scheme` 属性读取该值（Flask 源码行为，非 SearXNG 业务代码）
+2. **框架层间接读取**：Flask 框架内部通过 `request.scheme` 和 `request.is_secure` 属性读取该值
 3. **无业务代码直接读取**：在整个 SearXNG 代码库中，没有任何业务模块直接读取 `environ['wsgi.url_scheme']`
 
 **使用场景（全部通过 Flask 框架间接完成）**：
 - `url_for(_external=True)` 生成绝对 URL（如 `webapp.py:872`, `webapp.py:877`, `webapp.py:1253`）
 - `flask.redirect()` 处理重定向（如 `webapp.py:589`, `webapp.py:667`, `webapp.py:699`, `webapp.py:792`）
-- Cookie 的 `Secure` 标志设置（Flask 框架内部行为）
+- `request.is_secure` 判断协议安全性（`http_sec_fetch.py:83`）
 
 ---
 
@@ -284,14 +284,16 @@ ProxyFix: 设置 REMOTE_ADDR（真实客户端 IP）
    ↓
 Flask 应用
    ├─ before_request 钩子（limiter.pre_request）
-   │   └─ filter_request(sxng_request)
+   │   └─ filter_request(sxng_request)  [limiter.py:147]
    │       ├─ real_ip = ip_address(request.remote_addr)  [直接消费]
    │       ├─ network = get_network(real_ip, cfg)
    │       ├─ ip_lists.pass_ip/block_ip(real_ip, cfg)
-   │       ├─ ip_limit.filter_request(network, ...)
-   │       ├─ link_token.is_suspicious(network, ...)
-   │       └─ header probe 模块（http_user_agent 等）
+   │       └─ ip_limit.filter_request(network, request, cfg)
+   │           └─ [如果 botdetection.ip_limit.link_token = true]
+   │               └─ link_token.is_suspicious(network, request, True)
    ├─ 视图函数
+   │   ├─ /client<token>.css → client_token() [webapp.py:605]
+   │   │   └─ link_token.ping(sxng_request, token)  [直接读取 remote_addr]
    │   └─ 插件系统（post_search 钩子）
    │       ├─ tor_check.py: request.remote_addr  [直接消费]
    │       └─ self_info.py: request.remote_addr  [直接消费]
@@ -299,7 +301,7 @@ Flask 应用
        └─ url_for() → 通过 Flask 框架间接使用 wsgi.url_scheme
 ```
 
-### 6.2 直接消费 REMOTE_ADDR 的模块（代码证据链）
+### 6.2 直接消费 REMOTE_ADDR 的模块（完整代码证据链）
 
 #### 6.2.1 限流模块（核心消费者）
 
@@ -310,20 +312,62 @@ def filter_request(request: SXNG_Request) -> werkzeug.Response | None:
     real_ip = ip_address(request.remote_addr)  # [1] 直接读取处理后的 IP
     network = get_network(real_ip, cfg)       # [2] 转换为网络段
     
-    # ... 传递给所有 botdetection 子模块
+    # ... 传递给 botdetection 子模块
     match, msg = ip_lists.pass_ip(real_ip, cfg)    # 直接传递 real_ip
     match, msg = ip_lists.block_ip(real_ip, cfg)   # 直接传递 real_ip
     val = ip_limit.filter_request(network, request, cfg)  # 传递 network
-    val = link_token.is_suspicious(network, request, True)  # 传递 network
+```
+
+**重要修正**：limiter 主流程**不会直接调用** `link_token.is_suspicious`，而是通过 `ip_limit.filter_request` 分支触发。
+
+**ip_limit 内部调用 link_token**（`ip_limit.py:110-112`）：
+```python
+if cfg['botdetection.ip_limit.link_token']:
+    suspicious = link_token.is_suspicious(network, request, True)
 ```
 
 **子模块消费证据**：
 - `searx/botdetection/ip_limit.py:92-148`：基于 `network` 参数进行滑动窗口限流计数
 - `searx/botdetection/ip_lists.py`：接收 `real_ip` 参数进行黑白名单匹配
-- `searx/botdetection/link_token.py:105`：`ping()` 函数直接读取 `request.remote_addr`
+- `searx/botdetection/link_token.py:73-90`：`is_suspicious()` 接收 `network` 参数进行判定
 - 所有 header probe 模块：接收 `network` 参数，基于准确的客户端识别进行请求计数
 
-#### 6.2.2 插件系统
+#### 6.2.2 client_token 到 link_token.ping 链路
+
+**路由入口**：`webapp.py:605-608`
+```python
+@app.route('/client<token>.css', methods=['GET', 'POST'])
+def client_token(token=None):
+    link_token.ping(sxng_request, token)
+    return Response('', mimetype='text/css', headers={"Cache-Control": "no-store, max-age=0"})
+```
+
+**ping 函数直接读取 remote_addr**：`link_token.py:93-112`
+```python
+def ping(request: flask.Request, token: str):
+    valkey_client = valkeydb.get_valkey_client()
+    cfg = config.get_global_cfg()
+
+    if not token_is_valid(token):
+        return
+
+    real_ip = ip_address(request.remote_addr)  # [直接读取]
+    network = get_network(real_ip, cfg)
+
+    ping_key = get_ping_key(network, request)
+    logger.debug(
+        "store ping_key for (client) network %s (IP %s) -> %s", network.compressed, real_ip.compressed, ping_key
+    )
+    valkey_client.set(ping_key, 1, ex=PING_LIVE_TIME)
+```
+
+**链路说明**：
+- 浏览器加载页面时，会请求 `/client<token>.css` 这个样式表
+- 该请求触发 `client_token` 视图函数
+- 函数调用 `link_token.ping()`，后者直接读取 `request.remote_addr`
+- 将该客户端网络标记为"已验证"，降低其限流阈值
+
+#### 6.2.3 插件系统
 
 **Tor 检查插件**：`searx/plugins/tor_check.py:68`
 ```python
@@ -339,7 +383,7 @@ if self.ip_regex.search(search.search_query.query) and request.remote_addr:
     )
 ```
 
-#### 6.2.3 网络转换辅助函数
+#### 6.2.4 网络转换辅助函数
 
 `searx/botdetection/_helpers.py:56-77`：
 ```python
@@ -360,10 +404,11 @@ def get_network(real_ip: IPv4Address | IPv6Address, cfg: "config.Config") -> IPv
 | 消费方式 | 代码证据 | 说明 |
 |----------|----------|------|
 | 直接写入 | `flaskfix.py:64` | `environ['wsgi.url_scheme'] = scheme` |
-| 框架间接读取 | Flask 内部 | `request.scheme` 属性读取 `environ['wsgi.url_scheme']` |
+| 框架间接读取 | Flask 内部 | `request.scheme` 和 `request.is_secure` 属性读取 `environ['wsgi.url_scheme']` |
 | 业务代码直接读取 | **无** | 代码库中未发现业务模块直接读取 `environ['wsgi.url_scheme']` |
 | 业务代码间接使用 | `webapp.py:872`、`webapp.py:877`、`webapp.py:1253` | 通过 `url_for(_external=True)` 生成绝对 URL |
 | 业务代码间接使用 | `webapp.py:589`、`webapp.py:667`、`webapp.py:699`、`webapp.py:792` | 通过 `flask.redirect()` 处理重定向 |
+| 业务代码间接使用 | `http_sec_fetch.py:83` | 通过 `request.is_secure` 判断协议安全性 |
 
 ### 6.4 统计模块的受益边界（可核对依据）
 
@@ -391,7 +436,6 @@ def get_network(real_ip: IPv4Address | IPv6Address, cfg: "config.Config") -> IPv
 | 模块 | 受益方式 | 证据强度 | 边界说明 |
 |------|----------|----------|----------|
 | 模板渲染 | 通过 `url_for` 生成正确的绝对 URL | 强 | 不直接读取 remote_addr 或 scheme，依赖 Flask 框架 |
-| Cookie 安全 | 正确的协议确保 Cookie 的 Secure 标志正确设置 | 中 | Flask 框架内部行为，无直接代码证据 |
 | 搜索引擎反爬 | 真实客户端 IP 用于检测和绕过搜索引擎的反爬机制 | 弱 | 通过限流模块间接保证，无直接读取链路 |
 | 统计模块 (metrics) | 限流的准确执行确保统计数据反映真实客户端行为 | 极弱 | 二阶效应，无直接代码证据 |
 
@@ -428,6 +472,22 @@ REMOTE_ADDR: 攻击者真实IP
 - 这意味着如果请求绕过代理直接到达应用，且携带伪造的 `X-Forwarded-For`，同时 `trusted_proxies` 包含了攻击者的 IP，那么攻击者可以伪造客户端 IP
 - 缓解措施：确保网络层面只允许受信任的反向代理访问应用端口
 
+### 7.4 协议安全性
+
+代码证据（`http_sec_fetch.py:83-87`）：
+```python
+if not request.is_secure:
+    logger.warning(
+        "Sec-Fetch cannot be verified for non-secure requests (HTTP headers are not set/sent by the client)."
+    )
+    return None
+```
+
+**说明**：
+- `request.is_secure` 依赖于 `wsgi.url_scheme` 的正确设置
+- 非 HTTPS 环境下，Sec-Fetch 头部验证会被跳过
+- 这是合理的安全降级，因为 HTTP 环境下这些头部本身就不可靠
+
 ---
 
 ## 8. 关键文件索引
@@ -439,10 +499,12 @@ REMOTE_ADDR: 攻击者真实IP
 | `searx/flaskfix.py` | 协议与路径还原 | 11-69 |
 | `searx/limiter.toml` | 受信任代理配置 | 13-20 |
 | `searx/limiter.py` | 限流模块入口，核心消费者 | 147-209 |
-| `searx/botdetection/ip_limit.py` | IP 限流实现 | 92-148 |
-| `searx/botdetection/link_token.py` | link_token 方法 | 73-112 |
+| `searx/botdetection/ip_limit.py` | IP 限流实现，内部调用 link_token | 92-148 |
+| `searx/botdetection/link_token.py` | link_token ping 和 is_suspicious 方法 | 73-112 |
+| `searx/webapp.py` | client_token 路由入口 | 605-608 |
 | `searx/plugins/tor_check.py` | Tor 检查插件 | 68 |
 | `searx/plugins/self_info.py` | 自信息插件 | 51-54 |
+| `searx/botdetection/http_sec_fetch.py` | Sec-Fetch 头部验证，使用 request.is_secure | 83-87 |
 | `searx/webapp.py` | 中间件注册 | 1394-1404 |
 
 ---
@@ -461,9 +523,14 @@ SearXNG 的受信任反向代理机制采用分层设计：
 - 单点处理、多处受益的架构，保证一致性和可维护性
 - WSGI 中间件按 `ReverseProxyPathFix` → `WhiteNoise` → `ProxyFix` 的顺序执行，ProxyFix 作为最内层中间件直接为 Flask 应用提供处理后的 REMOTE_ADDR
 
+**调用链修正**：
+- limiter 主流程不会直接调用 `link_token.is_suspicious`，而是通过 `ip_limit.filter_request` 内部分支触发
+- 新增 `client_token` → `link_token.ping` 链路，这是直接读取 `remote_addr` 的重要消费者
+
 **边界澄清**：
 - 统计模块（metrics）不直接消费 IP 还原结果，间接受益的说法缺乏直接代码证据
 - 协议信息全部通过 Flask 框架间接使用，无业务代码直接读取 `wsgi.url_scheme`
-- 直接消费者仅限限流模块和两个插件（tor_check、self_info）
+- 直接消费者包括：限流模块（limiter + ip_limit + ip_lists + link_token）、client_token 路由、tor_check 插件、self_info 插件
+- Cookie Secure 相关表述无代码证据支持，已移除；协议安全性的实际使用体现在 `request.is_secure` 判断
 
 这种设计在安全性和易用性之间取得了平衡，既防止了未配置时的头部伪造风险，又在正确配置后能准确还原真实客户端信息。
