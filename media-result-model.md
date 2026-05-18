@@ -64,7 +64,9 @@ self["positions"] = self.get("positions", "")
 self["score"] = self.get("score", 0)
 self["category"] = self.get("category", "")
 self["publishedDate"] = self.get("publishedDate")
-self["pubdate"] = self.get("pubdate", "")
+
+# 注意：pubdate 不在 __init__ 中初始化，它在 normalize_result_fields() 阶段
+# 由 _normalize_date_fields() 从 publishedDate 自动派生
 ```
 
 #### 扩展字段支持（通过 dict 特性动态支持）:
@@ -225,7 +227,7 @@ def _normalize_date_fields(result: "MainResult | LegacyResult"):
 | 字段 | 类型 | 生成时机 | 用途 |
 |------|------|----------|------|
 | `publishedDate` | `datetime` | 引擎侧返回 | 模板显示文本（Jinja2 自动格式化） |
-| `pubdate` | `str` | `normalize_result_fields()` 中生成 | `<time datetime="">` 属性值（ISO 格式） |
+| `pubdate` | `str` | `_normalize_date_fields()` 中从 `publishedDate` 派生 | `<time datetime="">` 属性值（strftime 格式 `%Y-%m-%d %H:%M:%S%z`，如 `2024-01-15 14:30:00+0000`） |
 
 > **重要**: 引擎只需返回 `publishedDate` (datetime 对象)，`pubdate` 由系统自动派生。模板中两者配合使用：
 > ```jinja2
