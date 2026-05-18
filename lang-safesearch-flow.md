@@ -6,8 +6,11 @@
 用户请求
     ↓
 [入口参数解析] webadapter.py
-    ├─ parse_lang()     # 语言偏好解析
-    └─ parse_safesearch() # 安全搜索解析
+    ├─ parse_lang()            # 语言偏好解析（保留用户选择，包括 auto）
+    └─ parse_safesearch()      # 安全搜索解析
+    ↓
+[auto 语言替换] webadapter.py
+    └─ query_lang == 'auto' ? 用客户端语言替换 : 保留原值
     ↓
 [SearchQuery 封装] search/models.py
     ↓
@@ -21,7 +24,7 @@
     ↓
 [结果合并] results.py
     ├─ extend()             # 合并结果
-    └─ add_unresponsive_engine() # 记录不响应引擎
+    └─ add_unresponsive_engine() # 按 display_error_messages 决定是否记录
     ↓
 返回给用户
 ```
@@ -39,11 +42,15 @@
 3. **用户偏好**：`preferences.get_value('language')`（来自 cookies）
 4. **默认值**：`settings['search']['default_lang']`（默认为 `"auto"`）
 
-**特殊处理：**
-- 如果设置为 `"auto"`，则使用 `preferences.client.locale_tag`（从 `Accept-Language` 头解析），若仍无则回退到 `"all"`
-- 锁定机制：如果 `is_locked('language')` 为 `True`，直接使用偏好值，忽略其他输入
+**自动语言选择的两阶段处理：**
+- **阶段一（参数解析）**：`parse_lang()` 先完整保留用户的选择结果（包括 `"auto"`），存入 `selected_locale` 变量，用于 UI 展示
+- **阶段二（查询组装）**：在 `get_search_query_from_webapp()` 中检查，若 `query_lang == 'auto'`，才替换为 `preferences.client.locale_tag`（从 `Accept-Language` 头解析），若仍无则回退到 `"all"`
 
-**代码位置：** [webadapter.py:55-72](searx/webadapter.py#L55-L72)
+**锁定机制：** 如果 `is_locked('language')` 为 `True`，直接使用偏好值，忽略其他输入
+
+**代码位置：**
+- 参数解析：[webadapter.py:55-72](searx/webadapter.py#L55-L72)
+- auto 替换：[webadapter.py:263-267](searx/webadapter.py#L263-L267)
 
 ### 2.2 安全搜索等级解析 (`parse_safesearch` - webadapter.py:75-92)
 
@@ -247,15 +254,22 @@ def extend(self, engine_name: str | None, results: list[Result | LegacyResult]):
 
 ```python
 def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: bool = False):
-    self.unresponsive_engines.add(
-        UnresponsiveEngine(engine_name, error_type, suspended)
-    )
+    if searx.engines.engines[engine_name].display_error_messages:
+        self.unresponsive_engines.add(
+            UnresponsiveEngine(engine_name, error_type, suspended)
+        )
 ```
+
+**记录条件：**
+- 是否记录取决于引擎配置的 `display_error_messages` 开关（默认为 `True`）
+- 若 `display_error_messages: False`，即使引擎出错也不会添加到 `unresponsive_engines` 列表中
 
 **记录的信息：**
 - 引擎名称
 - 错误类型（如 timeout、HTTP error 等）
 - 是否被临时挂起
+
+**代码位置：** [results.py:274-280](searx/results.py#L274-L280)
 
 ### 5.3 结果返回
 
@@ -263,7 +277,7 @@ def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: 
 - 合并后的搜索结果列表
 - 建议、答案、信息框等
 - 各引擎响应时间统计
-- 不响应引擎列表（用于 UI 提示）
+- 不响应引擎列表（用于 UI 提示，受 `display_error_messages` 控制）
 
 ---
 
@@ -271,13 +285,14 @@ def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: 
 
 | 功能模块 | 文件路径 | 关键函数/类 |
 |---------|---------|------------|
-| 入口参数解析 | `searx/webadapter.py` | `parse_lang`, `parse_safesearch` |
+| 入口参数解析 | `searx/webadapter.py` | `parse_lang`, `parse_safesearch`, `get_search_query_from_webapp` |
 | 用户偏好管理 | `searx/preferences.py` | `Preferences`, `MapSetting`, `SearchLanguageSetting` |
 | 搜索查询模型 | `searx/search/models.py` | `SearchQuery`, `EngineRef` |
 | 处理器抽象 | `searx/search/processors/abstract.py` | `EngineProcessor.get_params` |
 | 引擎 Traits | `searx/enginelib/traits.py` | `EngineTraits`, `get_language`, `get_region` |
 | 语言匹配 | `searx/locales.py` | `get_engine_locale` |
-| 结果合并 | `searx/results.py` | `ResultContainer.extend` |
+| 结果合并 | `searx/results.py` | `ResultContainer.extend`, `add_unresponsive_engine` |
+| 引擎配置默认值 | `searx/engines/__init__.py` | `display_error_messages` 默认值定义 |
 | Google 引擎 | `searx/engines/google.py` | `get_google_info`, `request` |
 | DuckDuckGo 引擎 | `searx/engines/duckduckgo.py` | `request` |
 | XPath 引擎 | `searx/engines/xpath.py` | `request` |
@@ -305,6 +320,7 @@ preferences:
 - name: google
   engine: google
   safesearch: true
+  display_error_messages: true  # 是否在 UI 显示该引擎的错误信息
 
 - name: xpath-example
   engine: xpath
@@ -313,4 +329,17 @@ preferences:
     0: '&filter=none'
     1: '&filter=moderate'
     2: '&filter=strict'
+
+- name: silent-engine
+  engine: some_engine
+  display_error_messages: false  # 静默失败，不显示给用户
 ```
+
+### display_error_messages 说明
+
+| 配置值 | 行为 |
+|--------|------|
+| `true`（默认） | 引擎出错时，错误信息会记录到 `unresponsive_engines` 并在 UI 展示 |
+| `false` | 引擎出错时，仅内部记录日志，但不会在 UI 展示给用户 |
+
+**代码默认值定义位置：** [engines/__init__.py:41](searx/engines/__init__.py#L41)
