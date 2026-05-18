@@ -22,7 +22,8 @@
 | `thumbnail` | `str` | `""` | 视频 | 视频缩略图URL |
 | `iframe_src` | `str` | `""` | 视频 | 视频嵌入播放器URL |
 | `audio_src` | `str` | `""` | 音频 | 音频源URL |
-| `publishedDate` | `datetime` | `None` | 图片/视频 | 发布日期 |
+| `publishedDate` | `datetime` | `None` | 图片/视频 | 发布日期（datetime 对象，用于模板显示文本） |
+| `pubdate` | `str` | `""` | 图片/视频 | 发布日期字符串（格式 `%Y-%m-%d %H:%M:%S%z`，用于 `<time datetime="">` 属性） |
 | `length` | `timedelta` | `None` | 视频 | 视频时长 |
 | `views` | `str` | `""` | 视频 | 观看次数（人性化格式） |
 | `author` | `str` | `""` | 图片/视频 | 作者/创作者 |
@@ -63,6 +64,7 @@ self["positions"] = self.get("positions", "")
 self["score"] = self.get("score", 0)
 self["category"] = self.get("category", "")
 self["publishedDate"] = self.get("publishedDate")
+self["pubdate"] = self.get("pubdate", "")
 ```
 
 #### 扩展字段支持（通过 dict 特性动态支持）:
@@ -205,28 +207,106 @@ url_fields = ["url", "iframe_src", "audio_src", "img_src", "thumbnail_src", "thu
 
 ## 3. 结果处理层：合并与排序
 
-### 3.1 哈希去重策略
+### 3.1 日期字段标准化处理
 
-**文件**: `searx/result_types/_base.py:527-545`
+**文件**: `searx/result_types/_base.py:219-225`
 
-图片结果使用专用哈希算法（因图片结果的 `parsed_url` 可能为空）：
-
-```python
-if self.template == "images.html":
-    return hash(f"{self.template}|{self.url}|{self.img_src}")
-```
-
-普通结果（含视频）哈希算法：
+`_normalize_date_fields()` 函数统一处理发布日期字段，为模板渲染准备双格式：
 
 ```python
-return hash(
-    f"{self.template}"
-    + f"|{url.netloc}|{url.path}|{url.params}|{url.query}|{url.fragment}"
-    + f"|{self.img_src}"
-)
+def _normalize_date_fields(result: "MainResult | LegacyResult"):
+    if result.publishedDate:
+        try:
+            result.pubdate = result.publishedDate.strftime('%Y-%m-%d %H:%M:%S%z')
+        except ValueError:
+            result.publishedDate = None
 ```
 
-### 3.2 结果分组排序
+| 字段 | 类型 | 生成时机 | 用途 |
+|------|------|----------|------|
+| `publishedDate` | `datetime` | 引擎侧返回 | 模板显示文本（Jinja2 自动格式化） |
+| `pubdate` | `str` | `normalize_result_fields()` 中生成 | `<time datetime="">` 属性值（ISO 格式） |
+
+> **重要**: 引擎只需返回 `publishedDate` (datetime 对象)，`pubdate` 由系统自动派生。模板中两者配合使用：
+> ```jinja2
+> <time datetime="{{ result.pubdate }}">{{ result.publishedDate }}</time>
+> ```
+
+---
+
+### 3.2 哈希去重策略
+
+哈希去重逻辑在 `Result`、`MainResult`、`LegacyResult` 中各有不同实现：
+
+#### 3.2.1 Result 基类哈希 (`searx/result_types/_base.py:288-299`)
+
+```python
+def __hash__(self) -> int:
+    return id(self)
+```
+
+- 基类默认使用对象身份 ID 作为哈希值
+- 子类可覆盖此方法实现内容去重
+
+#### 3.2.2 MainResult 哈希 (`searx/result_types/_base.py:405-418`)
+
+```python
+def __hash__(self) -> int:
+    if not self.parsed_url:
+        raise ValueError(f"missing a value in field 'parsed_url': {self}")
+    url = self.parsed_url
+    return hash(
+        f"{self.template}"
+        + f"|{url.netloc}|{url.path}|{url.params}|{url.query}|{url.fragment}"
+        + f"|{self.img_src}"
+    )
+```
+
+| 哈希因子 | 说明 |
+|----------|------|
+| `template` | 模板名称，区分结果类型 |
+| `parsed_url` (netloc+path+params+query+fragment) | 不包含 scheme 的 URL，用于匹配同源结果 |
+| `img_src` | 图片/视频资源 URL，区分同一页面的不同多媒体 |
+
+> **注意**: `MainResult` **没有**图片专用分支，所有结果统一使用此算法，要求 `parsed_url` 必须存在。
+
+#### 3.2.3 LegacyResult 哈希 (`searx/result_types/_base.py:521-547`)
+
+```python
+def __hash__(self) -> int:
+    if "answer" in self:
+        return hash(self["answer"])
+
+    if self.template == "images.html":
+        # 图片结果专用分支：因图片结果的 parsed_url 可能为空
+        return hash(f"{self.template}|{self.url}|{self.img_src}")
+
+    if not any(cls in self for cls in ["suggestion", "correction", "infobox", ...]):
+        # 普通 URL 结果分支（含视频）
+        if not self.parsed_url:
+            raise ValueError(...)
+        url = self.parsed_url
+        return hash(
+            f"{self.template}"
+            + f"|{url.netloc}|{url.path}|{url.params}|{url.query}|{url.fragment}"
+            + f"|{self.img_src}"
+        )
+
+    return id(self)
+```
+
+| 分支 | 触发条件 | 哈希因子 |
+|------|----------|----------|
+| **答案结果** | 包含 `"answer"` 键 | `answer` 字段内容 |
+| **图片结果** | `template == "images.html"` | `template` + `url` + `img_src` |
+| **普通结果**（含视频） | 非特殊类型且有 `parsed_url` | `template` + `parsed_url`（无 scheme） + `img_src` |
+| **特殊结果** | 建议/校正/信息框等 | 对象 ID（不去重） |
+
+> **关键区别**: 图片结果在 `LegacyResult` 中使用 `url` 而非 `parsed_url`，因为图片引擎的 `parsed_url` 可能为空。
+
+---
+
+### 3.3 结果分组排序
 
 **文件**: `searx/results.py:197-253`
 
@@ -274,7 +354,7 @@ def get_result_template(theme_name: str, template_name: str):
 | `img_src` | 第2行: `<a href="{{ result.img_src }}">` | 始终渲染 | 点击跳转到原图 |
 | `thumbnail_src` / `img_src` | 第3行: `src="{% if result.thumbnail_src %}...{% else %}...{% endif %}"` | 始终渲染，优先使用 `thumbnail_src` | 显示 200x200 缩略图 |
 | `resolution` | 第4行: `{%- if result.resolution %} <span class="image_resolution">{{ result.resolution }}</span> {%- endif -%}` | **仅当 `result.resolution` 非空时显示** | 缩略图右上角显示分辨率标签 |
-| `title` | 第5行: `<span class="title">{{ result.title\|striptags }}</span>` | 始终渲染 | 缩略图下方显示标题 |
+| `title` | 第5行: `<span class="title">{{ result.title|striptags }}</span>` | 始终渲染 | 缩略图下方显示标题 |
 | `parsed_url.netloc` | 第6行: `<span class="source">{{- result.parsed_url.netloc -}}</span>` | 始终渲染 | 缩略图下方显示来源域名 |
 
 #### 详情面板消费
@@ -282,7 +362,7 @@ def get_result_template(theme_name: str, template_name: str):
 | 字段 | 消费位置 | 触发条件 | 渲染效果 |
 |------|----------|----------|----------|
 | `img_src` | 第13行: `data-src="{{ image_proxify(result.img_src) }}"` | 点击缩略图时加载 | 详情面板显示大图 |
-| `title` | 第16行: `<h4>{{ result.title\|striptags }}</h4>` | 始终渲染 | 详情标题 |
+| `title` | 第16行: `<h4>{{ result.title|striptags }}</h4>` | 始终渲染 | 详情标题 |
 | `content` | 第17行: `{%- if result.content %}...{% else %}&nbsp;{% endif -%}` | 非空显示，否则占位 | 详情描述 |
 | `author` | 第19行: `{%- if result.author %}<span>Author:</span>{{ result.author }}{% else %}&nbsp;{% endif -%}` | 非空显示，否则占位 | 作者信息 |
 | `resolution` | 第20行: `{%- if result.resolution %}<span>Resolution:</span>{{ result.resolution }}{% else %}&nbsp;{% endif -%}` | 非空显示，否则占位 | 分辨率信息 |
@@ -308,13 +388,13 @@ def get_result_template(theme_name: str, template_name: str):
 | `parsed_url` | 第28-30行: `get_pretty_url(result.parsed_url)` | 始终渲染 | 美化后的域名显示 |
 | `thumbnail` | 第33行: `{%- if result.thumbnail %}...{%- endif -%}` | **仅当 `result.thumbnail` 非空时渲染** | 左侧显示视频缩略图 |
 | `length` | 第33行: `{%- if result.length -%}<span class="thumbnail_length">{{ result.length }}</span>{%- endif -%}` | **仅当同时有 `thumbnail` 和 `length` 时显示** | 缩略图右下角显示时长标签 |
-| `title` | 第34行: `<h3>{{ result_link(result.url, result.title\|safe) }}</h3>` | 始终渲染 | 结果标题链接 |
+| `title` | 第34行: `<h3>{{ result_link(result.url, result.title|safe) }}</h3>` | 始终渲染 | 结果标题链接 |
 
 #### result_sub_header 宏消费 (`macros.html:38-45`)
 
 | 字段 | 消费位置 | 触发条件 | 渲染效果 |
 |------|----------|----------|----------|
-| `publishedDate` | 第39行: `{% if result.publishedDate %}<time class="published_date">{{ result.pubdate }}</time>{% endif %}` | **非空时显示** | 发布日期 |
+| `publishedDate` + `pubdate` | 第39行: `<time class="published_date" datetime="{{ result.pubdate }}" >{{ result.publishedDate }}</time>` | **`publishedDate` 非空时显示** | 发布日期（双格式：`pubdate` 用于 `datetime` 属性，`publishedDate` 用于显示文本） |
 | `length` | 第41行: `{% if result.length and not result.thumbnail %}<div class="result_length">Length: {{ result.length }}</div>{% endif %}` | **有 `length` 但无 `thumbnail` 时显示** | （已显示在缩略图上则不重复显示） |
 | `views` | 第42行: `{% if result.views %}<div class="result_views">Views: {{ result.views }}</div>{% endif %}` | **非空时显示** | 观看次数 |
 | `author` | 第43行: `{% if result.author %}<div class="result_author">Author: {{ result.author }}</div>{% endif %}` | **非空时显示** | 作者/频道 |
@@ -368,15 +448,17 @@ def get_result_template(theme_name: str, template_name: str):
     │
     ├─ extend() - 收集结果
     │   ├─ LegacyResult 包装
-    │   └─ normalize_result_fields()
+    │   └─ normalize_result_fields() - 字段标准化
     │       ├─ _normalize_url_fields() - URL 解析与标准化
     │       ├─ _normalize_text_fields() - 文本清理
-    │       └─ _normalize_date_fields() - 日期格式化
+    │       └─ _normalize_date_fields() - 生成 pubdate 字符串
     │
     ├─ _merge_main_result() - 按哈希去重合并
     │   └─ hash() - 计算结果哈希
-    │       ├─ 图片: template|url|img_src
-    │       └─ 视频: template|parsed_url|img_src
+    │       ├─ MainResult: template|parsed_url|img_src (通用算法)
+    │       └─ LegacyResult:
+    │           ├─ 图片: template|url|img_src
+    │           └─ 视频/普通: template|parsed_url|img_src
     │
     └─ get_ordered_results() - 排序 + 分组
         ├─ 按 score 降序
@@ -398,7 +480,7 @@ def get_result_template(theme_name: str, template_name: str):
     │
     └─ videos.html
         ├─ result_header 宏 (消费: url, thumbnail, length, title)
-        ├─ result_sub_header 宏 (消费: publishedDate, views, author, metadata)
+        ├─ result_sub_header 宏 (消费: publishedDate, pubdate, views, author, metadata)
         ├─ 描述内容 (消费: content)
         └─ 嵌入播放器 (消费: iframe_src)
 ```
@@ -440,6 +522,16 @@ url_fields = ["url", "iframe_src", "audio_src", "img_src", "thumbnail_src", "thu
 2. **过渡**: 新引擎可使用 `EngineResults` 包装器，选择 `LegacyResult` 或 `MainResult`
 3. **未来**: 引入 `ImageResult` 和 `VideoResult` 子类，将 `resolution`、`iframe_src` 等字段纳入强类型定义
 
+### 6.5 哈希去重设计权衡
+
+| 类型 | 哈希算法 | 适用场景 | 优缺点 |
+|------|----------|----------|--------|
+| **MainResult** | `template + parsed_url + img_src` | 类型安全的新引擎 | 强一致要求，不允许 `parsed_url` 为空 |
+| **LegacyResult** (图片) | `template + url + img_src` | 图片引擎 | 兼容 `parsed_url` 可能为空的情况 |
+| **LegacyResult** (视频) | `template + parsed_url + img_src` | 视频/普通引擎 | 与 MainResult 算法一致 |
+
+> **迁移注意**: 当图片引擎迁移到 `MainResult` 时，需要确保 `parsed_url` 字段被正确填充，否则哈希计算会抛出异常。
+
 ---
 
 ## 7. 引擎归一化映射对照矩阵
@@ -480,10 +572,14 @@ url_fields = ["url", "iframe_src", "audio_src", "img_src", "thumbnail_src", "thu
 | 数据模型 | `searx/result_types/_base.py` | 228 | `Result` 基类定义 |
 | 数据模型 | `searx/result_types/_base.py` | 339 | `MainResult` 主结果类定义 |
 | 数据模型 | `searx/result_types/_base.py` | 428 | `LegacyResult` 兼容类定义 |
+| 日期处理 | `searx/result_types/_base.py` | 219 | `_normalize_date_fields` 日期标准化 |
 | URL 处理 | `searx/result_types/_base.py` | 111 | `_filter_urls` URL 统一过滤 |
+| MainResult 哈希 | `searx/result_types/_base.py` | 405 | `MainResult.__hash__` 通用哈希算法 |
+| LegacyResult 哈希 | `searx/result_types/_base.py` | 521 | `LegacyResult.__hash__` 含图片专用分支 |
 | 结果容器 | `searx/results.py` | 53 | `ResultContainer` 结果收集合并 |
 | 结果排序 | `searx/results.py` | 197 | `get_ordered_results` 排序分组 |
 | 模板分发 | `searx/webapp.py` | 247 | `get_result_template` 模板选择 |
 | 图片模板 | `searx/templates/simple/result_templates/images.html` | 1 | 图片结果渲染 |
 | 视频模板 | `searx/templates/simple/result_templates/videos.html` | 1 | 视频结果渲染 |
 | 模板宏 | `searx/templates/simple/macros.html` | 21 | `result_header` 等宏定义 |
+| 模板宏 | `searx/templates/simple/macros.html` | 39 | `result_sub_header` 发布日期双格式消费 |
