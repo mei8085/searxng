@@ -248,7 +248,30 @@ def extract_doi(url):
    - hostnames 的 HIGH/LOW 优先级是在 `on_result` 末尾设置的
    - 如果组合插件调整了优先级设置的位置，可能影响结果排序
 
-### 4.4 推荐的执行顺序原则
+### 4.4 执行顺序风险矩阵（结构化对照）
+
+基于现有实现，以下是各功能点是否受执行顺序影响的结构化对照矩阵：
+
+| 分类 | 功能点 | 触发条件 | 影响结果 |
+|------|--------|----------|----------|
+| **🔴 会受顺序影响** | | | |
+| | **tracker_url_remover 清理参数** | hostnames 先执行，将 `youtube.com` 重写为 `invidious.example.com` | ClearURLs 规则针对 `youtube.com` 域名匹配，域名改变后追踪参数（如 `utm_`）残留 |
+| | **hostnames 字段级 REMOVE** | tracker_url_remover 先执行，意外修改了 URL 域名 | 字段级 REMOVE 规则基于原始域名匹配，可能漏掉应移除的 URL |
+| | **hostnames 字段级 REPLACE** | tracker_url_remover 先执行，意外修改了 URL 域名 | 字段级 REPLACE 规则基于原始域名匹配，可能漏掉应重写的 URL |
+| | **无效计算（性能影响）** | hostnames REMOVE 在其他插件之后执行 | 其他插件已花费时间清理 URL、提取 DOI，但结果被 hostnames 移除，全部计算浪费 |
+| **🟢 不受顺序影响** | | | |
+| | **hostnames 主 URL REMOVE** | 仅检查原始 `result.parsed_url.netloc` | 不依赖其他插件的输出，无论何时执行结果一致 |
+| | **hostnames HIGH/LOW 优先级** | 仅检查 `result.parsed_url.netloc` | 不依赖其他插件的输出（假设未修改 parsed_url） |
+| | **oa_doi_rewrite 提取 DOI** | 仅检查 URL path 和查询参数 | ✅ **不依赖域名**，hostnames 改域名不影响 DOI 提取 |
+| | **oa_doi_rewrite 生成新 URL** | 基于提取的 DOI 拼接新 URL | 新域名由配置决定，与原 URL 无关 |
+
+**风险矩阵解读**：
+- 🔴 **高风险（4 项）**：tracker_url_remover 必须在 hostnames REPLACE 之前执行；hostnames REMOVE 应优先执行
+- 🟢 **低风险（4 项）**：核心逻辑不依赖执行顺序，结果可预测
+
+---
+
+### 4.5 推荐的执行顺序原则
 
 为避免互相覆盖，应遵循以下原则：
 
@@ -256,13 +279,14 @@ def extract_doi(url):
 
 **推荐逻辑顺序**：
 ```
-tracker_url_remover → hostnames → oa_doi_rewrite
+hostnames REMOVE → tracker_url_remover → hostnames REPLACE → oa_doi_rewrite → 优先级设置
 ```
 
 **原因**：
-- tracker_url_remover 基于原始域名匹配追踪参数（ClearURLs 规则针对原始域名）
-- hostnames 基于清理后的 URL 重写域名（避免重写后参数无法匹配）
-- oa_doi_rewrite 最后处理 DOI 重定向（基于已清理的 URL）
+1. hostnames REMOVE 优先：快速移除不需要的结果，避免无效计算
+2. tracker_url_remover 次之：基于原始域名匹配追踪参数
+3. hostnames REPLACE 再次：基于清理后的 URL 重写域名
+4. oa_doi_rewrite 最后：不依赖域名，放最后不影响
 
 #### 原则 2：移除类逻辑优先执行
 
@@ -627,7 +651,7 @@ def on_result(self, request, search, result):
 - 完整覆盖所有语义，无功能缺失
 - 可在组合插件中添加日志、调试、监控等增强功能
 
-### 4.9 常见问题与边界处理
+### 4.10 常见问题与边界处理
 
 **Q1：如果 hostnames 配置为空怎么办？**
 A：组合插件的 `_load_hostnames_config()` 会正确处理空配置，REPLACE/REMOVE/HIGH/LOW 保持为空字典/集合，相关逻辑自动跳过。
