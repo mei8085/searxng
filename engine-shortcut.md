@@ -97,13 +97,13 @@ else:
 |------------------------|------------------------|------|
 | False | True | 使用 `raw_text_query.enginerefs`（即使为空也不回退） |
 | False | False | 调用 `parse_generic()`，按表单→偏好→general 回退 |
-| True | True | **忽略 specific**，调用 `parse_generic()`（锁定分类优先级最高） |
+| True | True | **忽略 enginerefs**，调用 `parse_generic()`（锁定分类优先级最高） |
 | True | False | 调用 `parse_generic()` |
 
-> **关键澄清**：
-> - "specific 命中后不回退默认分类" **仅在 categories 未锁定时成立**
-> - 若 categories 被管理员锁定，无论 specific 是否为 True，都会走 `parse_generic()` 路径
-> - 锁定场景下，用户的 `!` 前缀会被忽略，分类由管理员配置决定
+> **关键澄清（两层行为区分）**：
+> - **引擎选择层**：categories 锁定时，`!` 前缀**不会决定最终的引擎集合**，`enginerefs` 被忽略
+> - **文本剥离层**：categories 锁定时，若 `!` 前缀被解析命中（返回 True），**仍会从 `user_query_parts` 剥离**，不会出现在最终搜索文本中
+> - 这两层行为是独立的：解析命中的前缀总是被剥离，但只有 categories 未锁定时才会影响引擎选择
 
 ### 4.2 语言协同
 
@@ -130,6 +130,10 @@ def parse_lang(preferences, form, raw_text_query):
 |------|-----------|
 | 语言已锁定 | 1. 管理员锁定配置（忽略查询前缀、表单参数、用户偏好） |
 | 语言未锁定 | 1. 查询前缀 `:语言` → 2. 表单参数 → 3. 用户偏好 → 4. 系统默认 |
+
+> **与 `!` 前缀相同的两层行为**：
+> - **语言选择层**：language 锁定时，`:` 前缀不会决定最终语言
+> - **文本剥离层**：language 锁定时，若 `:` 前缀被解析命中，仍会从 `user_query_parts` 剥离
 
 ### 4.3 搜索安全级别协同
 
@@ -204,6 +208,7 @@ def get_selected_categories(preferences, form):
 > **重要补充**：
 > - 当 categories 未锁定且用户使用 `!` 快捷前缀时（`specific == True`），**完全绕过** `get_selected_categories()`，直接使用 `raw_text_query.enginerefs`（即使为空也不回退）
 > - 当 categories 被锁定时，无论用户是否使用 `!` 前缀，都会进入 `parse_generic()`，可能回退到 general
+> - 无论 categories 是否锁定，只要 `!` 前缀被解析命中，就会从搜索文本中剥离
 
 ## 5. 快捷词冲突与回退策略
 
@@ -292,6 +297,7 @@ def register_engine(engine):
 > **categories 锁定场景的差异**：
 > - 如果 categories 被锁定，即使 `specific == True`，也会走 `parse_generic()` 路径
 > - 此时空的 `raw_text_query.enginerefs` 会被忽略，使用管理员配置的分类
+> - 但 `!` 前缀已从搜索文本中剥离，不影响最终查询文本
 
 ### 5.4 查询阶段：快捷词命中失败的回退链路
 
@@ -422,7 +428,40 @@ self.raw_text_query.enginerefs.extend(
 - **未锁定**：使用空列表搜索，返回空结果（不回退）
 - **已锁定**：忽略空列表，使用管理员配置的分类
 
-## 6. 完整解析流程图
+## 6. categories 锁定场景下的完整行为分析
+
+### 6.1 两层行为对比表
+
+| 行为层面 | categories 未锁定 | categories 已锁定 |
+|---------|-----------------|-----------------|
+| **引擎选择** | `!` 前缀命中 → 使用 `enginerefs` | `!` 前缀命中 → 忽略 `enginerefs`，使用管理员配置 |
+| **文本剥离** | 命中 → 从 `user_query_parts` 剥离 | 命中 → 仍从 `user_query_parts` 剥离（与锁定无关） |
+| `specific` 值 | 命中 → `True` | 命中 → `True`（但被忽略） |
+| 最终查询文本 | 不含 `!` 前缀 | 不含 `!` 前缀（与未锁定相同） |
+
+### 6.2 示例对比
+
+**场景**：categories 被锁定为 `['general']`，用户输入 `!g python`
+
+```
+categories 未锁定时：
+    BangParser 命中 "g" → specific = True
+    enginerefs = [EngineRef('google', 'none')]
+    引擎选择：使用 google 引擎
+    最终搜索文本："python"
+
+categories 已锁定时：
+    BangParser 命中 "g" → specific = True（RawTextQuery 内部行为）
+    enginerefs = [EngineRef('google', 'none')]（RawTextQuery 内部行为）
+    webadapter 检测到 is_locked('categories') == True
+    → 忽略 enginerefs，调用 parse_generic()
+    → 使用管理员配置的 general 分类
+    最终搜索文本："python"（!g 已被剥离）
+```
+
+**关键差异**：两种场景下最终搜索文本都是 "python"，但使用的引擎集合不同。
+
+## 7. 完整解析流程图
 
 ```
 用户输入查询字符串
@@ -459,11 +498,11 @@ query.py: RawTextQuery._parse_query()
         ├─ FeelingLuckyParser.check(part)?
         │   ├─ 是 → 解析成功 → special_part = True
         │   └─ 否 → 所有解析器都不匹配
-        └─ 分流:
-            special_part == True → 加入 query_parts（特殊前缀）
+        └─ 分流（与 categories 是否锁定无关!）:
+            special_part == True → 加入 query_parts（特殊前缀，从搜索文本剥离）
             special_part == False → 加入 user_query_parts（普通文本）
     ↓
-webadapter.py: 选择引擎列表
+webadapter.py: 选择引擎列表（categories 锁定只影响这一层!）
     ├─ categories 未锁定 AND specific == True?
     │   ├─ 是 → 使用 raw_text_query.enginerefs（可能为空，不回退）
     │   └─ 否 → parse_generic() → 表单分类 → 用户偏好 → general
@@ -476,9 +515,9 @@ validate_engineref_list() → 过滤未知引擎和 Token 验证失败的引擎
 执行搜索（engineref_list 为空时返回空结果）
 ```
 
-## 7. 关键数据结构
+## 8. 关键数据结构
 
-### 7.1 EngineRef
+### 8.1 EngineRef
 
 在 `searx/search/models.py:8-24` 中定义：
 
@@ -490,7 +529,7 @@ class EngineRef:
         self.category = category  # 分类名称（'none' 表示直接指定引擎）
 ```
 
-### 7.2 engine_shortcuts 字典
+### 8.2 engine_shortcuts 字典
 
 在 `searx/engines/__init__.py:58-66` 中定义：
 
@@ -505,7 +544,7 @@ engine_shortcuts = {}
 - `wp` → `wikipedia`
 - `ddg` → `duckduckgo`
 
-### 7.3 RawTextQuery 关键属性
+### 8.3 RawTextQuery 关键属性
 
 | 属性 | 类型 | 含义 |
 |------|------|------|
@@ -516,11 +555,11 @@ engine_shortcuts = {}
 | `specific` | bool | 是否通过 `!` 前缀指定了特定引擎/分类（与 enginerefs 是否为空无关） |
 | `timeout_limit` | float/None | 解析出的超时限制 |
 
-## 8. 总结
+## 9. 总结
 
-### 8.1 核心设计原则
+### 9.1 核心设计原则
 
-SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松、管理员配置优先级最高**的设计哲学：
+SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松、管理员配置优先级最高、解析与执行分离**的设计哲学：
 
 1. **配置阶段**：零容忍策略
    - 重复的快捷词或引擎名被视为严重配置错误
@@ -531,14 +570,20 @@ SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶�
    - 但识别了前缀但引擎不可用时，**不做回退**，直接返回空结果（仅 categories 未锁定时）
 
 3. **管理员锁定**：最高优先级
-   - 任何配置项被锁定后，完全忽略用户的查询前缀和表单参数
-   - categories 锁定时，`!` 前缀完全失效
-   - language 锁定时，`:` 前缀完全失效
+   - 任何配置项被锁定后，完全忽略用户的查询前缀和表单参数（在执行层）
+   - 但**解析层**不受锁定影响，前缀仍会被正常解析和剥离
+   - categories 锁定时，`!` 前缀在**引擎选择层**失效，但在**文本剥离层**仍生效
+   - language 锁定时，`:` 前缀在**语言选择层**失效，但在**文本剥离层**仍生效
 
-4. **优先级设计**：
+4. **解析与执行分离**：
+   - `RawTextQuery` 只负责解析，不关心配置是否锁定
+   - 锁定逻辑在 `webadapter.py` 的执行层生效
+   - 这种分离确保了解析逻辑的简洁性和一致性
+
+5. **优先级设计**：
    - 管理员锁定配置 > 查询前缀 > 表单参数 > 用户偏好 > 系统默认
 
-### 8.2 关键行为澄清
+### 9.2 关键行为澄清
 
 | 场景 | 实际行为 | 常见误解 |
 |------|---------|---------|
@@ -547,13 +592,14 @@ SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶�
 | `!引擎` 但引擎 Token 验证失败 | 返回空结果，不回退 | ❌ 误以为会尝试其他引擎 |
 | validate 后 valid 为空 | 返回空结果，静默失败 | ❌ 误以为会有错误提示或回退 |
 | `!unknown` 无法匹配 | 作为普通文本搜索 | ✅ 正确 |
-| categories 已锁定时使用 `!g` | 忽略 `!g`，使用管理员配置的分类 | ❌ 误以为 `!` 前缀总是生效 |
+| categories 已锁定时使用 `!g` | 忽略 `!g` 选择引擎，但 `!g` 会从搜索文本中剥离 | ❌ 误以为 `!` 前缀完全失效（文本也保留） |
+| language 已锁定时使用 `:en` | 忽略 `:en` 选择语言，但 `:en` 会从搜索文本中剥离 | ❌ 误以为 `:` 前缀完全失效（文本也保留） |
 
-### 8.3 多层回退机制（仅限特定场景）
+### 9.3 多层回退机制（仅限特定场景）
 
 - **快捷词匹配失败时**：快捷词 → 引擎名 → 分类名 → 普通文本
 - **无快捷词且 categories 未锁定时**：表单分类 → 用户偏好分类 → general 分类
-- **categories 已锁定时**：管理员配置分类（忽略所有用户输入）
+- **categories 已锁定时**：管理员配置分类（忽略所有用户输入，但文本仍被剥离）
 - **引擎验证失败时**：静默过滤，不影响整体搜索（但可能导致空结果）
 
 这种设计在配置正确性、用户体验和管理员控制权之间做了权衡：对于用户输入错误保持宽容，对于已识别的用户意图保持忠实，同时确保管理员的锁定配置具有最高优先级。
