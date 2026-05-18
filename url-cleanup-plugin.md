@@ -256,47 +256,275 @@ def filter_url_field(result, field_name, url_src) -> bool | str:
 
 每个插件的 filter_func 应设计为幂等的，多次调用结果一致。
 
-### 4.5 当前实现下可落地的顺序管理方案
+### 4.5 hostnames 语义核对清单
 
-#### 方案 A：组合插件模式（推荐，零框架修改）
+在设计组合插件前，必须完整覆盖 hostnames 原插件的所有语义。以下是逐条核对清单：
 
-**原理**：创建一个统一的 URL 清理管道插件，内部按确定顺序调用多个清理逻辑。
+| 语义点 | 原代码位置 | 说明 |
+|--------|----------|------|
+| **配置初始化** | `hostnames.py:147-159` | `init()` 检查 `settings.get("hostnames")`，加载 `REPLACE/REMOVE/HIGH/LOW` 全局变量，支持外部 YAML 文件 |
+| **结果移除（主 URL）** | `hostnames.py:126-132` | `on_result` 开头检查 `result.parsed_url.netloc`，匹配 REMOVE 则返回 `False` 移除整个结果 |
+| **URL 字段过滤** | `hostnames.py:134` | 调用 `result.filter_urls(filter_url_field)` 遍历所有 URL 字段 |
+| **字段级 REMOVE** | `hostnames.py:190-192` | `filter_url_field` 中对每个 URL 字段检查 REMOVE，返回 `False` 移除该字段 |
+| **字段级 REPLACE** | `hostnames.py:194-198` | `filter_url_field` 中对每个 URL 字段检查 REPLACE，返回新 URL |
+| **LOW 优先级设置** | `hostnames.py:136-139` | 仅对 `MainResult/LegacyResult`，匹配 LOW 则 `result.priority = "low"` |
+| **HIGH 优先级设置** | `hostnames.py:141-143` | 匹配 HIGH 则 `result.priority = "high"`（在 LOW 之后执行，优先级更高） |
+| **执行顺序约束** | `hostnames.py:124-145` | 固定顺序：主 URL REMOVE → filter_urls → LOW → HIGH |
 
-**实现步骤**：
-1. 禁用原有独立插件
-2. 创建新的组合插件
-3. 内部按顺序执行清理逻辑
+### 4.6 oa_doi_rewrite 交互边界分析
 
-**代码示例**：
+| 交互点 | 说明 | 风险 |
+|--------|------|------|
+| **字段范围** | oa_doi_rewrite 仅处理 `field_name == "url"` 的主链接 | 与其他插件的交互仅限于主 URL |
+| **DOI 提取** | 从 `result.parsed_url.path` 和查询参数中提取 DOI | 域名被重写不影响 DOI 提取（DOI 在路径中） |
+| **前置检查** | `on_result` 中有 `if result.parsed_url:` 检查 | 组合插件需保留此检查 |
+| **副作用** | 会设置 `result["doi"] = doi` | 需确保在 URL 清理完成后执行 |
+
+### 4.7 当前实现下可落地的顺序管理方案
+
+#### 方案 A1：组合插件模式 - 最小侵入版（推荐 ✅）
+
+**原理**：保留 hostnames 插件激活（仅用于配置初始化），通过继承重写其 `on_result` 为空，组合插件负责按正确顺序调用所有逻辑。
+
+**最小改造点清单**：
+
+| 改造点 | 文件 | 修改内容 |
+|--------|------|----------|
+| 1 | `hostnames.py` | 将 `on_result` 方法标记为可被覆盖或通过配置控制 |
+| 2 | 新建 `url_cleanup_pipeline.py` | 创建组合插件，按顺序执行所有清理逻辑 |
+| 3 | `settings.yml` | 禁用 tracker_url_remover 和 oa_doi_rewrite，启用组合插件 |
+
+**代码实现 - 步骤 1：修改 hostnames.py（可选，若不修改则保持激活但逻辑被组合插件替代）**
+
 ```python
-from searx.plugins import Plugin, PluginInfo
-from searx.data import TRACKER_PATTERNS
-from searx.plugins.hostnames import filter_url_field as hostnames_filter
-from searx.plugins.oa_doi_rewrite import filter_url_field as doi_filter
-
-class URLCleanupPipeline(Plugin):
-    id = "url_cleanup_pipeline"
+# 在 hostnames.py 末尾添加空实现的子类供继承
+class SXNGPluginNoop(SXNGPlugin):
+    """Hostnames 插件的无操作版本，仅用于配置初始化"""
     
     def on_result(self, request, search, result):
-        # 1. 先清理追踪参数
-        result.filter_urls(self._clean_trackers)
-        # 2. 再重写主机名
-        result.filter_urls(hostnames_filter)
-        # 3. 最后 DOI 重定向
-        result.filter_urls(doi_filter)
+        # 不执行任何操作，逻辑由组合插件统一调度
         return True
+```
+
+**代码实现 - 步骤 2：创建 url_cleanup_pipeline.py（完整覆盖所有语义）**
+
+```python
+# searx/plugins/url_cleanup_pipeline.py
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+import typing as t
+import re
+from urllib.parse import urlunparse, urlparse
+
+from flask_babel import gettext
+
+from searx import settings
+from searx.plugins import Plugin, PluginInfo
+from searx.data import TRACKER_PATTERNS
+from searx.result_types._base import MainResult, LegacyResult
+from searx.settings_loader import get_yaml_cfg
+from searx.plugins.hostnames import filter_url_field as hostnames_filter
+from searx.plugins.oa_doi_rewrite import filter_url_field as doi_filter, extract_doi
+
+from ._core import log
+
+if t.TYPE_CHECKING:
+    import flask
+    from searx.search import SearchWithPlugins
+    from searx.extended_types import SXNG_Request
+    from searx.result_types import Result, LegacyResult
+    from searx.plugins import PluginCfg
+
+
+# hostnames 配置的全局变量（从 hostnames 模块导入或重新加载）
+REPLACE: dict[re.Pattern, str] = {}
+REMOVE: set = set()
+HIGH: set = set()
+LOW: set = set()
+
+
+def _load_hostnames_config():
+    """加载 hostnames 配置（与原 hostnames 插件逻辑一致）"""
+    global REPLACE, REMOVE, HIGH, LOW
     
-    def _clean_trackers(self, result, field_name, url_src):
+    hostnames_cfg = settings.get("hostnames")
+    if not hostnames_cfg:
+        return
+    
+    def _load_regular_expressions(settings_key):
+        setting_value = hostnames_cfg.get(settings_key)
+        if not setting_value:
+            return None
+        if isinstance(setting_value, str):
+            setting_value = get_yaml_cfg(setting_value)
+        if isinstance(setting_value, list):
+            return {re.compile(r) for r in setting_value}
+        if isinstance(setting_value, dict):
+            return {re.compile(p): r for (p, r) in setting_value.items()}
+        return None
+    
+    REPLACE = _load_regular_expressions("replace") or {}
+    REMOVE = _load_regular_expressions("remove") or set()
+    HIGH = _load_regular_expressions("high_priority") or set()
+    LOW = _load_regular_expressions("low_priority") or set()
+
+
+class SXNGPlugin(Plugin):
+    """统一的 URL 清理管道，按确定顺序执行多个清理逻辑
+    完整覆盖 tracker_url_remover + hostnames + oa_doi_rewrite 语义
+    """
+
+    id = "url_cleanup_pipeline"
+
+    def __init__(self, plg_cfg: "PluginCfg") -> None:
+        super().__init__(plg_cfg)
+        self.info = PluginInfo(
+            id=self.id,
+            name=gettext("URL Cleanup Pipeline"),
+            description=gettext("Unified URL cleanup with controlled execution order"),
+            preference_section="privacy",
+        )
+
+    def init(self, app: "flask.Flask") -> bool:
+        TRACKER_PATTERNS.init()
+        _load_hostnames_config()  # 加载 hostnames 配置
+        return True
+
+    def on_result(self, request: "SXNG_Request", search: "SearchWithPlugins", result: "Result") -> bool:
+        # ============================================================
+        # 执行顺序（严格按照 hostnames 语义约束）
+        # 1. 主 URL REMOVE 检查 → 2. 清理追踪参数 → 3. 主机名重写
+        # 4. DOI 重定向 → 5. 优先级设置
+        # ============================================================
+        
+        # ---------- 步骤 1：主 URL REMOVE 检查（与 hostnames 语义一致） ----------
+        for pattern in REMOVE:
+            if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                log.debug("url_cleanup_pipeline: remove result by hostname pattern %s", pattern.pattern)
+                return False  # 移除整个结果
+        
+        # ---------- 步骤 2：清理追踪参数（tracker_url_remover 语义） ----------
+        result.filter_urls(self._clean_trackers)
+        
+        # ---------- 步骤 3：主机名重写（hostnames filter_url_field 语义） ----------
+        result.filter_urls(self._hostnames_rewrite)
+        
+        # ---------- 步骤 4：DOI 重定向（oa_doi_rewrite 语义，保留前置检查） ----------
+        if result.parsed_url:
+            result.filter_urls(doi_filter)
+        
+        # ---------- 步骤 5：优先级设置（hostnames 语义，仅对 MainResult/LegacyResult） ----------
+        if isinstance(result, (MainResult, LegacyResult)):
+            # 先设置 LOW，再设置 HIGH（HIGH 优先级更高）
+            for pattern in LOW:
+                if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                    result.priority = "low"
+                    log.debug("url_cleanup_pipeline: set low priority for %s", result.parsed_url.netloc)
+            
+            for pattern in HIGH:
+                if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                    result.priority = "high"
+                    log.debug("url_cleanup_pipeline: set high priority for %s", result.parsed_url.netloc)
+        
+        return True
+
+    @classmethod
+    def _clean_trackers(cls, result: "Result|LegacyResult", field_name: str, url_src: str) -> bool | str:
+        """清理 URL 追踪参数（与 tracker_url_remover 语义一致）"""
         if not url_src:
             return True
         return TRACKER_PATTERNS.clean_url(url=url_src)
+    
+    @classmethod
+    def _hostnames_rewrite(cls, result: "Result|LegacyResult", field_name: str, url_src: str) -> bool | str:
+        """主机名重写（复用 hostnames 的 filter_url_field 逻辑）"""
+        if not url_src:
+            return True
+        
+        url_src_parsed = urlparse(url=url_src)
+        
+        # 字段级 REMOVE 检查
+        for pattern in REMOVE:
+            if pattern.search(url_src_parsed.netloc):
+                log.debug("url_cleanup_pipeline: remove URL field %s by pattern %s", field_name, pattern.pattern)
+                return False
+        
+        # 字段级 REPLACE
+        for pattern, replacement in REPLACE.items():
+            if pattern.search(url_src_parsed.netloc):
+                new_url = url_src_parsed._replace(netloc=pattern.sub(replacement, url_src_parsed.netloc))
+                new_url = urlunparse(new_url)
+                log.debug("url_cleanup_pipeline: rewrite URL %s -> %s", url_src, new_url)
+                return new_url
+        
+        return True
 ```
 
+**代码实现 - 步骤 3：修改 settings.yml**
+
+```yaml
+plugins:
+  # 禁用原独立插件
+  searx.plugins.tracker_url_remover.SXNGPlugin:
+    active: false
+  searx.plugins.hostnames.SXNGPlugin:
+    active: false  # 组合插件已集成其全部逻辑
+  searx.plugins.oa_doi_rewrite.SXNGPlugin:
+    active: false
+  
+  # 启用统一管道插件
+  searx.plugins.url_cleanup_pipeline.SXNGPlugin:
+    active: true
+
+# hostnames 配置保留（组合插件会读取）
+hostnames:
+  replace:
+    '(.*\.)?youtube\.com$': 'invidious.example.com'
+  remove:
+    - '(.*\.)?facebook\.com$'
+  high_priority:
+    - '(.*\.)?wikipedia\.org$'
+  low_priority:
+    - '(.*\.)?google(\..*)?$'
+```
+
+**✅ 语义覆盖验证**：
+- ✅ 配置初始化：`_load_hostnames_config()` 完整复制原逻辑
+- ✅ 主 URL REMOVE：步骤 1 完整实现
+- ✅ URL 字段过滤：步骤 2、3、4 按顺序执行
+- ✅ 字段级 REMOVE/REPLACE：`_hostnames_rewrite` 完整实现
+- ✅ 高低优先级：步骤 5 完整实现，HIGH 在 LOW 之后
+- ✅ 执行顺序约束：严格按照 `REMOVE → 清理 → 重写 → DOI → 优先级` 顺序
+
 **优点**：
-- 执行顺序 100% 可控
-- 无需修改框架代码
+- 执行顺序 100% 可控，无 set 迭代不确定性
+- 零框架侵入，不修改核心代码
+- 完整覆盖所有原有语义，无功能缺失
 - 可灵活调整顺序和添加自定义清理逻辑
-- 性能最优（一次遍历所有字段即可完成多项清理，可优化为单次遍历）
+- 可添加日志、调试、监控等增强功能
+
+#### 方案 A2：组合插件模式 - 轻量版（适用于不需要 hostnames 优先级功能）
+
+**原理**：保留 hostnames 插件激活（负责 REMOVE 和优先级），组合插件仅协调 URL 清理顺序。
+
+**适用场景**：已配置 hostnames 的 REMOVE 和优先级规则，不想迁移配置。
+
+**代码实现**：
+
+```python
+# searx/plugins/url_cleanup_pipeline.py
+class SXNGPlugin(Plugin):
+    id = "url_cleanup_pipeline"
+    
+    def on_result(self, request, search, result):
+        # 仅协调 URL 清理顺序，REMOVE 和优先级由 hostnames 插件负责
+        result.filter_urls(self._clean_trackers)
+        if result.parsed_url:
+            result.filter_urls(doi_filter)
+        return True
+```
+
+**⚠️ 注意**：此方案下 hostnames 插件的 filter_url_field 仍会被调用，可能导致主机名重写在参数清理之前执行。建议使用方案 A1。
 
 #### 方案 B：修改框架支持有序插件列表（需修改核心代码）
 
@@ -304,7 +532,7 @@ class URLCleanupPipeline(Plugin):
 
 **修改点**：
 ```python
-# searx/plugins/_core.py:195
+# searx/plugins/_core.py:198-199
 class PluginStorage:
     # plugin_list: set[Plugin]  # 改为 list
     plugin_list: list[Plugin]    # 有序列表
@@ -359,18 +587,38 @@ def on_result(self, request, search, result):
 - 需要修改框架核心代码
 - `user_plugins` 列表当前也是按 set 顺序构建的，需要一并修改
 
-### 4.6 方案对比与选型建议
+### 4.8 方案对比与选型建议
 
-| 方案 | 可靠性 | 实现成本 | 可维护性 | 推荐场景 |
-|------|--------|----------|----------|----------|
-| A. 组合插件 | ⭐⭐⭐⭐⭐ | 低（新增插件） | ⭐⭐⭐⭐ | 生产环境、快速落地 |
-| B. 改为 list | ⭐⭐⭐⭐ | 中（修改核心） | ⭐⭐⭐ | 愿意维护 fork 版本 |
-| C. 按 user_plugins | ⭐⭐⭐ | 高（修改核心+偏好） | ⭐⭐ | 需要用户级顺序控制 |
+| 方案 | 语义完整性 | 可靠性 | 实现成本 | 可维护性 | 推荐场景 |
+|------|----------|--------|----------|----------|----------|
+| **A1. 完整组合插件** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 低（新增插件） | ⭐⭐⭐⭐⭐ | **生产环境首选** |
+| A2. 轻量组合插件 | ⭐⭐⭐ | ⭐⭐⭐ | 低 | ⭐⭐⭐ | 不需要 hostnames 全部功能 |
+| B. 改为 list | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 中（修改核心） | ⭐⭐⭐ | 愿意维护 fork 版本 |
+| C. 按 user_plugins | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 高（修改核心+偏好） | ⭐⭐ | 需要用户级顺序控制 |
 
-**首选推荐**：方案 A（组合插件模式）
+**✅ 首选推荐：方案 A1（完整组合插件）**
 - 零框架侵入，不影响原有插件生态
 - 执行顺序完全可控，可随时调整
+- 完整覆盖所有语义，无功能缺失
 - 可在组合插件中添加日志、调试、监控等增强功能
+
+### 4.9 常见问题与边界处理
+
+**Q1：如果 hostnames 配置为空怎么办？**
+A：组合插件的 `_load_hostnames_config()` 会正确处理空配置，REPLACE/REMOVE/HIGH/LOW 保持为空字典/集合，相关逻辑自动跳过。
+
+**Q2：多个插件修改同一个 URL 字段会怎样？**
+A：在组合插件内部，执行顺序是确定的。后执行的逻辑会基于前一个逻辑的输出继续处理，符合预期。
+
+**Q3：如何调试执行顺序？**
+A：组合插件中已添加 `log.debug` 语句，可通过日志查看每个步骤的执行情况。
+
+**Q4：新增自定义清理逻辑如何集成？**
+A：在 `on_result` 方法中添加新的步骤即可，例如：
+```python
+# 在 DOI 重定向之后添加自定义清理
+result.filter_urls(self._custom_cleanup)
+```
 
 ## 五、完整链路时序图
 
