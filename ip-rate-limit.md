@@ -101,13 +101,14 @@ return result
 ### 2.3 四类计数键的命名差异
 
 > **重要差异**: API_WINDOW 使用冒号分隔，其他三类直接拼接网络地址。
+> **适用范围**: 所有计数键仅在 `/search` 路径下可能被创建。
 
-| 窗口类型 | 原始键名格式 | 代码位置 |
-|---------|-------------|---------|
-| API_WINDOW | `ip_limit.API_WINDOW:<network>` | `ip_limit.py:106` |
-| SUSPICIOUS_IP_WINDOW | `ip_limit.SUSPICIOUS_IP_WINDOW<network>` | `ip_limit.py:116, 121` |
-| BURST_WINDOW | `ip_limit.BURST_WINDOW<network>` | `ip_limit.py:129, 140` |
-| LONG_WINDOW | `ip_limit.LONG_WINDOW<network>` | `ip_limit.py:133, 144` |
+| 窗口类型 | 原始键名格式 | 代码位置 | 触发条件 |
+|---------|-------------|---------|---------|
+| API_WINDOW | `ip_limit.API_WINDOW:<network>` | `ip_limit.py:106` | format != html |
+| SUSPICIOUS_IP_WINDOW | `ip_limit.SUSPICIOUS_IP_WINDOW<network>` | `ip_limit.py:116, 121` | link_token 启用且请求可疑 |
+| BURST_WINDOW | `ip_limit.BURST_WINDOW<network>` | `ip_limit.py:129, 140` | 所有 /search 请求 |
+| LONG_WINDOW | `ip_limit.LONG_WINDOW<network>` | `ip_limit.py:133, 144` | 所有 /search 请求 |
 
 **最终存储键名**（经过 `secret_hash` 处理）：
 ```
@@ -298,6 +299,8 @@ def block_ip(real_ip, cfg):
 ```
 ip_limit.filter_request(network, request, cfg)
   ↓
+  （仅 /search 路径会进入此函数）
+  ↓
 1. link-local 检查
    ├─ 是且 filter_link_local=false → [放行]
    └─ 否 → 继续
@@ -309,43 +312,71 @@ ip_limit.filter_request(network, request, cfg)
          └─ ≤ API_MAX → 继续后续检测
   ↓
 3. link_token 已启用？
-   ├─ 否 → 进入【普通限流模式】
-   └─ 是 → 进入【可疑检测模式】
+   ├─ 否 → 进入【A. 普通限流模式】（单一分支，所有请求走同一套阈值）
+   └─ 是 → 进入【B. 可疑检测模式】（双分支，先判定可疑性再分流）
 ```
 
-#### 普通限流模式（link_token 未启用）
+---
 
-```
-  ↓
-4. 计数 BURST_WINDOW
-   ├─ > BURST_MAX(15) → 返回 429 → [拦截]
-   └─ ≤ BURST_MAX → 继续
-  ↓
-5. 计数 LONG_WINDOW
-   ├─ > LONG_MAX(150) → 返回 429 → [拦截]
-   └─ ≤ LONG_MAX → [放行]
-```
+#### A. 普通限流模式（link_token 未启用）
 
-#### 可疑检测模式（link_token 已启用）
+**特点**：不区分正常/可疑浏览器，所有 `/search` 请求适用同一套阈值。
 
 ```
   ↓
-4. 调用 link_token.is_suspicious()
-   ├─ 不可疑 → drop SUSPICIOUS_IP_WINDOW 计数 → [放行]
-   └─ 可疑 → 继续
+4. 计数 BURST_WINDOW（阈值：BURST_MAX = 15次/20秒）
+   ├─ > 15 → 返回 429 → [拦截]
+   └─ ≤ 15 → 继续
   ↓
-5. 计数 SUSPICIOUS_IP_WINDOW
-   ├─ > SUSPICIOUS_IP_MAX(3) → 302 重定向到 / → [拦截]
-   └─ ≤ SUSPICIOUS_IP_MAX → 继续
-  ↓
-6. 计数 BURST_WINDOW
-   ├─ > BURST_MAX_SUSPICIOUS(2) → 返回 429 → [拦截]
-   └─ ≤ BURST_MAX_SUSPICIOUS → 继续
-  ↓
-7. 计数 LONG_WINDOW
-   ├─ > LONG_MAX_SUSPICIOUS(10) → 返回 429 → [拦截]
-   └─ ≤ LONG_MAX_SUSPICIOUS → [放行]
+5. 计数 LONG_WINDOW（阈值：LONG_MAX = 150次/10分钟）
+   ├─ > 150 → 返回 429 → [拦截]
+   └─ ≤ 150 → [放行]
 ```
+
+---
+
+#### B. 可疑检测模式（link_token 已启用）
+
+**特点**：先通过 `is_suspicious()` 判定浏览器真实性，再分流到不同路径。
+
+```
+  ↓
+4. 调用 link_token.is_suspicious()  ← 【关键分流边界】
+   ├─ 不可疑（真实浏览器，有有效 ping 记录）
+   │    ├─ drop SUSPICIOUS_IP_WINDOW 计数（清除之前的可疑标记）
+   │    └─ 直接 [放行]  ← 不进入 BURST/LONG 计数！
+   │
+   └─ 可疑（无有效 ping 记录，疑似爬虫）
+        ↓
+        5. 计数 SUSPICIOUS_IP_WINDOW（阈值：3次/30天）
+           ├─ > 3 → 302 重定向到 / → [拦截]
+           └─ ≤ 3 → 继续
+        ↓
+        6. 计数 BURST_WINDOW（阈值：BURST_MAX_SUSPICIOUS = 2次/20秒）
+           ├─ > 2 → 返回 429 → [拦截]
+           └─ ≤ 2 → 继续
+        ↓
+        7. 计数 LONG_WINDOW（阈值：LONG_MAX_SUSPICIOUS = 10次/10分钟）
+           ├─ > 10 → 返回 429 → [拦截]
+           └─ ≤ 10 → [放行]
+```
+
+> **重要分流边界**：link_token 启用时，`is_suspicious()` 返回 `False`（不可疑）的请求会直接 `return None` 放行，**不会**进入 BURST_WINDOW 和 LONG_WINDOW 的计数。只有 `is_suspicious()` 返回 `True`（可疑）的请求才会继续进入后续三层计数。
+
+---
+
+#### 两种模式并行对比表
+
+| 对比维度 | A. 普通限流模式（link_token 关闭） | B. 可疑检测模式（link_token 开启） |
+|---------|---------------------------------|---------------------------------|
+| 可疑判定 | 无（所有请求一视同仁） | 有（`is_suspicious()` 作为分流边界） |
+| 非可疑请求 | 必须经过 BURST+LONG 计数 | 直接放行，不计数 |
+| 可疑请求 | 不存在此概念（无分流） | 经过 SUSPICIOUS_IP + BURST（可疑阈值） + LONG（可疑阈值） |
+| BURST 阈值 | 15次/20秒 | 2次/20秒（仅可疑请求） |
+| LONG 阈值 | 150次/10分钟 | 10次/10分钟（仅可疑请求） |
+| SUSPICIOUS_IP 计数 | 无 | 有（3次/30天，仅可疑请求） |
+| 对真实浏览器 | 受 15/150 阈值限制 | 不受限流阈值限制（直接放行） |
+| 对疑似爬虫 | 受 15/150 阈值限制 | 受 3/2/10 严格阈值限制 |
 
 ### 4.3 各节点返回值汇总
 
