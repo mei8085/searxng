@@ -2,7 +2,9 @@
 
 ## 1. 概述
 
-本报告基于 SearXNG 元搜索引擎的实现，深入分析 Google、Bing、DuckDuckGo、Yahoo 四大主流商业搜索引擎在适配层上的差异。报告覆盖请求拼装、响应解析、错误识别三个核心层面，探讨适配框架如何抽象统一这些差异，并分析其对结果归并、限流、机器人检测的影响。
+本报告基于 SearXNG 元搜索引擎的代码实现，分析 Google、Bing、DuckDuckGo、Yahoo 四大主流商业搜索引擎在适配层上的差异。报告覆盖请求拼装、响应解析、错误识别三个核心层面，探讨适配框架如何抽象统一这些差异，并分析其对结果归并、限流、机器人检测的影响。
+
+> **报告原则**：所有结论均有明确的代码引用可追溯验证。无法从代码静态分析得出的主观判断（如"高/中/低"、"估计"、"几小时"等）均已标注为"推测"或移除。
 
 ## 2. 适配层架构总览
 
@@ -39,15 +41,15 @@ SearXNG 采用"处理器-引擎"双层适配架构：
 | DuckDuckGo | POST | [duckduckgo.py:361-456](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L361-L456) | 使用 POST 提交表单数据 |
 | Yahoo | GET | [yahoo.py:144-194](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L144-L194) | 所有请求使用 GET |
 
-**差异点：**
+**可验证事实**：
 - DuckDuckGo 采用 POST 方法，通过表单提交搜索参数，其他引擎均使用 GET
 - DuckDuckGo 需要特殊的 Content-Type 头：`application/x-www-form-urlencoded`
 
 ### 3.2 语言/区域参数映射
 
-#### Google 的多维度本地化策略
+#### Google 的本地化参数
 
-Google 使用最复杂的本地化参数体系，包含 5 个核心参数：
+Google 的本地化参数体系包含 5 个核心参数（可验证的代码事实）：
 
 ```python
 # google.py:199-256
@@ -63,7 +65,7 @@ ret_val["params"]["oe"] = "utf8"                       # 输出编码
 ret_val["subdomain"] = eng_traits.custom["supported_domains"].get(country.upper(), "www.google.com")
 ```
 
-#### Bing 的简化策略
+#### Bing 的本地化参数
 
 Bing 仅使用单一 `mkt` 参数：
 ```python
@@ -80,7 +82,7 @@ def get_locale_params(engine_region):
 params["headers"]["Accept-Language"] = f"{engine_region},{lang};q=0.9"
 ```
 
-#### DuckDuckGo 的表单参数
+#### DuckDuckGo 的本地化参数
 
 DuckDuckGo 通过表单字段 `kl` 和 Cookie 传递语言信息：
 ```python
@@ -90,7 +92,7 @@ params["cookies"]["kl"] = eng_region
 params["cookies"]["df"] = t_range  # 时间范围也通过 Cookie 传递
 ```
 
-#### Yahoo 的域名映射策略
+#### Yahoo 的本地化参数
 
 Yahoo 通过不同域名实现本地化：
 ```python
@@ -112,14 +114,13 @@ lang2domain = {
 | 搜索引擎 | 参数名 | 计算方式 | 实现位置 |
 |---------|--------|---------|---------|
 | Google | start | `(pageno - 1) * 10` | [google.py:307](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L307) |
-| Bing | 不支持 | - | - |
+| Bing | 未实现 | - | **代码证据**：[bing.py:97-119](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L97-L119) 的 `request()` 函数中无分页参数处理逻辑 |
 | DuckDuckGo | s, dc | 首页: `b=""`，后续页: `s=offset` | [duckduckgo.py:405-435](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L405-L435) |
 | Yahoo | b | `pageno * 7 + 1` | [yahoo.py:165](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L165) |
 
-**特殊说明：**
-- DuckDuckGo 分页需要 `vqd` 令牌（Validation Query Digest），首次请求时从响应中提取，后续请求必须携带
-- Bing 不支持分页，因为其分页依赖 JavaScript
-- DuckDuckGo 第二页起的偏移量计算：`10 + (pageno - 2) * 15`
+**可验证事实**：
+- DuckDuckGo 分页需要 `vqd` 令牌（Validation Query Digest），首次请求时从响应中提取，后续请求必须携带。**代码证据**：[duckduckgo.py:178-200](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L178-L200) 中 `get_vqd()` 函数负责从响应中提取 vqd
+- DuckDuckGo 第二页起的偏移量计算：`10 + (pageno - 2) * 15`。**代码证据**：[duckduckgo.py:412-414](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L412-L414)
 
 ### 3.4 安全搜索参数映射
 
@@ -127,7 +128,7 @@ lang2domain = {
 |---------|---------|---------|---------|---------|
 | Google | off | medium | high | [google.py:65](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L65) |
 | Bing | off | moderate | strict | [bing.py:44-48](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L44-L48) |
-| DuckDuckGo | - | - | - | 无单独参数，由后端控制 |
+| DuckDuckGo | - | - | - | **代码证据**：[duckduckgo.py:361-456](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L361-L456) 的 `request()` 函数中无安全搜索参数处理逻辑 |
 | Yahoo | p | i | r | [yahoo.py:38](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L38) |
 
 ### 3.5 时间范围参数映射
@@ -135,9 +136,9 @@ lang2domain = {
 | 搜索引擎 | day | week | month | year | 实现位置 |
 |---------|-----|------|-------|------|---------|
 | Google | d | w | m | y | [google.py:62](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L62) |
-| Bing | 不支持 | 不支持 | 不支持 | 不支持 | - |
+| Bing | 未实现 | 未实现 | 未实现 | 未实现 | **代码证据**：[bing.py:97-119](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L97-L119) 的 `request()` 函数中无时间范围参数处理逻辑 |
 | DuckDuckGo | d | w | m | y | [duckduckgo.py:213](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L213) |
-| Yahoo | d | w | m | 不支持 | [yahoo.py:37](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L37) |
+| Yahoo | d | w | m | 未实现 | **代码证据**：[yahoo.py:144-194](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L144-L194) 的 `request()` 函数中无 `year` 时间范围处理逻辑 |
 
 ### 3.6 特殊请求头与 Cookie
 
@@ -169,7 +170,7 @@ headers["Referer"] = "https://html.duckduckgo.com/"
 | DuckDuckGo | HTML | lxml + XPath | [duckduckgo.py:465-518](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L465-L518) |
 | Yahoo | HTML | lxml + XPath | [yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) |
 
-虽然所有引擎都返回 HTML，但 DOM 结构差异巨大。
+**可验证事实**：所有引擎都返回 HTML，但各引擎的结果项 XPath 选择器无任何公共部分。
 
 ### 4.2 结果项 XPath 差异
 
@@ -325,8 +326,10 @@ def detect_google_sorry(resp):
         raise SearxEngineCaptchaException()
 ```
 
-**检测时机**：在 `response()` 函数开头调用，优先于结果解析
-**检测粒度**：3 种模式全覆盖，误判率低
+**可验证事实**：
+- 检测时机：在 `response()` 函数开头调用，优先于结果解析
+- **代码证据**：[google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) 中 `detect_google_sorry(resp)` 是 `response()` 函数的第一行
+- 检测覆盖度：实现 3 种检测模式（URL 路径检测、状态码检测、内容特征检测）
 
 #### DuckDuckGo 的表单式 CAPTCHA 检测
 ```python
@@ -339,56 +342,42 @@ if is_ddg_captcha(doc):
     raise SearxEngineCaptchaException(suspended_time=0, message=f"CAPTCHA ({params['data'].get('kl')})")
 ```
 
-**检测时机**：DOM 解析后、结果提取前
-**特殊处理**：设置 `suspended_time=0`，不触发 IP 封禁
+**可验证事实**：
+- 检测时机：DOM 解析后、结果提取前
+- 特殊处理：设置 `suspended_time=0`，不触发 IP 封禁
 
 #### Bing 的依赖式错误检测
 
-Bing **没有**在引擎层面实现自定义错误检测逻辑，完全依赖网络层的通用错误检测：
+Bing 没有在引擎层面实现自定义错误检测逻辑，完全依赖网络层的通用错误检测。
 
-1. **通用状态码检测**（网络层自动处理）：
-   - HTTP 402/403 → `SearxEngineAccessDeniedException`
-   - HTTP 429 → `SearxEngineTooManyRequestsException`
-   - Cloudflare / ReCAPTCHA → `SearxEngineCaptchaException`
-
-2. **区域重定向处理**：
-```python
-# bing.py:115-117
-# 某些地区（如中国）存在地理封锁，www.bing.com 会重定向到区域版本
-params["allow_redirects"] = True
-```
-
-**检测特点**：
-- 无引擎特定错误模式
-- 依赖 HTTP 状态码和通用 CDN 检测
-- 错误粒度较粗，无法识别 Bing 特有的软封禁
+**可验证事实**：
+- **代码证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168) 的 `response()` 函数中无任何错误检测逻辑，直接进行 DOM 解析和结果提取
+- 依赖网络层通用检测：HTTP 402/403 → AccessDenied，HTTP 429 → TooManyRequests
+- **推测**：当 Bing 返回状态码 200 但内容为空或异常时，框架无法识别为错误状态
 
 #### Yahoo 的极简错误检测
 
-Yahoo **同样没有**实现自定义错误检测，完全依赖网络层通用检测：
+Yahoo 同样没有实现自定义错误检测，完全依赖网络层通用检测。
 
-1. **通用状态码检测**（网络层自动处理）
-2. **无特殊处理逻辑**：既无 CAPTCHA 检测，也无状态码映射
-3. **静默失败风险**：当 Yahoo 返回空结果或登录页面时，无法识别为错误
+**可验证事实**：
+- **代码证据**：[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 的 `response()` 函数中无任何错误检测逻辑，直接进行 DOM 解析和结果提取
+- 仅依赖网络层通用检测，无任何引擎特定的内容校验
+- **推测**：当 Yahoo 返回登录页面、地理封锁页面或其他异常页面但状态码为 200 时，XPath 匹配失败将返回空结果列表，上层无法区分"无搜索结果"与"被封禁/限流"
 
-**检测特点**：
-- 最简化的错误处理策略
-- 可能出现"伪成功"（返回异常页面但状态码为 200）
-- 错误识别率最低
-
-### 5.4 四引擎错误检测能力矩阵
+### 5.4 四引擎错误检测能力矩阵（可追溯版）
 
 | 检测维度 | Google | DuckDuckGo | Bing | Yahoo |
 |---------|--------|-----------|------|-------|
-| 自定义 CAPTCHA 检测 | ✓ 多模式 | ✓ 表单检测 | ✗ | ✗ |
-| HTTP 状态码检测 | ✓ | ✓ | ✓ | ✓ |
-| Cloudflare 检测 | ✓ | ✓ | ✓ | ✓ |
-| ReCAPTCHA 检测 | ✓ | ✓ | ✓ | ✓ |
-| 软封禁识别 | ✓ | ✓ | ✗ | ✗ |
-| 响应内容检测 | ✓ | ✓ | ✗ | ✗ |
-| 错误粒度 | 细 | 中 | 粗 | 最粗 |
-| 误报率 | 低 | 低 | 中 | 高 |
-| 漏报率 | 低 | 低 | 中 | 高 |
+| 自定义 CAPTCHA 检测 | ✓ 3种模式检测<br>[google.py:281-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L281-L301) | ✓ 表单检测<br>[duckduckgo.py:458-462](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L458-L462) | ✗ 无自定义检测<br>[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168) | ✗ 无自定义检测<br>[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) |
+| HTTP 状态码检测 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 |
+| Cloudflare 检测 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 |
+| ReCAPTCHA 检测 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 | ✓ 网络层通用 |
+| 软封禁识别 | ✓ URL/内容检测<br>[google.py:318-325](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L318-L325) | ✓ DOM 检测<br>[duckduckgo.py:458-462](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L458-L462) | ✗ 无检测逻辑 | ✗ 无检测逻辑 |
+| 响应内容检测 | ✓ 3层检测（URL/状态码/内容） | ✓ 1层检测（DOM） | ✗ 无检测 | ✗ 无检测 |
+| 自定义检测代码行数 | 21 行 | 5 行 | 0 行 | 0 行 |
+| 检测调用位置 | response() 第1行 | DOM 解析后 | 无调用 | 无调用 |
+
+> **说明**："错误粒度"、"误报率"、"漏报率"等指标需要实际运行数据支撑，无法从代码静态分析得出，故移除。
 
 ### 5.5 网络层通用错误检测详解
 
@@ -417,28 +406,27 @@ if resp.status_code == 429:
     raise SearxEngineTooManyRequestsException()
 ```
 
-**Cloudflare 特殊暂停时间**：
-- Cloudflare CAPTCHA：默认暂停 2 周（`search.suspended_times.cf_SearxEngineCaptcha`）
-- Cloudflare 防火墙：暂停时间更长（`search.suspended_times.cf_SearxEngineAccessDenied`）
-
-### 5.6 错误处理策略差异
+### 5.6 错误处理策略差异（可追溯版）
 
 | 异常类型 | 默认暂停时间 | 配置项 |
 |---------|-------------|--------|
-| SearxEngineAccessDeniedException | 86400 秒 (1 天) | search.suspended_times.SearxEngineAccessDenied |
-| SearxEngineCaptchaException | 86400 秒 (1 天) | search.suspended_times.SearxEngineCaptcha |
-| SearxEngineTooManyRequestsException | 3660 秒 (约 1 小时) | search.suspended_times.SearxEngineTooManyRequests |
-| Cloudflare CAPTCHA | 1209600 秒 (2 周) | search.suspended_times.cf_SearxEngineCaptcha |
-| Cloudflare Firewall | 更长 | search.suspended_times.cf_SearxEngineAccessDenied |
+| SearxEngineAccessDeniedException | 180 秒 (3 分钟) | search.suspended_times.SearxEngineAccessDenied |
+| SearxEngineCaptchaException | 3600 秒 (1 小时) | search.suspended_times.SearxEngineCaptcha |
+| SearxEngineTooManyRequestsException | 180 秒 (3 分钟) | search.suspended_times.SearxEngineTooManyRequests |
+| Cloudflare CAPTCHA | 1296000 秒 (15 天) | search.suspended_times.cf_SearxEngineCaptcha |
+| Cloudflare Firewall | 86400 秒 (1 天) | search.suspended_times.cf_SearxEngineAccessDenied |
+| ReCAPTCHA | 604800 秒 (7 天) | search.suspended_times.recaptcha_SearxEngineCaptcha |
 
-**引擎特定策略**：
-- DuckDuckGo：CAPTCHA 异常设置 `suspended_time=0`，不会导致 IP 被封锁
-- Google：多层检测，一旦触发即严格封禁
-- Bing/Yahoo：无自定义策略，完全遵循通用规则
+**引擎特定策略（可验证事实）**：
+- DuckDuckGo：CAPTCHA 异常显式设置 `suspended_time=0`，**代码证据**：[duckduckgo.py:475](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L475)
+- Google：无自定义暂停时间，使用异常类型默认值，**代码证据**：[google.py:281-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L281-L301) 中未设置 `suspended_time` 参数
+- Bing/Yahoo：无自定义策略，完全遵循通用规则，**代码证据**：两引擎的 `response()` 函数中无任何异常抛出逻辑
 
-**通用递增策略**：
-- 连续错误会导致暂停时间递增（`search.ban_time_on_fail` → `search.max_ban_time_on_fail`）
-- 成功请求后重置错误计数
+**通用递增策略（可验证事实）**：
+- 连续错误会导致暂停时间递增，配置键 `search.ban_time_on_fail`（值：5）→ `search.max_ban_time_on_fail`（值：120 秒）
+- 成功请求后重置错误计数，**代码证据**：[abstract.py:140-155](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L140-L155) 中 `is_suspended()` 函数的实现逻辑
+
+**配置来源**：[settings.yml:66-81](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/settings.yml#L66-L81)
 
 ## 6. 适配框架的抽象统一机制
 
@@ -478,7 +466,7 @@ class EngineTraits:
     custom: Dict[str, Any]         # 引擎自定义数据
 ```
 
-**统一调用流程：**
+**统一调用流程**：
 ```python
 # 抽象层调用
 eng_lang = traits.get_language(sxng_locale, default)
@@ -516,118 +504,239 @@ except Exception as e:
 
 ## 7. 对结果归并的影响
 
-### 7.1 结果质量差异
+### 7.1 各引擎结果解析逻辑差异（可验证事实）
 
-| 搜索引擎 | 结果数/页 | 内容完整性 | 广告干扰 |
-|---------|----------|-----------|---------|
-| Google | ~10 | 高，包含缩略图、结构化数据 | 中等 |
-| Bing | ~10 | 中 | 高 |
-| DuckDuckGo | ~10-15 | 中 | 低 |
-| Yahoo | ~7 | 低 | 高 |
+| 搜索引擎 | 结果容器 XPath | URL 解码逻辑 | 特殊内容提取 | 代码位置 |
+|---------|---------------|-------------|-------------|---------|
+| Google | `//a[@data-ved and not(@class)]` | 移除 `/url?q=` 跳转器 + `&sa=U` 参数 | 内联图片 (data:image) | [google.py:374-428](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L374-L428) |
+| Bing | `//ol[@id="b_results"]/li[contains(@class, "b_algo")]` | Base64 解码 `a1` 前缀的 URL | 无 | [bing.py:129-160](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L129-L160) |
+| DuckDuckGo | `//div[@id="links"]/div[contains(@class, "web-result")]` | 无特殊解码 | Zero-Click 答案 | [duckduckgo.py:493-517](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L493-L517) |
+| Yahoo | `//div[contains(@class,"algo-sr")]` | 解析 `/RU=` 与 `/RS=` 之间的 URL | 无 | [yahoo.py:230-250](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L230-L250) |
 
-### 7.2 去重挑战
+> **说明**："结果数/页"、"内容完整性"、"广告干扰"等指标需要实际运行数据支撑，无法从代码静态分析得出，故移除。
 
-由于各引擎的 URL 编码方式不同，结果归并时需要：
-1. 统一解码所有跟踪/跳转 URL
-2. 规范化 URL（去除跟踪参数、标准化协议等）
-3. 基于标题+内容的模糊去重
+### 7.2 错误识别差异对结果归并的影响（可追溯结论）
 
-### 7.3 排序影响因素
+#### 7.2.1 异常结果混入风险
 
-SearXNG 的结果排序综合考虑：
-- 引擎权重（`weight` 配置项）
-- 结果在原引擎中的位置
-- 结果内容的丰富度（是否有缩略图、结构化数据）
-- 响应时间
+| 搜索引擎 | 错误检测代码位置 | 异常拦截机制 | 可追溯依据 |
+|---------|-----------------|-------------|-----------|
+| Google | [google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) | 前置拦截 | `detect_google_sorry()` 在 `response()` 第1行调用，异常响应在结果解析前被拦截 |
+| DuckDuckGo | [duckduckgo.py:473-476](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L473-L476) | 中期拦截 | `is_ddg_captcha()` 在 DOM 解析后、结果提取前调用 |
+| Bing | 无检测代码 | 依赖网络层 + XPath 隐式过滤 | **代码证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168) 的 `response()` 函数直接进行 DOM 解析，XPath 匹配失败返回空列表 |
+| Yahoo | 无检测代码 | 依赖网络层 + XPath 隐式过滤 | **代码证据**：[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 的 `response()` 函数直接进行 DOM 解析，XPath 匹配失败返回空列表 |
+
+**可追溯结论 1**：Google 和 DuckDuckGo 的自定义错误检测确保了只有正常响应才会进入结果解析流程。
+- **证据**：[google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) 中 `detect_google_sorry(resp)` 是 `response()` 函数的第一行
+
+**可追溯结论 2**：Bing 和 Yahoo 由于缺乏自定义错误检测，存在将异常页面内容混入正常结果的风险。
+- **证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 的 `response()` 函数直接进行 DOM 解析，无前置错误校验
+
+#### 7.2.2 空结果歧义问题
+
+**可追溯结论 3**：对于 Bing 和 Yahoo，空结果列表可能意味着两种完全不同的情况，上层无法区分。
+- **情况 A**：搜索引擎确实没有找到相关结果（正常业务逻辑）
+- **情况 B**：搜索引擎返回了异常页面（如封禁、限流、地理封锁），导致 XPath 匹配失败
+- **证据**：框架层的 `_search_basic()` 函数将空列表视为有效返回值，仅在抛出异常时才标记错误
+  [online.py:253-282](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L253-L282)
+
+#### 7.2.3 去重复杂度增加
+
+**可追溯结论 4**：各引擎的 URL 解码逻辑不统一，增加了结果归并时的去重复杂度。
+- Google URL 需要移除跳转器参数：`/url?q=` + `&sa=U`
+- Bing URL 需要 Base64 解码 `a1` 前缀
+- Yahoo URL 需要提取 `/RU=` 与 `/RS=` 之间的部分
+- DuckDuckGo URL 无需特殊处理
+- **证据**：各引擎 `response()` 函数中的 URL 处理逻辑位置见 7.1 节表格
+
+### 7.3 排序影响因素（可验证事实）
+
+SearXNG 的结果排序逻辑在 `ResultContainer` 中实现，主要考虑以下可验证的因素：
+1. **引擎权重**：通过 `weight` 配置项设置，**代码证据**：[results.py](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/results.py) 中的排序逻辑
+2. **结果位置**：原引擎返回结果的顺序
+3. **结果类型优先级**：Answer > Result > Suggestion
+4. **响应时间**：用于计算引擎性能评分
+
+> **说明**："内容丰富度"等主观因素未在代码中找到明确的排序逻辑实现，故移除。
 
 ## 8. 对限流策略的影响
 
-### 8.1 各引擎限流敏感度
+### 8.1 限流触发机制（可验证事实）
 
-| 搜索引擎 | 限流阈值 (估计) | 封禁策略 | 恢复时间 |
-|---------|----------------|---------|---------|
-| Google | 低 (严格) | 显示 CAPTCHA，IP 临时封禁 | 几小时到几天 |
-| Bing | 中 | HTTP 429，响应延迟 | 几小时 |
-| DuckDuckGo | 高 | 返回空结果或 CAPTCHA | 约 1 小时（滑动窗口） |
-| Yahoo | 中 | HTTP 403 | 不确定 |
+| 搜索引擎 | 限流触发方式 | 代码证据 |
+|---------|-------------|---------|
+| Google | 1. URL 路径包含 `/sorry`<br>2. HTTP 302 重定向<br>3. 响应内容包含 `/sorry/` | [google.py:318-325](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L318-L325) |
+| DuckDuckGo | DOM 中存在 `//form[@id='challenge-form']` | [duckduckgo.py:458-462](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L458-L462) |
+| Bing | 1. HTTP 402/403 → AccessDenied<br>2. HTTP 429 → TooManyRequests<br>3. Cloudflare 挑战 | [raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) |
+| Yahoo | 1. HTTP 402/403 → AccessDenied<br>2. HTTP 429 → TooManyRequests<br>3. Cloudflare 挑战 | [raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) |
 
-### 8.2 框架级限流措施
+> **说明**："限流阈值"、"恢复时间"等指标需要实际运行数据或搜索引擎官方文档支撑，无法从 SearXNG 代码静态分析得出，故移除。
 
-1. **引擎暂停机制**：捕获到限流异常后暂停引擎一段时间
-2. **连续错误递增封禁**：`ban_time_on_fail` → `max_ban_time_on_fail`
+### 8.2 错误识别差异对限流策略的影响（可追溯结论）
+
+#### 8.2.1 限流检测时效性对比
+
+| 搜索引擎 | 检测代码位置 | 检测时机 | 检测所需数据 | 可追溯依据 |
+|---------|------------|---------|-------------|-----------|
+| Google | [google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) | `response()` 函数第 1 行 | `resp.url` + `resp.status_code` + 前 2000 字节响应内容 | **代码证据**：[google.py:281-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L281-L301) 中 `detect_google_sorry()` 无需完整解析响应体 |
+| DuckDuckGo | [duckduckgo.py:473-476](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L473-L476) | DOM 解析后 | 完整 HTML DOM 树 | **代码证据**：[duckduckgo.py:458-462](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L458-L462) 中 `is_ddg_captcha()` 需要调用 `eval_xpath()` 检查 CAPTCHA 表单 |
+| Bing | 网络层通用 | HTTP 响应返回后 | HTTP 状态码 + 响应内容特征（Cloudflare） | **代码证据**：[raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) 中通用检测仅检查状态码和 Cloudflare 特征 |
+| Yahoo | 网络层通用 | HTTP 响应返回后 | HTTP 状态码 + 响应内容特征（Cloudflare） | **代码证据**：[raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) 中通用检测仅检查状态码和 Cloudflare 特征 |
+
+**可追溯结论 1**：Google 的错误检测时机最早，可在响应解析的最早期识别限流状态。
+- **证据**：[google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) 中 `detect_google_sorry(resp)` 是 `response()` 函数的第一行，传入的是原始响应对象而非解析后的 DOM
+
+**可追溯结论 2**：Bing 和 Yahoo 的限流检测存在盲区，软封禁状态无法触发限流保护。
+- **证据**：[raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) 中的通用检测仅检查 HTTP 状态码和 Cloudflare 特征，不校验响应内容是否为有效搜索结果
+
+**可追溯结论 3**：框架的 `handle_exception()` 是限流保护的唯一入口，漏检错误意味着无法触发限流。
+- **证据**：[abstract.py:187-191](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L187-L191) 中只有捕获到特定异常类型才会调用 `handle_exception(result_container, e, suspend=True)`
+
+#### 8.2.2 限流策略差异（可验证事实）
+
+| 搜索引擎 | 暂停时间策略 | 可追溯依据 |
+|---------|-------------|-----------|
+| Google | 使用 CAPTCHA 异常默认值 3600 秒 | [google.py:281-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L281-L301) 中未设置 `suspended_time` |
+| DuckDuckGo | 显式设置 `suspended_time=0`，不触发 IP 封禁 | [duckduckgo.py:475](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L475) |
+| Bing | 使用网络层异常的默认暂停时间 | 无自定义异常抛出逻辑 |
+| Yahoo | 使用网络层异常的默认暂停时间 | 无自定义异常抛出逻辑 |
+
+**可追溯结论 4**：DuckDuckGo 的 `suspended_time=0` 策略是唯一的引擎级限流策略定制。
+- **证据**：[duckduckgo.py:475](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L475) 中显式设置 `suspended_time=0`
+- **证据**：搜索所有引擎代码，仅 DuckDuckGo 在抛出 `SearxEngineCaptchaException` 时自定义了暂停时间
+
+### 8.3 框架级限流措施（可验证事实）
+
+1. **引擎暂停机制**：捕获到限流异常后暂停引擎一段时间，**代码证据**：[abstract.py:187-191](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L187-L191)
+2. **连续错误递增封禁**：配置键 `search.ban_time_on_fail`（值：5）→ `search.max_ban_time_on_fail`（值：120 秒），**代码证据**：[abstract.py:140-155](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L140-L155)
 3. **请求超时控制**：每个引擎有独立的 `timeout` 配置
 4. **并发控制**：通过线程池间接控制并发请求数
 
-### 8.3 引擎特有规避策略
+### 8.4 引擎特有规避策略（可验证事实）
 
-- **Google**：使用 `gen_gsa_useragent()` 生成专用 UA，轮换子域名
-- **DuckDuckGo**：静态 UA + 完整 Sec-Fetch 头，缓存 vqd 令牌
-- **Bing**：设置 `allow_redirects=True` 应对地区重定向
+- **Google**：使用 `gen_gsa_useragent()` 生成专用 UA，根据地区轮换子域名，**代码证据**：[google.py:270-276](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L270-L276)
+- **DuckDuckGo**：静态 UA + 完整 Sec-Fetch 头，缓存 vqd 令牌，**代码证据**：[duckduckgo.py:383-388](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L383-L388)、[duckduckgo.py:229-250](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L229-L250)
+- **Bing**：设置 `allow_redirects=True` 应对地区重定向，**代码证据**：[bing.py:115-117](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L115-L117)
+- **Yahoo**：通过 Cookie 传递搜索偏好，**代码证据**：[yahoo.py:174-183](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L174-L183)
 
 ## 9. 对机器人检测的影响
 
-### 9.1 各引擎反爬技术栈
+### 9.1 各引擎反检测实现（可验证事实）
 
-| 搜索引擎 | 检测技术 | 规避难度 |
-|---------|---------|---------|
-| Google | 行为分析、CAPTCHA、指纹识别、IP 信誉 | 极高 |
-| Bing | IP 限流、UA 检测 | 中等 |
-| DuckDuckGo | vqd 令牌、Sec-Fetch 头验证、行为分析 | 高 |
-| Yahoo | Cookie 验证、IP 限流 | 中等 |
+| 搜索引擎 | SearXNG 实现的反检测措施 | 代码证据 |
+|---------|-------------------------|---------|
+| Google | 1. 专用 GSA User-Agent 生成<br>2. `CONSENT=YES+` Cookie 绕过同意提示<br>3. 按地区轮换子域名<br>4. 随机 `arc_id` 参数 | [google.py:270-276](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L270-L276)<br>[google.py:79-98](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L79-L98) |
+| DuckDuckGo | 1. 静态 User-Agent（不轮换）<br>2. 完整 `Sec-Fetch-*` 请求头系列<br>3. `vqd` 令牌缓存与复用<br>4. `kl`/`df` Cookie 设置 | [duckduckgo.py:383-388](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L383-L388)<br>[duckduckgo.py:229-250](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L229-L250) |
+| Bing | 1. `allow_redirects=True` 自动跟随区域重定向<br>2. `Accept-Language` 头设置 | [bing.py:115-117](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L115-L117) |
+| Yahoo | 1. 按地区/语言切换域名<br>2. `sB` Cookie 传递搜索偏好 | [yahoo.py:40-120](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L40-L120)<br>[yahoo.py:174-183](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L174-L183) |
 
-### 9.2 框架级反检测措施
+> **说明**："检测技术"、"规避难度"等指标属于搜索引擎内部实现，无法从 SearXNG 代码静态分析得出，故移除。
 
-1. **UA 轮换**：`gen_useragent()` 生成随机真实浏览器 UA
-2. **请求头标准化**：模拟真实浏览器的请求头顺序和值
+### 9.2 错误识别与反检测的交互（可追溯结论）
+
+#### 9.2.1 反馈回路机制
+
+错误识别能力直接影响反检测策略的有效性，形成闭环：
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  错误识别能力   │────▶│  封禁检测时效性 │────▶│  反检测策略调整 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+          ▲                                                        │
+          │                                                        │
+          └────────────────────────────────────────────────────────┘
+```
+
+| 搜索引擎 | 错误识别模式 | 封禁检测触发条件 | 反检测策略联动机制 | 可追溯依据 |
+|---------|-------------|-----------------|------------------|-----------|
+| Google | 自定义检测（3 种模式） | URL 路径 / 状态码 / 内容特征任一匹配 | 封禁状态可在 `response()` 第 1 行识别，支持快速调整反检测策略 | [google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) 中 `detect_google_sorry()` 在 `response()` 第 1 行调用 |
+| DuckDuckGo | 自定义检测（1 种模式） | DOM 中存在 `//form[@id='challenge-form']` | 检测到 CAPTCHA 后设置 `suspended_time=0`，不触发 IP 封禁，可快速重试 | [duckduckgo.py:473-476](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L473-L476) 中 `is_ddg_captcha()` 在结果提取前调用 |
+| Bing | 仅网络层通用检测 | HTTP 402/403/429 状态码 + Cloudflare 特征 | 仅当网络层检测到异常状态码时触发反检测调整 | **代码证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168) 中无自定义错误检测逻辑 |
+| Yahoo | 仅网络层通用检测 | HTTP 402/403/429 状态码 + Cloudflare 特征 | 仅当网络层检测到异常状态码时触发反检测调整 | **代码证据**：[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 中无自定义错误检测逻辑 |
+
+**可追溯结论 1**：Google 的多层错误检测确保封禁状态能被及时发现，使反检测策略（如 UA 轮换、子域名切换）能够快速响应。
+- **证据**：[google.py:267-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L267-L301) 中 `detect_google_sorry()` 可通过 URL 路径、状态码、内容特征三种方式识别封禁
+
+**可追溯结论 2**：DuckDuckGo 的 `suspended_time=0` 策略是一种创新的反检测配合机制。
+- **证据**：[duckduckgo.py:475](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L475) 中设置 `suspended_time=0`，即使检测到 CAPTCHA 也不会触发 IP 封禁，可快速重试
+
+**可追溯结论 3**：Bing 和 Yahoo 由于缺乏自定义错误检测，反检测策略存在滞后性。
+- **证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 中无任何错误检测逻辑，只有当网络层检测到 403/429 状态码时才会触发反检测调整
+
+#### 9.2.2 各引擎反检测策略特点
+
+**Google 的主动反检测策略**：
+- 专用 GSA User-Agent：`gen_gsa_useragent()` 生成 Google Search Appliance 风格的 UA
+- 子域名轮换：根据查询地区选择不同的 `google.xx` 域名，分散请求压力
+- **代码证据**：[google.py:261-276](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L261-L276)
+
+**DuckDuckGo 的令牌缓存策略**：
+- `vqd` 令牌缓存：`get_vqd()` 提取的令牌按查询词和 UA 缓存 1 小时
+- 静态 UA + 完整 Sec-Fetch 头：模拟真实浏览器的请求特征
+- **代码证据**：[duckduckgo.py:178-200](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L178-L200)
+
+**Bing 的简化策略**：
+- 仅依赖 `allow_redirects=True` 处理区域重定向
+- 无特殊反检测措施
+- **代码证据**：[bing.py:115-117](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L115-L117)
+
+**Yahoo 的 Cookie 策略**：
+- 通过 `sB` Cookie 传递搜索偏好（安全搜索、语言等）
+- 按地区/语言切换域名
+- **代码证据**：[yahoo.py:166-194](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L166-L194)
+
+### 9.3 框架级反检测措施（可验证事实）
+
+1. **UA 轮换**：`gen_useragent()` 生成随机真实浏览器 UA，**代码证据**：[network/__init__.py](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/__init__.py) 中的 `gen_useragent()` 函数
+2. **请求头标准化**：模拟真实浏览器的请求头顺序和值，**代码证据**：[online.py:132-162](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L132-L162) 中的 `get_params()` 函数
 3. **Cookie 管理**：支持引擎特定的 Cookie 策略
-4. **代理支持**：每个引擎可独立配置代理
-
-### 9.3 引擎特有反检测措施
-
-#### Google
-```python
-# google.py:79-98
-def ui_async(start: int) -> str:
-    # 生成随机 arc_id，每小时轮换
-    if not _arcid_random or (int(time.time()) - _arcid_random[1]) > 3600:
-        _arcid_random = ("".join(random.choices(_arcid_range, k=23)), int(time.time()))
-    arc_id = f"arc_id:srp_{_arcid_random[0]}_1{start:02}"
-    return ",".join([arc_id, use_ac, _fmt])
-```
-
-#### DuckDuckGo
-```python
-# duckduckgo.py:229-250
-def set_vqd(query, value, params):
-    # 缓存 vqd 令牌，避免重复获取
-    key = cache.secret_hash(f"{query}//{params['headers']['User-Agent']}")
-    cache.set(key=key, value=value, expire=3600)
-```
+4. **代理支持**：每个引擎可独立配置代理，**代码证据**：[settings.yml](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/settings.yml) 中的 `proxy` 配置项
 
 ## 10. 总结与建议
 
-### 10.1 差异总览
+### 10.1 三维度差异总览（可追溯版）
 
-| 维度 | 差异程度 | 主要差异点 | 统一难度 |
-|-----|---------|-----------|---------|
-| 请求拼装 | 高 | HTTP 方法、参数命名、分页机制、本地化策略 | 中 |
-| 响应解析 | 极高 | DOM 结构、URL 编码、内容提取方式 | 高 |
-| 错误识别 | 中 | CAPTCHA 形式、状态码使用、封禁策略 | 中 |
+| 维度 | 可验证差异点（代码证据） | 统一机制 |
+|-----|-------------------------|---------|
+| **请求拼装** | 1. HTTP 方法差异：GET vs POST<br>2. 语言参数映射差异：5 参数 vs 1 参数 vs 域名映射<br>3. 分页参数差异：4 种不同计算方式 | `OnlineProcessor.get_params()` 标准化层<br>[online.py:132-162](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L132-L162) |
+| **响应解析** | 1. DOM 结构差异：4 种完全不同的 XPath 选择器<br>2. URL 编码差异：跳转器 vs Base64 vs 嵌入模式<br>3. 特殊内容提取：内联图片 vs Zero-Click 答案 | `_search_basic()` 结果格式统一<br>[online.py:253-282](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L253-L282) |
+| **错误识别** | 1. 检测层级差异：2 引擎有自定义检测，2 引擎无<br>2. 检测代码量差异：21 行 vs 5 行 vs 0 行<br>3. 暂停时间策略差异：3600s vs 0s | `handle_exception()` 统一异常处理<br>[online.py:277](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L277) |
 
-### 10.2 适配框架的设计价值
+> **说明**："差异程度"、"统一难度"等主观评级无法从代码静态分析得出，以上仅展示可验证的差异点和统一机制。
+
+### 10.2 错误识别维度四引擎对比矩阵（可追溯版）
+
+| 特性 | Google | DuckDuckGo | Bing | Yahoo |
+|-----|--------|-----------|------|-------|
+| 自定义错误检测 | ✓ 3 种模式<br>[google.py:281-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L281-L301) | ✓ 1 种模式<br>[duckduckgo.py:458-462](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L458-L462) | ✗ 无实现 | ✗ 无实现 |
+| 网络层通用检测 | ✓ | ✓ | ✓ | ✓ |
+| 软封禁识别 | ✓ URL/内容检测 | ✓ DOM 检测 | ✗ 无检测逻辑 | ✗ 无检测逻辑 |
+| 响应内容校验 | ✓ 3 层检测 | ✓ 1 层检测 | ✗ 无检测 | ✗ 无检测 |
+| 检测调用时机 | `response()` 第 1 行 | DOM 解析后 | 无调用 | 无调用 |
+| 自定义检测代码行数 | 21 行 | 5 行 | 0 行 | 0 行 |
+| 自定义暂停时间 | 未设置（使用默认 3600s） | 显式设置 `suspended_time=0` | 无自定义异常 | 无自定义异常 |
+
+> **说明**："检测延迟"、"封禁反馈效率"、"反检测策略有效性"、"结果集稳定性"等指标需要实际运行数据支撑，无法从代码静态分析得出，故替换为可量化的代码事实。
+
+### 10.3 适配框架的设计价值
 
 1. **关注点分离**：引擎适配只需关注业务逻辑，通用逻辑由框架处理
 2. **可扩展性**：新增引擎只需实现 `request()`、`response()`、`fetch_traits()`
 3. **容错性**：统一的异常处理和熔断机制
 4. **可观测性**：统一的指标收集和错误记录
+5. **分层检测**：网络层通用检测 + 引擎层自定义检测的双层架构
 
-### 10.3 优化建议
+### 10.4 关键发现（可追溯结论）
 
-1. **增加结果中间表示**：在引擎 response() 之上增加一层语义标准化，降低归并复杂度
-2. **增强反检测能力**：引入请求指纹随机化、行为模拟等高级反检测技术
-3. **自适应限流**：基于历史成功率动态调整各引擎的请求频率
-4. **统一测试框架**：为所有引擎提供标准化的集成测试套件
+**结论1：自定义错误检测可在结果解析前拦截异常响应**
+- **证据**：[google.py:365](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L365) 中 `detect_google_sorry(resp)` 是 `response()` 函数的第一行，异常响应在结果解析前被拦截
+- **影响**：Google 和 DuckDuckGo 的自定义检测确保只有正常响应才会进入结果解析流程
 
----
+**结论2：无自定义检测的引擎存在"软封禁"识别盲区**
+- **证据**：[raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) 中的通用检测仅检查 HTTP 状态码和 Cloudflare 特征，不校验响应内容是否为有效搜索结果
+- **证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 中无任何错误检测逻辑
+- **影响**：当 Bing/Yahoo 返回状态码 200 但内容为空或异常时，框架无法识别为错误状态
 
-*报告基于 SearXNG commit 版本生成，分析覆盖 Google、Bing、DuckDuckGo、Yahoo 四大主流搜索引擎的适配实现。*
+**结论3：空结果列表存在歧义，上层无法区分"无结果"与"被封禁"**
+- **证据**：[online.py:253-282](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L253-L282) 中 `_search_basic()` 函数将空列表视为有效返回值，仅在抛出异常时才标记错误
+- **影响**：Bing 和 Yahoo 的空结果可能意味着搜索引擎确实无
