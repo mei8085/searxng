@@ -779,6 +779,29 @@ SearXNG 的结果排序逻辑在 `ResultContainer` 中实现，主要考虑以�
 - **证据**：搜索所有引擎代码，仅 DuckDuckGo 在抛出 `SearxEngineCaptchaException` 时自定义了暂停时间
 - **影响**：DuckDuckGo 检测到 CAPTCHA 时不会触发 IP 封禁，可快速重试
 
+##### 唯一性可复核证明
+
+| 检索项 | 说明 | 结果 |
+|-------|------|------|
+| **检索方法** | 使用 `ripgrep` 工具在 `searx/engines/` 目录下搜索 `suspended_time` 关键字 | 可复现 |
+| **检索范围** | `d:\fz\0508-2\solo-dogfeeding\code\26-searxng\searx\engines\` 下所有 `.py` 文件 | 共 80+ 个引擎文件 |
+| **命中结果** | 共 3 处 `suspended_time` 赋值 | 见下表 |
+
+**四大引擎 `suspended_time` 自定义情况对比**
+
+| 搜索引擎 | 文件 | 自定义 `suspended_time` | 代码行 | 异常抛出语句 |
+|---------|------|-----------------------|--------|-------------|
+| Google | google.py | ❌ 无 | - | `raise SearxEngineCaptchaException()` 无参数 |
+| Bing | bing.py | ❌ 无（无任何异常抛出） | - | 无异常抛出代码 |
+| DuckDuckGo | duckduckgo.py | ✅ 有（`suspended_time=0`） | [418](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L418)、[476](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L476) | `raise SearxEngineCaptchaException(suspended_time=0, ...)` |
+| Yahoo | yahoo.py | ❌ 无（无任何异常抛出） | - | 无异常抛出代码 |
+
+**反例为空证据**：
+- 在四大引擎中，除 DuckDuckGo 的 2 处外，其余引擎均未找到 `suspended_time` 参数的使用
+- Google 虽抛出 `SearxEngineCaptchaException`，但未传入 `suspended_time` 参数，**代码证据**：[google.py:295-301](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/google.py#L295-L301)
+- Bing、Yahoo 的 `response()` 函数中无任何自定义异常抛出逻辑，**代码证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256)
+- 跨引擎检索确认：全引擎目录中仅 `duckduckgo.py` 和 `quark.py`（非本报告覆盖引擎）自定义了 `suspended_time`
+
 **结论5：框架的 `handle_exception()` 是限流保护的唯一入口**
 - **证据**：[abstract.py:187-191](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L187-L191) 中只有捕获到特定异常类型才会调用 `handle_exception(result_container, e, suspend=True)`
 - **影响**：漏检错误意味着无法触发限流保护，可能导致 IP 信誉持续恶化
@@ -816,5 +839,5 @@ SearXNG 的结果排序逻辑在 `ResultContainer` 中实现，主要考虑以�
 **报告生成说明**：
 - 本报告所有结论均基于 SearXNG 代码库静态分析
 - 代码引用路径：`d:\fz\0508-2\solo-dogfeeding\code\26-searxng\`
-- 分析时间：2025-07-01
-- 报告版本：v2.0（可追溯版）
+- 分析时间：2026-05-18
+- 报告版本：v2.1（关键发现3补全版）
