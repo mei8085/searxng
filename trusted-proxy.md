@@ -441,36 +441,88 @@ def get_network(real_ip: IPv4Address | IPv6Address, cfg: "config.Config") -> IPv
 
 ---
 
-## 7. 安全考虑
+## 7. 安全边界与风险分析
 
-### 7.1 头部伪造风险
+### 7.1 客户端 IP 伪造风险的前提链（可复核）
 
-如果 `trusted_proxies` 配置不正确，攻击者可以通过伪造 `X-Forwarded-For` 头部绕过限流：
+**"攻击者可伪造客户端 IP"这一结论仅在以下条件**全部同时成立**时才成立：**
 
+| 序号 | 前提条件 | 代码/配置位置 | 验证方式 |
+|------|----------|--------------|----------|
+| 1 | `trusted_proxies` 配置**非空** | `searx/limiter.toml` 中 `[botdetection] trusted_proxies` 列表 | 检查配置文件，空列表则此前提不成立 |
+| 2 | `trusted_proxies` 配置**包含攻击者的 IP 段** | `trusted_proxies.py:91` 读取配置，`trusted_proxies.py:61-67` 进行网段匹配 | 审计 trusted_proxies 列表，确保只包含真正的反向代理 |
+| 3 | 攻击者能够**绕过反向代理直接连接应用端口** | 网络层面配置，代码层无检测逻辑 | 检查防火墙/安全组规则，确认应用端口是否只对反向代理开放 |
+| 4 | 攻击者能够在请求中**设置 `X-Forwarded-For` 头部** | `trusted_proxies.py:125-137` 解析该头部 | 验证反向代理是否配置为**覆盖**（而非追加）X-Forwarded-For |
+
+**攻击成立的完整链路**：
 ```
-攻击者请求 → 直接连接应用（不经过代理）
-X-Forwarded-For: 1.2.3.4, 5.6.7.8
-REMOTE_ADDR: 攻击者真实IP
+攻击者 IP: 192.168.1.100（假设在 trusted_proxies 中）
+   ↓
+直接连接应用端口（绕过反向代理）
+   ↓
+伪造请求头: X-Forwarded-For: 1.2.3.4, 5.6.7.8
+   ↓
+ProxyFix 处理:
+  1. 从右向左遍历: 5.6.7.8 → 检查是否在 trusted_proxies
+     → 假设不在 → 返回 5.6.7.8 作为客户端 IP
+  2. 攻击者成功伪造客户端 IP 为 5.6.7.8
 ```
 
-**防护措施**（已在代码中实现）：
-- 必须正确配置 `trusted_proxies`，只包含真正的反向代理
-- 没有 `trusted_proxies` 时，`X-Forwarded-For` 会被忽略（`trusted_proxies.py:144-148`）
-- 反向代理应配置为**覆盖**而非追加 `X-Forwarded-For`
+---
 
-### 7.2 降级策略的安全性
+### 7.2 风险不成立的反例边界
 
-当无法确定真实 IP 时，使用黑洞地址 `100::`：
+以下场景中，**即使攻击者能够发送请求，也无法伪造客户端 IP**：
+
+#### 反例 1：trusted_proxies 为空或未配置
+- **代码证据**：`trusted_proxies.py:144-148`
+  ```python
+  if x_forwarded_for and not trusted_proxies:
+      log_error_only_once("missing botdetection.trusted_proxies config")
+      x_forwarded_for = []  # 丢弃整个头部
+  ```
+- **结果**：X-Forwarded-For 被完全忽略，回退到 X-Real-IP 或 REMOTE_ADDR（攻击者真实 IP）
+
+#### 反例 2：攻击者 IP 不在 trusted_proxies 中
+- **代码证据**：`trusted_proxies.py:66-86` 信任剥离算法
+- **场景**：
+  ```
+  攻击者 IP: 192.168.1.100（不在 trusted_proxies）
+  X-Forwarded-For: 1.2.3.4, 192.168.1.100
+  ```
+- **处理过程**：
+  1. 从右向左遍历：192.168.1.100 → 不在 trusted_proxies
+  2. 返回 192.168.1.100 作为客户端 IP
+- **结果**：攻击者无法伪造，客户端 IP 就是攻击者真实 IP
+
+#### 反例 3：请求经过反向代理且代理配置为覆盖 X-Forwarded-For
+- **场景**：Nginx 配置 `proxy_set_header X-Forwarded-For $remote_addr;`（覆盖而非追加）
+- **结果**：攻击者发送的伪造头部被反向代理覆盖，应用只能看到代理设置的真实客户端 IP
+
+#### 反例 4：网络层面阻止直接连接
+- **场景**：防火墙/安全组只允许反向代理 IP 访问应用端口
+- **结果**：攻击者根本无法建立 TCP 连接，攻击无从谈起
+
+#### 反例 5：使用 X-Real-IP 而非 X-Forwarded-For
+- **代码证据**：`trusted_proxies.py:159-160`
+  ```python
+  elif x_real_ip:
+      environ["REMOTE_ADDR"] = x_real_ip
+  ```
+- **说明**：X-Real-IP 直接使用头部值，不经过 trusted_proxies 剥离逻辑
+- **注意**：这并不意味着更安全，只是攻击面不同——攻击者需要伪造 X-Real-IP 头部
+
+---
+
+### 7.3 降级策略的安全性
+
+当无法确定真实 IP 时，使用黑洞地址 `100::`（`trusted_proxies.py:166-167`）：
 - 该地址在 RFC 6666 中被定义为 discard 前缀，不会路由到任何真实主机
 - 所有无法识别的客户端会被归到同一地址，可能影响限流准确性
 - 但避免了使用无效值导致的程序崩溃
+- **边界**：这是最终降级手段，仅在所有头部都无效或缺失时触发
 
-### 7.3 信任链的完整性
-
-**重要安全边界**：
-- ProxyFix 不验证 TCP 连接的 `REMOTE_ADDR` 是否在受信任列表中
-- 这意味着如果请求绕过代理直接到达应用，且携带伪造的 `X-Forwarded-For`，同时 `trusted_proxies` 包含了攻击者的 IP，那么攻击者可以伪造客户端 IP
-- 缓解措施：确保网络层面只允许受信任的反向代理访问应用端口
+---
 
 ### 7.4 协议安全性
 
@@ -484,9 +536,33 @@ if not request.is_secure:
 ```
 
 **说明**：
-- `request.is_secure` 依赖于 `wsgi.url_scheme` 的正确设置
+- `request.is_secure` 依赖于 `wsgi.url_scheme` 的正确设置（由 `ReverseProxyPathFix` 中间件写入）
 - 非 HTTPS 环境下，Sec-Fetch 头部验证会被跳过
 - 这是合理的安全降级，因为 HTTP 环境下这些头部本身就不可靠
+- **边界**：仅影响 Sec-Fetch 头部验证，不影响 IP 还原逻辑
+
+---
+
+### 7.5 安全配置最佳实践
+
+基于上述边界分析，推荐的安全配置：
+
+1. **正确配置 trusted_proxies**：
+   - 只包含真正的反向代理 IP 段
+   - 定期审计，避免遗留无效条目
+   - 配置入口：`searx/limiter.toml`
+
+2. **网络层隔离**：
+   - 防火墙只允许反向代理访问应用端口
+   - 应用不直接暴露给公网
+
+3. **反向代理配置**：
+   - 使用 `proxy_set_header X-Forwarded-For $remote_addr;` 覆盖而非追加
+   - 确保代理不会转发客户端伪造的 X-Forwarded-For
+
+4. **监控告警**：
+   - 关注 `missing botdetection.trusted_proxies config` 错误日志
+   - 异常 IP 模式变化时及时排查
 
 ---
 
