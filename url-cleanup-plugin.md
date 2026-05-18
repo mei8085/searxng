@@ -204,24 +204,49 @@ for plugin in searx.plugins.STORAGE:  # 遍历 set，顺序不确定
 
 ### 4.3 互相覆盖的风险场景
 
-当多个插件修改同一个 URL 字段时，**后执行的插件会覆盖先执行插件的修改**。
+当多个插件修改同一个 URL 字段时，**后执行的插件会基于前一个插件修改后的 URL 继续处理**。
 
-**风险场景示例**：
+**✅ 澄清：hostnames 改域名不会导致 oa_doi_rewrite 失效**
 
-1. **tracker_url_remover 与 hostnames 冲突**：
+经过代码核实，oa_doi_rewrite 的 `extract_doi` 函数仅从 `url.path` 和查询参数中提取 DOI，**不依赖 `netloc`（域名）**：
+
+```python
+# oa_doi_rewrite.py:73-81
+def extract_doi(url):
+    m = regex.search(url.path)          # 仅从 path 提取
+    if m:
+        return m.group(0)
+    for _, v in parse_qsl(url.query):  # 仅从查询参数提取
+        m = regex.search(v)
+        if m:
+            return m.group(0)
+    return None
+```
+
+因此，即使 hostnames 把 `doi.org` 重写为其他域名，只要 URL 路径中包含 DOI（如 `10.1234/abc`），oa_doi_rewrite 仍能正常工作。
+
+---
+
+**真实风险场景**：
+
+1. **tracker_url_remover 与 hostnames 冲突（参数残留）**：
    - hostnames 先执行：`youtube.com` → `invidious.example.com`
-   - tracker_url_remover 后执行：可能无法匹配 invidious 的规则（因为 ClearURLs 规则是针对 youtube.com 的）
-   - 结果：追踪参数残留
+   - tracker_url_remover 后执行：ClearURLs 规则是针对 `youtube.com` 域名匹配的，域名改变后可能无法匹配
+   - 结果：`utm_` 等追踪参数残留
 
-2. **hostnames 与 oa_doi_rewrite 冲突**：
-   - hostnames 先执行：`doi.org` → 自定义镜像域名
-   - oa_doi_rewrite 后执行：无法识别 DOI 路径（因为 DOI 正则匹配基于原始 doi.org 路径）
-   - 结果：DOI 重定向失败
+2. **hostnames REMOVE 与其他插件的交互（无效计算）**：
+   - 其他插件先执行：花费时间清理 URL、提取 DOI
+   - hostnames 后执行：发现主机名匹配 REMOVE，直接移除整个结果
+   - 结果：之前的清理工作全部浪费（性能影响）
 
-3. **多个插件修改同一个 URL**：
-   - 插件 A 修改 `url` 为 A'
-   - 插件 B 修改 `url` 为 B'（基于原始值）
-   - 最终结果取决于执行顺序，可能不符合预期
+3. **多个插件修改同一个 URL（顺序依赖）**：
+   - 插件 A 修改 `url` 为 A'（基于原始值）
+   - 插件 B 修改 `url` 为 B'（基于 A' 继续修改）
+   - 如果顺序调换，结果可能不同
+
+4. **优先级设置与结果排序的交互**：
+   - hostnames 的 HIGH/LOW 优先级是在 `on_result` 末尾设置的
+   - 如果组合插件调整了优先级设置的位置，可能影响结果排序
 
 ### 4.4 推荐的执行顺序原则
 
@@ -670,20 +695,110 @@ post_search 钩子（所有插件，按 set 顺序）
 | user_plugins 构建 | `searx/webapp.py:512-518` |
 | 搜索结果钩子 | `searx/search/__init__.py:198-199` |
 
-## 七、附录：可落地的组合插件完整实现
+## 七、附录：最小改造点清单与实施指南
 
-以下是一个可直接使用的 URL 清理管道插件示例：
+### 7.1 最小改造点清单
+
+| 序号 | 改造点 | 操作 | 影响范围 |
+|------|--------|------|----------|
+| 1 | 新增组合插件文件 | 创建 `searx/plugins/url_cleanup_pipeline.py` | 新增文件，无侵入 |
+| 2 | 修改 settings.yml | 禁用原独立插件，启用组合插件 | 配置文件 |
+| 3 | （可选）修改 hostnames.py | 添加空操作子类 `SXNGPluginNoop` | 可选，不修改也可运行 |
+
+### 7.2 完整实施步骤
+
+**步骤 1：创建组合插件文件**
+
+将 4.7 节中的完整代码保存为 `searx/plugins/url_cleanup_pipeline.py`。
+
+**步骤 2：修改 settings.yml**
+
+```yaml
+plugins:
+  # 禁用原独立插件
+  searx.plugins.tracker_url_remover.SXNGPlugin:
+    active: false
+  searx.plugins.hostnames.SXNGPlugin:
+    active: false  # 组合插件已集成其全部逻辑
+  searx.plugins.oa_doi_rewrite.SXNGPlugin:
+    active: false
+  
+  # 启用统一管道插件
+  searx.plugins.url_cleanup_pipeline.SXNGPlugin:
+    active: true
+
+# hostnames 配置保留（组合插件会读取）
+hostnames:
+  replace:
+    '(.*\.)?youtube\.com$': 'invidious.example.com'
+  remove:
+    - '(.*\.)?facebook\.com$'
+  high_priority:
+    - '(.*\.)?wikipedia\.org$'
+  low_priority:
+    - '(.*\.)?google(\..*)?$'
+```
+
+**步骤 3（可选）：修改 hostnames.py（如需保留其配置初始化）**
+
+在 `hostnames.py` 末尾添加空操作子类：
+
+```python
+class SXNGPluginNoop(SXNGPlugin):
+    """Hostnames 插件的无操作版本，仅用于配置初始化"""
+    
+    def on_result(self, request, search, result):
+        # 不执行任何操作，逻辑由组合插件统一调度
+        return True
+```
+
+**步骤 4：重启服务**
+
+重启 SearXNG 服务，验证日志中是否有 `url_cleanup_pipeline` 相关的加载日志。
+
+### 7.3 验证清单
+
+部署后请验证以下功能：
+
+| 功能点 | 验证方法 | 预期结果 |
+|--------|----------|----------|
+| 追踪参数清理 | 搜索包含 utm_ 参数的 URL | 参数被移除 |
+| 主机名重写 | 搜索 youtube.com 链接 | 被重写为 invidious.example.com |
+| 结果移除 | 搜索 facebook.com 链接 | 结果被移除 |
+| 优先级设置 | 搜索 wikipedia.org 链接 | 结果优先级为 high |
+| DOI 重定向 | 搜索包含 DOI 的学术链接 | 被重定向到配置的解析器 |
+| 执行顺序 | 查看 debug 日志 | 按 `REMOVE → 清理 → 重写 → DOI → 优先级` 顺序执行 |
+
+### 7.4 回滚方案
+
+如遇到问题，可快速回滚：
+
+1. 从 `settings.yml` 中移除 `url_cleanup_pipeline` 配置
+2. 重新启用原独立插件（tracker_url_remover、hostnames、oa_doi_rewrite）
+3. 重启服务
+
+### 7.5 可直接使用的组合插件完整代码
+
+以下是经过完整语义核对的组合插件代码，可直接复制使用：
 
 ```python
 # searx/plugins/url_cleanup_pipeline.py
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import typing as t
+import re
+from urllib.parse import urlunparse, urlparse
+
 from flask_babel import gettext
+
+from searx import settings
 from searx.plugins import Plugin, PluginInfo
 from searx.data import TRACKER_PATTERNS
-from searx.plugins.hostnames import filter_url_field as hostnames_filter
+from searx.result_types._base import MainResult, LegacyResult
+from searx.settings_loader import get_yaml_cfg
 from searx.plugins.oa_doi_rewrite import filter_url_field as doi_filter
+
+from ._core import log
 
 if t.TYPE_CHECKING:
     import flask
@@ -693,8 +808,42 @@ if t.TYPE_CHECKING:
     from searx.plugins import PluginCfg
 
 
+REPLACE: dict[re.Pattern, str] = {}
+REMOVE: set = set()
+HIGH: set = set()
+LOW: set = set()
+
+
+def _load_hostnames_config():
+    """加载 hostnames 配置（与原 hostnames 插件逻辑一致）"""
+    global REPLACE, REMOVE, HIGH, LOW
+    
+    hostnames_cfg = settings.get("hostnames")
+    if not hostnames_cfg:
+        return
+    
+    def _load_regular_expressions(settings_key):
+        setting_value = hostnames_cfg.get(settings_key)
+        if not setting_value:
+            return None
+        if isinstance(setting_value, str):
+            setting_value = get_yaml_cfg(setting_value)
+        if isinstance(setting_value, list):
+            return {re.compile(r) for r in setting_value}
+        if isinstance(setting_value, dict):
+            return {re.compile(p): r for (p, r) in setting_value.items()}
+        return None
+    
+    REPLACE = _load_regular_expressions("replace") or {}
+    REMOVE = _load_regular_expressions("remove") or set()
+    HIGH = _load_regular_expressions("high_priority") or set()
+    LOW = _load_regular_expressions("low_priority") or set()
+
+
 class SXNGPlugin(Plugin):
-    """统一的 URL 清理管道，按确定顺序执行多个清理逻辑"""
+    """统一的 URL 清理管道，按确定顺序执行多个清理逻辑
+    完整覆盖 tracker_url_remover + hostnames + oa_doi_rewrite 语义
+    """
 
     id = "url_cleanup_pipeline"
 
@@ -709,13 +858,42 @@ class SXNGPlugin(Plugin):
 
     def init(self, app: "flask.Flask") -> bool:
         TRACKER_PATTERNS.init()
+        _load_hostnames_config()
         return True
 
     def on_result(self, request: "SXNG_Request", search: "SearchWithPlugins", result: "Result") -> bool:
-        # 执行顺序：清理参数 → 重写主机名 → DOI 重定向
+        # 执行顺序（严格按照 hostnames 语义约束）
+        # 1. 主 URL REMOVE 检查 → 2. 清理追踪参数 → 3. 主机名重写
+        # 4. DOI 重定向 → 5. 优先级设置
+        
+        # 步骤 1：主 URL REMOVE 检查
+        for pattern in REMOVE:
+            if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                log.debug("url_cleanup_pipeline: remove result by hostname pattern %s", pattern.pattern)
+                return False
+        
+        # 步骤 2：清理追踪参数
         result.filter_urls(self._clean_trackers)
-        result.filter_urls(hostnames_filter)
-        result.filter_urls(doi_filter)
+        
+        # 步骤 3：主机名重写
+        result.filter_urls(self._hostnames_rewrite)
+        
+        # 步骤 4：DOI 重定向（保留前置检查）
+        if result.parsed_url:
+            result.filter_urls(doi_filter)
+        
+        # 步骤 5：优先级设置（仅对 MainResult/LegacyResult）
+        if isinstance(result, (MainResult, LegacyResult)):
+            for pattern in LOW:
+                if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                    result.priority = "low"
+                    log.debug("url_cleanup_pipeline: set low priority for %s", result.parsed_url.netloc)
+            
+            for pattern in HIGH:
+                if result.parsed_url and pattern.search(result.parsed_url.netloc):
+                    result.priority = "high"
+                    log.debug("url_cleanup_pipeline: set high priority for %s", result.parsed_url.netloc)
+        
         return True
 
     @classmethod
@@ -723,20 +901,25 @@ class SXNGPlugin(Plugin):
         if not url_src:
             return True
         return TRACKER_PATTERNS.clean_url(url=url_src)
-```
-
-**配置方式**：
-```yaml
-plugins:
-  # 禁用原有独立插件
-  searx.plugins.tracker_url_remover.SXNGPlugin:
-    active: false
-  searx.plugins.hostnames.SXNGPlugin:
-    active: false  # 如果需要主机名重写功能，可保留或在管道中集成
-  searx.plugins.oa_doi_rewrite.SXNGPlugin:
-    active: false
-  
-  # 启用统一管道插件
-  searx.plugins.url_cleanup_pipeline.SXNGPlugin:
-    active: true
+    
+    @classmethod
+    def _hostnames_rewrite(cls, result: "Result|LegacyResult", field_name: str, url_src: str) -> bool | str:
+        if not url_src:
+            return True
+        
+        url_src_parsed = urlparse(url=url_src)
+        
+        for pattern in REMOVE:
+            if pattern.search(url_src_parsed.netloc):
+                log.debug("url_cleanup_pipeline: remove URL field %s by pattern %s", field_name, pattern.pattern)
+                return False
+        
+        for pattern, replacement in REPLACE.items():
+            if pattern.search(url_src_parsed.netloc):
+                new_url = url_src_parsed._replace(netloc=pattern.sub(replacement, url_src_parsed.netloc))
+                new_url = urlunparse(new_url)
+                log.debug("url_cleanup_pipeline: rewrite URL %s -> %s", url_src, new_url)
+                return new_url
+        
+        return True
 ```
