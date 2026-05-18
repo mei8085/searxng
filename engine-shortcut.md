@@ -44,30 +44,30 @@ def autocompleter():
 raw_query_parts = re.split(r'(\s+)', self.query)
 ```
 
-使用正则表达式 `(\s+)` 进行分割，保留空白字符作为分割标记。
+使用正则表达式 `(\s+)` 进行分割，保留空白字符作为分割标记。每个非空白的 `query_part` 依次经过解析器链处理。
 
-### 3.2 解析顺序
+### 3.2 解析器执行顺序
 
-`RawTextQuery.PARSER_CLASSES` 定义了解析器的执行顺序：
+`RawTextQuery.PARSER_CLASSES` 定义了解析器的执行顺序，每个解析器通过 `check()` 方法判断是否处理当前 `query_part`：
 
-| 解析器 | 前缀 | 功能 |
-|--------|------|------|
-| TimeoutParser | `<` | 设置超时时间 |
-| LanguageParser | `:` | 设置语言 |
-| ExternalBangParser | `!!` | 外部 Bang 跳转 |
-| BangParser | `!` | 引擎/分类快捷前缀 |
-| FeelingLuckyParser | `!!` | 手气不错（重定向到第一个结果） |
+| 解析器 | 前缀 | check() 条件 | 功能 |
+|--------|------|-------------|------|
+| TimeoutParser | `<` | `raw_value[0] == '<'` | 设置超时时间 |
+| LanguageParser | `:` | `raw_value[0] == ':'` | 设置语言 |
+| ExternalBangParser | `!!` | `raw_value.startswith('!!') and len(raw_value) > 2` | 外部 Bang 跳转 |
+| BangParser | `!` | `raw_value[0] == '!' and not raw_value.startswith('!!')` | 引擎/分类快捷前缀 |
+| FeelingLuckyParser | `!!` | `raw_value == '!!'` | 手气不错（重定向到第一个结果） |
 
-### 3.3 BangParser 切分规则
+### 3.3 BangParser 匹配逻辑
 
-`BangParser` 在 `searx/query.py:178-238` 中实现，核心逻辑：
+`BangParser` 在 `searx/query.py:178-238` 中实现，核心匹配流程：
 
-1. **识别条件**：`raw_value[0] == '!'` 且不是 `!!`
+1. **识别条件**：`raw_value[0] == '!'` 且不是 `!!` 开头
 2. **值规范化**：`value = raw_value[1:].replace('-', ' ').replace('_', ' ').lower()`
-3. **匹配优先级**：
-   - 第一步：匹配 `engine_shortcuts` 字典中的快捷词
-   - 第二步：匹配 `engines` 字典中的引擎名称
-   - 第三步：匹配 `categories` 字典中的分类名称
+3. **三级匹配优先级**：
+   - **第一步**：匹配 `engine_shortcuts` 字典中的快捷词（如 `g` → `google`）
+   - **第二步**：匹配 `engines` 字典中的引擎名称（如 `google`）
+   - **第三步**：匹配 `categories` 字典中的分类名称（如 `images`）
 
 ### 3.4 快捷词匹配示例
 
@@ -76,10 +76,11 @@ raw_query_parts = re.split(r'(\s+)', self.query)
 | `!g python` | `g` → 匹配 `engine_shortcuts['g']` → `google` | 使用 google 引擎搜索 "python" |
 | `!wp python` | `wp` → 匹配 `engine_shortcuts['wp']` → `wikipedia` | 使用 wikipedia 引擎搜索 "python" |
 | `!images cat` | `images` → 匹配 `categories['images']` | 使用 images 分类下所有引擎搜索 "cat" |
+| `!unknown test` | 三级匹配都失败 → 返回 `False` | `!unknown` 作为普通文本，搜索 "!unknown test" |
 
 ## 4. 与默认配置的协同方式
 
-### 4.1 分类协同
+### 4.1 分类/引擎协同
 
 在 `searx/webadapter.py:269-276` 中实现：
 
@@ -90,25 +91,35 @@ else:
     query_engineref_list = parse_generic(preferences, form, disabled_engines)
 ```
 
-**关键逻辑**：
-- 当 `raw_text_query.specific == True`（即用户使用了 `!` 前缀），且分类未被锁定时，使用快捷前缀指定的引擎
-- 否则使用表单或偏好设置中的分类
+**决策逻辑**：
+- 当 `is_locked('categories') == False`（分类未被管理员锁定）**且** `raw_text_query.specific == True`（用户使用了 `!` 前缀）时，使用快捷前缀指定的引擎
+- 否则使用 `parse_generic()` 从表单或偏好设置中获取分类
 
 ### 4.2 语言协同
 
-在 `searx/webadapter.py:55-72` 中实现：
+在 `searx/webadapter.py:55-72` 中实现完整的优先级链：
 
 ```python
 def parse_lang(preferences, form, raw_text_query):
+    if is_locked('language'):
+        # 锁定场景：强制使用管理员配置，忽略所有用户输入
+        return preferences.get_value('language')
+    
+    # 未锁定场景：按优先级选择
     if len(raw_text_query.languages):
-        query_lang = raw_text_query.languages[-1]  # 使用查询中的语言前缀
+        query_lang = raw_text_query.languages[-1]  # 优先级1: 查询前缀 :语言
     elif 'language' in form:
-        query_lang = form.get('language')           # 使用表单参数
+        query_lang = form.get('language')           # 优先级2: 表单参数
     else:
-        query_lang = preferences.get_value('language')  # 使用用户偏好
+        query_lang = preferences.get_value('language')  # 优先级3: 用户偏好
 ```
 
-**优先级顺序**：查询前缀 `:语言` > 表单参数 > 用户偏好设置
+**语言优先级完整表**：
+
+| 场景 | 优先级顺序 |
+|------|-----------|
+| 语言已锁定 | 1. 管理员锁定配置（忽略查询前缀、表单参数、用户偏好） |
+| 语言未锁定 | 1. 查询前缀 `:语言` → 2. 表单参数 → 3. 用户偏好 → 4. 系统默认 |
 
 ### 4.3 搜索安全级别协同
 
@@ -117,14 +128,19 @@ def parse_lang(preferences, form, raw_text_query):
 ```python
 def parse_safesearch(preferences, form):
     if is_locked('safesearch'):
+        # 锁定场景：强制使用管理员配置
         return preferences.get_value('safesearch')
+    
     if 'safesearch' in form:
-        query_safesearch = form.get('safesearch')
+        query_safesearch = form.get('safesearch')  # 优先级1: 表单参数
     else:
-        query_safesearch = preferences.get_value('safesearch')
+        query_safesearch = preferences.get_value('safesearch')  # 优先级2: 用户偏好
 ```
 
-**注意**：搜索安全级别（safesearch）**不通过查询前缀**设置，只能通过表单参数或用户偏好设置。
+**关键特性**：
+- 搜索安全级别（safesearch）**不支持通过查询前缀**设置
+- 只能通过表单参数或用户偏好设置
+- 管理员锁定时完全忽略用户输入
 
 ### 4.4 超时设置协同
 
@@ -132,64 +148,146 @@ def parse_safesearch(preferences, form):
 
 ```python
 def parse_timeout(form, raw_text_query):
-    timeout_limit = raw_text_query.timeout_limit
+    timeout_limit = raw_text_query.timeout_limit  # 优先级1: 查询前缀 <超时
     if timeout_limit is None:
-        timeout_limit = form.get('timeout_limit')
+        timeout_limit = form.get('timeout_limit')  # 优先级2: 表单参数
 ```
 
-**优先级顺序**：查询前缀 `<超时时间>` > 表单参数
+**超时优先级**：查询前缀 `<超时时间>` > 表单参数 > 系统默认
 
-## 5. 快捷词与配置冲突时的回退策略
+### 4.5 默认分类回退到 general 的触发条件
 
-### 5.1 配置加载时的冲突检测
+在 `searx/webadapter.py:135-155` 中定义了完整的分类回退链：
 
-在 `searx/engines/__init__.py:251-260` 中实现：
+```python
+def get_selected_categories(preferences, form):
+    selected_categories = []
+    
+    # 第1层：尝试从表单参数解析（仅当分类未锁定时）
+    if not is_locked('categories') and form is not None:
+        for name, value in form.items():
+            parse_category_form(selected_categories, name, value)
+    
+    # 第2层：表单解析为空时，使用用户偏好（cookie 中存储的分类选择）
+    if not selected_categories:
+        cookie_categories = preferences.get_value('categories')
+        for ccateg in cookie_categories:
+            selected_categories.append(ccateg)
+    
+    # 第3层：用户偏好也为空时，强制回退到 general
+    if not selected_categories:
+        selected_categories = ['general']
+    
+    return selected_categories
+```
+
+**回退到 general 的触发条件（需同时满足）**：
+1. 分类未被管理员锁定（`is_locked('categories') == False`）
+2. 表单中未指定任何分类参数（无 `categories` 参数，也无 `category_xxx=on` 参数）
+3. 用户偏好中也未设置任何分类（cookie 为空或未设置）
+
+**注意**：当用户使用 `!` 快捷前缀时，`raw_text_query.specific == True`，此时会绕过 `get_selected_categories()` 的回退逻辑，直接使用快捷前缀指定的引擎。
+
+## 5. 快捷词冲突与回退策略
+
+### 5.1 配置阶段 vs 查询阶段：处理差异对比
+
+| 维度 | 配置阶段（系统启动时） | 查询阶段（用户搜索时） |
+|------|----------------------|----------------------|
+| **触发时机** | `load_engines()` 加载 `settings.yml` 时 | 用户输入查询，`RawTextQuery` 解析时 |
+| **冲突类型** | 多个引擎定义了相同的 `shortcut` 字段 | 用户输入的 `!xxx` 无法匹配任何快捷词/引擎/分类 |
+| **处理策略** | 严格失败 | 宽松回退 |
+| **行为** | 打印错误日志 + `sys.exit(1)` 终止程序 | 视为普通文本，继续搜索 |
+| **代码位置** | `searx/engines/__init__.py:251-260` | `searx/query.py:298-306` |
+
+### 5.2 配置阶段：严格冲突检测
+
+在 `searx/engines/__init__.py:251-260` 的 `register_engine()` 中实现：
 
 ```python
 def register_engine(engine):
+    # 检查引擎名称冲突
     if engine.name in engines:
         logger.error('Engine config error: ambiguous name: {0}'.format(engine.name))
         sys.exit(1)
     engines[engine.name] = engine
 
+    # 检查快捷词冲突
     if engine.shortcut in engine_shortcuts:
         logger.error('Engine config error: ambiguous shortcut: {0}'.format(engine.shortcut))
         sys.exit(1)
     engine_shortcuts[engine.shortcut] = engine.name
 ```
 
-**策略**：配置加载时检测到重复的快捷词，直接报错并退出程序（`sys.exit(1)`），属于**严格失败**策略。
+**设计意图**：配置错误是严重问题，必须在系统启动时暴露，避免运行时出现不可预测的行为。
 
-### 5.2 查询解析时的回退策略
+### 5.3 查询阶段：快捷词命中失败的回退链路
 
-在 `searx/query.py:193-214` 的 `BangParser._parse()` 中实现：
+这是最关键的回退逻辑，在 `searx/query.py:292-306` 中实现：
 
 ```python
-def _parse(self, value):
-    # 1. 尝试匹配快捷词
-    if value in engine_shortcuts:
-        value = engine_shortcuts[value]
+for i, query_part in enumerate(raw_query_parts):
+    if query_part.isspace() or query_part == '':
+        continue
     
-    # 2. 尝试匹配引擎名称
-    if value in engines:
-        self.raw_text_query.enginerefs.append(EngineRef(value, 'none'))
-        return True
+    special_part = False
+    for parser_class in RawTextQuery.PARSER_CLASSES:
+        if parser_class.check(query_part):
+            # 调用解析器，返回 True 表示成功解析，False 表示解析失败
+            special_part = parser_class(self, i == autocomplete_index)(query_part)
+            break
     
-    # 3. 尝试匹配分类名称
-    if value in categories:
-        self.raw_text_query.enginerefs.extend(...)
-        return True
-    
-    # 4. 都不匹配时返回 False
-    return False
+    # 核心分流逻辑
+    qlist = self.query_parts if special_part else self.user_query_parts
+    qlist.append(query_part)
 ```
 
-**回退逻辑**：
-- 如果快捷词、引擎名、分类名**都不匹配**，`BangParser.__call__()` 返回 `False`
-- 此时该前缀被视为普通查询文本的一部分，保留在 `user_query_parts` 中
-- 不会报错，继续使用默认分类进行搜索
+**完整回退链路（以 `!unknown test` 为例）**：
 
-### 5.3 禁用引擎的回退策略
+```
+用户输入: "!unknown test"
+    ↓
+re.split(r'(\s+)', query) → ['!unknown', ' ', 'test']
+    ↓
+处理 "!unknown":
+    BangParser.check("!unknown") → True（以 ! 开头）
+    ↓
+    BangParser._parse("unknown"):
+        1. "unknown" in engine_shortcuts? → 否
+        2. "unknown" in engines? → 否
+        3. "unknown" in categories? → 否
+        return False
+    ↓
+    special_part = False
+    ↓
+    加入 user_query_parts → user_query_parts = ["!unknown"]
+    ↓
+处理 "test":
+    所有解析器 check() 都返回 False
+    ↓
+    special_part = False
+    ↓
+    加入 user_query_parts → user_query_parts = ["!unknown", "test"]
+    ↓
+最终:
+    query_parts = []（无特殊前缀被识别）
+    user_query_parts = ["!unknown", "test"]
+    getQuery() → "!unknown test"
+    specific = False（未设置任何引擎）
+    ↓
+webadapter 中:
+    raw_text_query.specific == False → 调用 parse_generic()
+    ↓
+    使用默认分类（通常是 general）进行搜索
+```
+
+**回退链路关键点**：
+1. `BangParser._parse()` 返回 `False` 表示解析失败
+2. `special_part = False` 导致该 `query_part` 被加入 `user_query_parts` 而非 `query_parts`
+3. `raw_text_query.specific` 保持 `False`（只有 `BangParser` 成功解析时才会设为 `True`）
+4. 最终使用默认分类进行搜索，用户输入的 `!unknown` 作为查询文本的一部分
+
+### 5.4 禁用引擎的回退策略
 
 在 `searx/query.py:207-211` 中实现：
 
@@ -201,9 +299,9 @@ self.raw_text_query.enginerefs.extend(
 )
 ```
 
-**策略**：分类匹配时自动过滤掉用户禁用的引擎，如果分类下所有引擎都被禁用，则该分类无效。
+**策略**：分类匹配时自动过滤掉用户禁用的引擎。如果分类下所有引擎都被禁用，则 `enginerefs` 为空，后续会使用默认分类。
 
-### 5.4 验证阶段的回退
+### 5.5 验证阶段的回退
 
 在 `searx/webadapter.py:21-45` 中实现：
 
@@ -214,13 +312,13 @@ def validate_engineref_list(engineref_list, preferences):
     no_token = []
     for engineref in engineref_list:
         if engineref.name not in engines:
-            unknown.append(engineref)
+            unknown.append(engineref)    # 未知引擎：单独收集
             continue
         engine = engines[engineref.name]
         if not preferences.validate_token(engine):
-            no_token.append(engineref)
+            no_token.append(engineref)   # Token 验证失败：单独收集
             continue
-        valid.append(engineref)
+        valid.append(engineref)         # 验证通过：参与搜索
     return valid, unknown, no_token
 ```
 
@@ -228,38 +326,55 @@ def validate_engineref_list(engineref_list, preferences):
 - 未知引擎：放入 `unknown` 列表，不参与搜索
 - Token 验证失败：放入 `no_token` 列表，不参与搜索
 - 只有 `valid` 列表中的引擎会实际执行搜索
+- 如果 `valid` 为空，将使用默认分类
 
 ## 6. 完整解析流程图
 
 ```
 用户输入查询字符串
-        ↓
+    ↓
 webapp.py: search() 路由接收请求
-        ↓
+    ↓
 webadapter.py: get_search_query_from_webapp()
+    ├─ 检查是否锁定分类/语言/安全级别
+    └─ 创建 RawTextQuery 实例
         ↓
 query.py: RawTextQuery.__init__()
-        ↓
+    ↓
 query.py: RawTextQuery._parse_query()
-        ├─ 按空白字符分割查询
-        ├─ 遍历每个 query_part
-        │   ├─ TimeoutParser (<) → 超时设置
-        │   ├─ LanguageParser (:) → 语言设置
-        │   ├─ ExternalBangParser (!!) → 外部跳转
-        │   ├─ BangParser (!) → 引擎/分类快捷
-        │   │   ├─ 匹配 engine_shortcuts
-        │   │   ├─ 匹配 engines
-        │   │   ├─ 匹配 categories
-        │   │   └─ 都不匹配 → 作为普通文本
-        │   └─ FeelingLuckyParser (!!) → 手气不错
-        └─ 分离为 query_parts (特殊前缀) 和 user_query_parts (实际查询)
-        ↓
+    ├─ re.split(r'(\s+)', self.query) 分割查询
+    └─ 遍历每个非空白 query_part:
+        ├─ TimeoutParser.check(part)?
+        │   ├─ 是 → 解析成功? → special_part = True/False
+        │   └─ 否 → 继续下一个解析器
+        ├─ LanguageParser.check(part)?
+        │   ├─ 是 → 解析成功? → special_part = True/False
+        │   └─ 否 → 继续下一个解析器
+        ├─ ExternalBangParser.check(part)?
+        │   ├─ 是 → 解析成功? → special_part = True/False
+        │   └─ 否 → 继续下一个解析器
+        ├─ BangParser.check(part)?
+        │   ├─ 是 → 匹配 engine_shortcuts?
+        │   │       ├─ 是 → 转换为引擎名 → 检查 engines
+        │   │       └─ 否 → 直接检查 engines
+        │   │           ├─ 是 → 加入 enginerefs → special_part = True
+        │   │           └─ 否 → 检查 categories
+        │   │               ├─ 是 → 加入 enginerefs → special_part = True
+        │   │               └─ 否 → special_part = False
+        │   └─ 否 → 继续下一个解析器
+        ├─ FeelingLuckyParser.check(part)?
+        │   ├─ 是 → 解析成功 → special_part = True
+        │   └─ 否 → 所有解析器都不匹配
+        └─ 分流:
+            special_part == True → 加入 query_parts（特殊前缀）
+            special_part == False → 加入 user_query_parts（普通文本）
+    ↓
 webadapter.py: 组装 SearchQuery
-        ├─ 语言：查询前缀 > 表单 > 偏好
-        ├─ 引擎：快捷前缀指定 > 表单/分类偏好
-        ├─ 超时：查询前缀 > 表单
-        └─ 安全级别：表单 > 偏好（锁定时忽略）
-        ↓
+    ├─ 语言: 锁定? → 管理员配置 → 否则: 查询前缀 > 表单 > 偏好
+    ├─ 引擎: 未锁定且 specific==True? → 快捷前缀指定 → 否则: 表单/分类偏好 → 都空? → general
+    ├─ 超时: 查询前缀 > 表单 > 默认
+    └─ 安全级别: 锁定? → 管理员配置 → 否则: 表单 > 偏好
+    ↓
 执行搜索
 ```
 
@@ -292,13 +407,40 @@ engine_shortcuts = {}
 - `wp` → `wikipedia`
 - `ddg` → `duckduckgo`
 
+### 7.3 RawTextQuery 关键属性
+
+| 属性 | 类型 | 含义 |
+|------|------|------|
+| `query_parts` | list | 成功解析的特殊前缀列表（如 `['!g', ':en']`） |
+| `user_query_parts` | list | 实际搜索的文本部分列表（如 `['python', 'tutorial']`） |
+| `enginerefs` | list[EngineRef] | 解析出的引擎引用列表 |
+| `languages` | list | 解析出的语言列表 |
+| `specific` | bool | 是否通过 `!` 前缀指定了特定引擎/分类 |
+| `timeout_limit` | float/None | 解析出的超时限制 |
+
 ## 8. 总结
 
-SearXNG 的引擎快捷前缀解析系统采用**分层解析、严格配置、宽松查询**的策略：
+SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松**的设计哲学：
 
-1. **配置阶段**：严格检查，重复快捷词直接报错退出
-2. **查询阶段**：宽松处理，未识别的前缀作为普通文本保留
-3. **协同机制**：查询前缀优先级最高，其次是表单参数，最后是用户偏好
-4. **回退策略**：多层验证确保只有有效且可用的引擎参与搜索
+### 核心设计原则
 
-该设计既保证了配置的正确性，又提供了良好的用户体验，使用户可以通过简单的前缀语法快速切换搜索范围。
+1. **配置阶段**：零容忍策略
+   - 重复的快捷词或引擎名被视为严重配置错误
+   - 系统启动时直接终止，强制管理员修正
+
+2. **查询阶段**：最大可用性策略
+   - 无法识别的前缀不报错，作为普通文本继续搜索
+   - 确保用户总能得到搜索结果，即使输入有误
+
+3. **优先级设计**：用户意图优先
+   - 查询前缀（`:语言`、`<超时`、`!引擎`）优先级最高
+   - 其次是表单参数
+   - 最后是用户偏好和系统默认
+   - 管理员锁定配置具有最高优先级（覆盖所有用户输入）
+
+4. **多层回退机制**：
+   - 快捷词 → 引擎名 → 分类名 → 普通文本
+   - 表单分类 → 用户偏好分类 → general 分类
+   - 验证失败的引擎静默过滤，不影响整体搜索
+
+这种设计既保证了系统配置的正确性，又提供了良好的容错性和用户体验，使用户可以通过简单的前缀语法快速切换搜索范围。
