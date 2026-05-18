@@ -163,27 +163,44 @@ data["kl"] = eng_region  # DDG 的区域参数
 
 ### 3.3 安全搜索格式适配
 
-各引擎通过 `safesearch_map` 将 0/1/2 映射为引擎特定值：
+各引擎将 SearXNG 统一的 0/1/2 安全搜索等级，映射为各搜索引擎接口所需的特定取值。映射关系由各引擎独立定义，**并非统一变量名**，实际传递载体也因引擎而异（URL 参数或 Cookie）。
 
-| 引擎 | safesearch_map | 实现方式 | 示例 |
-|------|---------------|----------|------|
-| Google | `{0: "off", 1: "medium", 2: "high"}` | URL 参数 | `safe=medium` |
-| Yahoo | `{0: "p", 1: "i", 2: "r"}` | URL 参数 | - |
-| **Brave** | **`{0: "off", 1: "moderate", 2: "strict"}`** | **Cookie 写入** | **`safesearch=strict`** |
-| Wallhaven | `{0: "111", 1: "110", 2: "100"}` | URL 参数 | - |
-| XPath 引擎 | 可配置 | URL 参数拼接 | `&filter=moderate` |
+| 引擎 | 映射变量名 | 映射关系 | 传递载体 | 落点字段 |
+|------|-----------|----------|----------|----------|
+| Google | `filter_mapping` | `{0: "off", 1: "medium", 2: "high"}` | URL 参数 | `safe=xxx` |
+| Yahoo | `safesearch_dict` | `{0: "p", 1: "i", 2: "r"}` | Cookie | `sB` 中的 `vm` 字段 |
+| **Brave** | `safesearch_map` | `{2: "strict", 1: "moderate", 0: "off"}` | **Cookie** | **`safesearch=xxx`** |
+| Wallhaven | `safesearch_map` | `{0: "111", 1: "110", 2: "100"}` | URL 参数 | 自定义参数 |
+| XPath 引擎 | `safe_search_map` | 可配置 | URL 参数拼接 | 自定义参数 |
 
-**Google 引擎示例** ([engines/google.py:340-341](searx/engines/google.py#L340-L341))：
+**Google 引擎示例** ([engines/google.py:65,340-341](searx/engines/google.py#L65-L341))：
 ```python
+filter_mapping = {0: "off", 1: "medium", 2: "high"}  # 映射定义
+
+# 写入 URL 参数 safe=xxx
 if params["safesearch"]:
     query_url += "&" + urlencode({"safe": filter_mapping[params["safesearch"]]})
 ```
 
+**Yahoo 引擎示例** ([engines/yahoo.py:38,171-183](searx/engines/yahoo.py#L38-L183))：
+```python
+safesearch_dict = {0: 'p', 1: 'i', 2: 'r'}  # 映射定义
+
+# 写入 Cookie sB 的 vm 字段
+sbcookie_params = {
+    'v': 1,
+    'vm': safesearch_dict[params['safesearch']],  # 安全搜索等级
+    'fl': 1,
+    ...
+}
+params['cookies']['sB'] = build_sb_cookie(sbcookie_params)
+```
+
 **Brave 引擎示例** ([engines/brave.py:183,221](searx/engines/brave.py#L183-L221))：
 ```python
-safesearch_map = {2: "strict", 1: "moderate", 0: "off"}  # 等级到字符串映射
+safesearch_map = {2: "strict", 1: "moderate", 0: "off"}  # 映射定义
 
-# 写入 cookie，而非 URL 参数
+# 写入 Cookie safesearch=xxx
 params["cookies"]["safesearch"] = safesearch_map.get(params["safesearch"], "off")
 ```
 
@@ -302,6 +319,7 @@ def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: 
 | 结果合并 | `searx/results.py` | `ResultContainer.extend`, `add_unresponsive_engine` |
 | 引擎配置默认值 | `searx/engines/__init__.py` | `display_error_messages` 默认值定义 |
 | Google 引擎 | `searx/engines/google.py` | `get_google_info`, `request` |
+| Brave 引擎 | `searx/engines/brave.py` | `safesearch_map`, `request` |
 | DuckDuckGo 引擎 | `searx/engines/duckduckgo.py` | `request` |
 | XPath 引擎 | `searx/engines/xpath.py` | `request` |
 
