@@ -166,11 +166,11 @@ def _merge_main_result(self, result: MainResult | LegacyResult, position: int):
     # ... 后续合并逻辑
 ```
 
-### 2.2 异常传播完整链路
+### 2.2 引擎阶段异常传播完整链路
 
 **关键发现**：`ResultContainer.extend()` 调用 `_merge_main_result()` 时**没有捕获** `ValueError` 异常，异常会向上传播到 processor 层被捕获。
 
-**完整链路**：
+**引擎阶段异常链路**（仅发生在搜索执行阶段）：
 
 ```
 引擎返回结果列表
@@ -183,7 +183,7 @@ ResultContainer.extend()
     ↓
 _merge_main_result()
     ↓
-hash(result) → 抛出 ValueError (parsed_url 为 None)
+hash(result) → 抛出 ValueError (parsed_url 为 None 且非图像结果)
     ↓
 异常向上传播
     ↓
@@ -217,10 +217,55 @@ def handle_exception(self, result_container, exception_or_message, suspend=False
     # ... 可选挂起引擎
 ```
 
-**最终表现**：
+**引擎阶段异常的最终表现**：
 - 异常结果被丢弃，不进入渲染上下文
 - 该引擎在结果页底部显示为 "unresponsive"，错误信息为 "ValueError"
-- 不影响其他引擎的结果
+- 不影响其他引擎的结果，页面正常渲染
+
+### 2.3 引擎阶段异常 vs 模板渲染阶段异常对比
+
+SearxNG 存在两个完全独立的异常捕获边界，图像结果的 `parsed_url.netloc` 属于**模板渲染阶段异常**，**不会**被 processor 捕获链捕获。
+
+| 对比维度 | 引擎阶段异常 | 模板渲染阶段异常 |
+|---------|-------------|----------------|
+| **触发位置** | `_merge_main_result()` 中的 `hash(result)` 调用 | Jinja2 模板渲染时的字段访问，如 `result.parsed_url.netloc` |
+| **捕获位置** | `OnlineProcessor.search()` 的 `except Exception` | Flask 框架的全局错误处理器 |
+| **典型场景** | 普通 URL 结果 `parsed_url = None` 触发 hash 抛错 | 图像结果 `parsed_url = None`，模板第 6 行访问 `.netloc` 时抛 `AttributeError` |
+| **异常类型** | `ValueError` (hash 计算) | `AttributeError` (None.netloc) |
+| **对结果的影响** | 单个结果被丢弃，引擎标记为异常 | 整个页面渲染失败，返回 500 错误 |
+| **用户可见性** | 部分引擎结果缺失，页面其他部分正常 | 全站错误页，无搜索结果 |
+| **豁免机制** | 图像结果 hash 不依赖 parsed_url | 无，模板异常会穿透到 Flask 层 |
+
+**图像结果的特殊异常路径**：
+```
+图像结果返回 (url = "", img_src = "xxx", template = "images.html")
+    ↓
+normalize_result_fields() → parsed_url = None (因为 url 为空)
+    ↓
+_merge_main_result() → hash(result)
+    ↓
+LegacyResult.__hash__ 检测到 template == "images.html"
+    ↓
+使用 hash(f"images.html|{url}|{img_src}") → 成功，不抛错
+    ↓
+结果成功加入 main_results_map
+    ↓
+... 搜索流程完成 ...
+    ↓
+webapp.py 调用 render(results.html)
+    ↓
+Jinja2 模板引擎遍历 results
+    ↓
+渲染 images.html 模板第 6 行：{{ result.parsed_url.netloc }}
+    ↓
+parsed_url 为 None → AttributeError: 'NoneType' object has no attribute 'netloc'
+    ↓
+异常向上传播到 Flask 框架
+    ↓
+返回 500 Internal Server Error 页面
+```
+
+**关键结论**：图像结果的 hash 豁免仅保护了**搜索执行阶段**，但无法保护**模板渲染阶段**。`parsed_url` 为 None 的图像结果会成功进入结果容器，但在渲染时导致整个页面崩溃。
 
 ### 2.3 URL 字段规范化流程
 
