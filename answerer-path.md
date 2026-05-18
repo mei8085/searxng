@@ -1,6 +1,6 @@
 # Answerer 执行路径分析
 
-本文档详细说明 SearXNG 中本地 answerer 的工作机制，包括注册形态、命中判定、与缓存和插件的执行先后关系，以及结果合并展示逻辑。
+本文档详细说明 SearXNG 中本地 answerer 的工作机制，包括注册形态、命中判定、短路逻辑、与缓存和插件的执行先后关系，以及结果合并展示逻辑。
 
 ## 一、注册形态
 
@@ -67,7 +67,7 @@ class SXNGAnswerer(Answerer):
         return [Answer(answer=self.random_types[parts[1]]())]
 ```
 
-## 二、命中判定
+## 二、命中判定与短路逻辑
 
 ### 2.1 判定流程
 
@@ -103,9 +103,9 @@ def ask(self, query: str) -> list[BaseAnswer]:
 3. **空结果过滤**：answerer 返回空列表表示未命中，不影响其他 answerer
 4. **Engine 标记**：命中的 answer 会被标记 `engine = "answerer: {keyword}"`
 
-## 三、执行先后关系
+### 2.3 核心短路逻辑
 
-### 3.1 整体搜索流程
+**命中 answerer 后，常规搜索引擎检索会被完全跳过**。
 
 搜索入口在 `Search.search()` (`searx/search/__init__.py:174-179`)：
 
@@ -113,20 +113,24 @@ def ask(self, query: str) -> list[BaseAnswer]:
 def search(self) -> ResultContainer:
     self.start_time = default_timer()
     if not self.search_external_bang():
-        if not self.search_answerers():
-            self.search_standard()
+        if not self.search_answerers():  # 只要有结果就返回 True
+            self.search_standard()       # answerer 命中则这行不会执行
     return self.result_container
 ```
 
-**执行顺序**：
+**执行顺序与短路规则**：
 
 | 阶段 | 方法 | 说明 | 短路逻辑 |
 |------|------|------|----------|
 | 1 | `search_external_bang()` | 检查外部 bang 重定向 | 返回 `True` 则终止后续流程 |
-| 2 | `search_answerers()` | 调用本地 answerer | 返回 `True`（有结果）则跳过标准搜索 |
+| 2 | `search_answerers()` | 调用本地 answerer | 返回 `True`（有结果）则**跳过标准搜索** |
 | 3 | `search_standard()` | 传统搜索引擎检索 | 仅当前面都未命中时执行 |
 
-### 3.2 与插件的关系
+> **重要结论**：默认情况下，answerer 命中后不会发起任何网络请求到外部搜索引擎，也不会有传统搜索结果。answerer 结果与传统检索结果是**互斥**的，不存在并行合并。
+
+## 三、与插件的执行先后关系
+
+### 3.1 插件包装层
 
 插件执行通过 `SearchWithPlugins.search()` (`searx/search/__init__.py:201-209`) 包装：
 
@@ -140,7 +144,7 @@ def search(self) -> ResultContainer:
     return self.result_container
 ```
 
-**插件与 Answerer 时序**：
+### 3.2 插件与 Answerer 时序
 
 ```
 pre_search 插件钩子
@@ -158,19 +162,26 @@ result_container.close()
 
 关键点：
 - `pre_search` 在 answerer 之前执行，可通过返回 `False` 阻止整个搜索
-- `on_result` 钩子在 answerer 结果添加时被调用（见下文）
+- `on_result` 钩子在 answerer 结果添加到容器时被调用
 - `post_search` 在所有搜索完成后执行
 
-### 3.3 与缓存的关系
+## 四、缓存边界
 
-**全局搜索流程无缓存层**：SearXNG 的搜索主流程没有内置的查询结果缓存。
+### 4.1 主搜索链路无缓存
 
-**缓存使用场景**：
-1. **Answerer 内部缓存**：各 answerer 可自主使用缓存。例如天气 answerer 内部使用 `WEATHER_DATA_CACHE` 缓存地理位置数据 (`searx/weather.py:181-188`)
-2. **引擎级缓存**：部分在线引擎可能有自己的缓存机制
-3. **HTTP 请求头**：在线处理器设置 `Cache-Control: no-cache` (`searx/search/processors/online.py:145`)，避免 HTTP 层缓存
+**SearXNG 的主搜索流程没有内置的查询结果缓存**。每次用户发起搜索：
+1. 不会检查是否有相同查询的历史结果
+2. 不会缓存本次搜索结果供后续使用
+3. `search()` 方法每次都会完整执行判定逻辑
 
-**Answerer 与缓存的时序**：
+### 4.2 Answerer 局部缓存
+
+Answerer 只能在各自的实现内部自主使用缓存，例如：
+
+1. **天气 answerer**：内部使用 `WEATHER_DATA_CACHE` 缓存地理位置查询结果 (`searx/weather.py:181-188`)
+2. **其他 answerer**：可根据需要自行引入缓存机制
+
+**Answerer 内部缓存时序**：
 ```
 Answerer.answer(query)
     ↓
@@ -183,9 +194,16 @@ Answerer.answer(query)
 返回 Answer 结果
 ```
 
-## 四、结果合并展示
+### 4.3 其他缓存场景
 
-### 4.1 结果添加流程
+1. **引擎级缓存**：部分在线引擎可能有自己的缓存机制（与 answerer 无关）
+2. **HTTP 请求头**：在线处理器设置 `Cache-Control: no-cache` (`searx/search/processors/online.py:145`)，避免 HTTP 层缓存
+
+> **缓存边界总结**：缓存是 answerer 内部实现细节，主搜索链路不感知、不干预。不同 answerer 之间缓存独立，互不影响。
+
+## 五、结果展示与合并场景
+
+### 5.1 结果添加流程
 
 Answerer 结果通过 `search_answerers()` 添加到结果容器 (`searx/search/__init__.py:71-75`)：
 
@@ -196,7 +214,7 @@ def search_answerers(self):
     return bool(results)
 ```
 
-### 4.2 结果分类存储
+### 5.2 结果分类存储
 
 在 `ResultContainer.extend()` 中 (`searx/results.py:83-152`)，根据结果类型分发：
 
@@ -220,7 +238,7 @@ for result in list(results):
 - 命中的 Answer 存入 `self.answers`（`AnswerSet` 类型），而非主结果列表
 - `AnswerSet` 自动去重（基于 hash）并按 template 排序
 
-### 4.3 AnswerSet 机制
+### 5.3 AnswerSet 机制
 
 `AnswerSet` 定义在 `searx/result_types/answer.py:46-75`：
 
@@ -238,15 +256,15 @@ class AnswerSet:
         yield from self._answerlist
 ```
 
-### 4.4 展示逻辑
+### 5.4 展示逻辑
 
 在 web 应用的 `search()` 视图中 (`searx/webapp.py:620-729`)：
 
-1. 结果通过 `result_container.get_ordered_results()` 获取**主搜索结果**
+1. 主结果通过 `result_container.get_ordered_results()` 获取
 2. Answer 结果通过 `result_container.answers` 单独访问
 3. 模板中分别渲染：
-   - 主结果：`results.html` 模板
    - Answer：`answers.html` 模板（位于搜索结果顶部）
+   - 主结果：`results.html` 模板
 
 **HTML 输出结构**：
 ```html
@@ -265,7 +283,22 @@ class AnswerSet:
 </div>
 ```
 
-## 五、完整执行路径图
+### 5.5 Answers 与普通 Results 同时出现的场景
+
+如前所述，默认情况下 answerer 命中后会跳过 `search_standard()`，因此页面只会显示 answers 区域，不会有普通搜索结果。但以下特殊场景可能导致两者同时出现：
+
+| 场景 | 说明 | 触发方式 |
+|------|------|----------|
+| **后置插件追加** | `post_search` 插件钩子在 answerer 执行完成后，可主动向 `result_container` 添加 `MainResult` 类型结果 | 自定义插件实现 `post_search()` 方法，调用 `result_container.extend()` 追加结果 |
+| **on_result 钩子追加** | `on_result` 插件钩子在 answerer 结果被处理时，可触发其他结果添加逻辑 | 自定义插件在 `on_result()` 中检测到 answer 类型后，追加主结果 |
+| **Answerer 自身追加** | answerer 的 `answer()` 方法理论上可同时返回 `BaseAnswer` 和 `MainResult` 类型（但不推荐） | answerer 实现中返回非 Answer 类型的 Result 子类 |
+| **pre_search 预添加** | `pre_search` 钩子在 answerer 执行前就添加了主结果，answerer 命中后这些结果会保留 | 自定义插件在 `pre_search()` 中预先添加结果 |
+
+> **设计意图**：SearXNG 设计 answerer 短路机制是为了性能优化。如果业务需要同时展示 answer 和传统搜索结果，应通过插件机制实现，而非修改 answerer 核心逻辑。
+
+## 六、完整执行路径图
+
+### 6.1 默认路径（Answerer 命中 → 短路）
 
 ```
 用户查询
@@ -279,15 +312,64 @@ plugins.pre_search() ──(返回False)──→ 终止搜索
 Search.search()
    ├─→ search_external_bang() ──(命中)──→ 重定向
    │     ↓(未命中)
-   ├─→ search_answerers()
-   │     ├─→ AnswerStorage.ask(query)
-   │     │     ├─ 提取第一个关键词
-   │     │     └─ 调用匹配的 Answerer.answer()
-   │     ├─→ ResultContainer.extend(None, results)
-   │     │     ├─ on_result 插件过滤
-   │     │     └─ 存入 answers 集合（去重）
-   │     └─(有结果)──→ 跳过标准搜索
-   │     ↓(无结果)
+   └─→ search_answerers()
+         ├─→ AnswerStorage.ask(query)
+         │     ├─ 提取第一个关键词
+         │     └─ 调用匹配的 Answerer.answer()
+         ├─→ ResultContainer.extend(None, results)
+         │     ├─ on_result 插件过滤
+         │     └─ 存入 answers 集合（去重）
+         └─(有结果)──→ 短路：跳过 search_standard()
+   ↓
+plugins.post_search()
+   ↓
+result_container.close()
+   ↓
+模板渲染
+   └─ 仅显示 answers 区域（顶部）
+```
+
+### 6.2 插件追加场景（Answerer 命中 + 插件追加结果）
+
+```
+用户查询
+   ↓
+webapp.search() 视图
+   ↓
+SearchWithPlugins.search()
+   ↓
+plugins.pre_search()
+   ↓
+Search.search()
+   └─→ search_answerers() 命中
+         └─→ 存入 answers 集合
+   ↓
+plugins.post_search()
+   └─→ 插件主动调用 result_container.extend() 追加 MainResult
+   ↓
+result_container.close()
+   ↓
+模板渲染
+   ├─ answers 区域（顶部）
+   └─ 主结果列表（插件追加的结果）
+```
+
+### 6.3 Answerer 未命中路径（走常规检索）
+
+```
+用户查询
+   ↓
+webapp.search() 视图
+   ↓
+SearchWithPlugins.search()
+   ↓
+plugins.pre_search()
+   ↓
+Search.search()
+   ├─→ search_external_bang() 未命中
+   │     ↓
+   ├─→ search_answerers() 未命中（返回空）
+   │     ↓
    └─→ search_standard()
          └─ 多引擎并发检索 → 主结果列表
    ↓
@@ -296,15 +378,15 @@ plugins.post_search()
 result_container.close()
    ↓
 模板渲染
-   ├─ answers 区域（顶部展示）
-   └─ 主结果列表
+   └─ 仅显示主结果列表
 ```
 
-## 六、关键设计特点
+## 七、关键设计特点
 
 1. **短路优化**：Answerer 命中后跳过传统搜索，显著降低延迟和网络请求
 2. **关键词驱动**：仅匹配查询首词，判定逻辑简单高效
 3. **结果隔离**：Answer 与传统搜索结果分开展示，避免干扰
 4. **插件协同**：完整接入插件生命周期，支持过滤和扩展
-5. **无全局缓存**：搜索流程无缓存层，Answerer 按需自主缓存
+5. **无全局缓存**：主搜索链路不做查询结果缓存，Answerer 按需自主实现局部缓存
 6. **可扩展性**：通过新增 `searx/answerers/` 下的模块即可扩展 answerer
+7. **互斥默认，扩展灵活**：默认 answerer 与传统检索互斥，特殊需求可通过插件机制实现两者并存
