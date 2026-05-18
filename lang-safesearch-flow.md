@@ -165,18 +165,26 @@ data["kl"] = eng_region  # DDG 的区域参数
 
 各引擎通过 `safesearch_map` 将 0/1/2 映射为引擎特定值：
 
-| 引擎 | safesearch_map | 示例 |
-|------|---------------|------|
-| Google | `{0: "off", 1: "medium", 2: "high"}` | `safe=medium` |
-| Yahoo | `{0: "p", 1: "i", 2: "r"}` | - |
-| Brave | 直接传递数值 | `safesearch=strict` |
-| Wallhaven | `{0: "111", 1: "110", 2: "100"}` | - |
-| XPath 引擎 | 可配置 | `&filter=moderate` |
+| 引擎 | safesearch_map | 实现方式 | 示例 |
+|------|---------------|----------|------|
+| Google | `{0: "off", 1: "medium", 2: "high"}` | URL 参数 | `safe=medium` |
+| Yahoo | `{0: "p", 1: "i", 2: "r"}` | URL 参数 | - |
+| **Brave** | **`{0: "off", 1: "moderate", 2: "strict"}`** | **Cookie 写入** | **`safesearch=strict`** |
+| Wallhaven | `{0: "111", 1: "110", 2: "100"}` | URL 参数 | - |
+| XPath 引擎 | 可配置 | URL 参数拼接 | `&filter=moderate` |
 
 **Google 引擎示例** ([engines/google.py:340-341](searx/engines/google.py#L340-L341))：
 ```python
 if params["safesearch"]:
     query_url += "&" + urlencode({"safe": filter_mapping[params["safesearch"]]})
+```
+
+**Brave 引擎示例** ([engines/brave.py:183,221](searx/engines/brave.py#L183-L221))：
+```python
+safesearch_map = {2: "strict", 1: "moderate", 0: "off"}  # 等级到字符串映射
+
+# 写入 cookie，而非 URL 参数
+params["cookies"]["safesearch"] = safesearch_map.get(params["safesearch"], "off")
 ```
 
 **XPath 引擎通用处理** ([engines/xpath.py:236-239](searx/engines/xpath.py#L236-L239))：
