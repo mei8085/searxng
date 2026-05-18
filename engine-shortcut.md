@@ -91,11 +91,19 @@ else:
     query_engineref_list = parse_generic(preferences, form, disabled_engines)
 ```
 
-**决策逻辑**：
-- 当 `is_locked('categories') == False`（分类未被管理员锁定）**且** `raw_text_query.specific == True`（用户使用了 `!` 前缀）时，使用快捷前缀指定的引擎
-- 否则使用 `parse_generic()` 从表单或偏好设置中获取分类
+**决策逻辑（完整真值表）**：
 
-> **重要**：只要 `specific == True`，就会直接使用 `raw_text_query.enginerefs`，**即使该列表为空也不会回退到默认分类**。详见第 5.3 节。
+| is_locked('categories') | raw_text_query.specific | 行为 |
+|------------------------|------------------------|------|
+| False | True | 使用 `raw_text_query.enginerefs`（即使为空也不回退） |
+| False | False | 调用 `parse_generic()`，按表单→偏好→general 回退 |
+| True | True | **忽略 specific**，调用 `parse_generic()`（锁定分类优先级最高） |
+| True | False | 调用 `parse_generic()` |
+
+> **关键澄清**：
+> - "specific 命中后不回退默认分类" **仅在 categories 未锁定时成立**
+> - 若 categories 被管理员锁定，无论 specific 是否为 True，都会走 `parse_generic()` 路径
+> - 锁定场景下，用户的 `!` 前缀会被忽略，分类由管理员配置决定
 
 ### 4.2 语言协同
 
@@ -157,6 +165,8 @@ def parse_timeout(form, raw_text_query):
 
 **超时优先级**：查询前缀 `<超时时间>` > 表单参数 > 系统默认
 
+> 注意：超时设置**没有锁定机制**，用户总是可以通过查询前缀或表单参数修改。
+
 ### 4.5 默认分类回退到 general 的触发条件
 
 在 `searx/webadapter.py:135-155` 中定义了完整的分类回退链：
@@ -183,13 +193,17 @@ def get_selected_categories(preferences, form):
     return selected_categories
 ```
 
-**回退到 general 的触发条件（需同时满足）**：
-1. 分类未被管理员锁定（`is_locked('categories') == False`）
-2. 表单中未指定任何分类参数（无 `categories` 参数，也无 `category_xxx=on` 参数）
-3. 用户偏好中也未设置任何分类（cookie 为空或未设置）
-4. **且用户未使用 `!` 快捷前缀**（`raw_text_query.specific == False`）
+**回退到 general 的完整触发条件**：
 
-> **重要**：当用户使用 `!` 快捷前缀时，`raw_text_query.specific == True`，此时会**绕过** `get_selected_categories()` 的回退逻辑，直接使用快捷前缀指定的引擎（即使该引擎列表为空）。
+| 条件 | 说明 |
+|------|------|
+| 1. 进入 parse_generic() 路径 | 即 `is_locked('categories') == True` **或** `raw_text_query.specific == False` |
+| 2. 表单中未指定任何分类参数 | 无 `categories` 参数，也无 `category_xxx=on` 参数 |
+| 3. 用户偏好中也未设置任何分类 | cookie 为空或未设置 |
+
+> **重要补充**：
+> - 当 categories 未锁定且用户使用 `!` 快捷前缀时（`specific == True`），**完全绕过** `get_selected_categories()`，直接使用 `raw_text_query.enginerefs`（即使为空也不回退）
+> - 当 categories 被锁定时，无论用户是否使用 `!` 前缀，都会进入 `parse_generic()`，可能回退到 general
 
 ## 5. 快捷词冲突与回退策略
 
@@ -226,9 +240,9 @@ def register_engine(engine):
 
 ### 5.3 查询阶段：分类快捷词命中但引擎不可用的行为
 
-**关键结论**：分类快捷词命中后，若该分类下引擎因禁用或校验不可用导致 `enginerefs` 为空，**不会回退到默认分类**，而是执行一次空搜索。
+**关键结论（仅适用于 categories 未锁定场景）**：分类快捷词命中后，若该分类下引擎因禁用或校验不可用导致 `enginerefs` 为空，**不会回退到默认分类**，而是执行一次空搜索。
 
-**代码证据链**：
+**代码证据链（categories 未锁定时）**：
 
 1. **第一步：`BangParser._parse()` 匹配分类成功，但 `enginerefs` 为空**
    ```python
@@ -274,6 +288,10 @@ def register_engine(engine):
    ```
 
 **最终结果**：返回一个没有搜索结果的页面，不触发任何回退机制。
+
+> **categories 锁定场景的差异**：
+> - 如果 categories 被锁定，即使 `specific == True`，也会走 `parse_generic()` 路径
+> - 此时空的 `raw_text_query.enginerefs` 会被忽略，使用管理员配置的分类
 
 ### 5.4 查询阶段：快捷词命中失败的回退链路
 
@@ -350,7 +368,9 @@ webadapter 中:
 ```
 webadapter.py: get_search_query_from_webapp()
     ↓
-query_engineref_list = raw_text_query.enginerefs  # 可能为空
+query_engineref_list = raw_text_query.enginerefs  # 可能为空（categories 未锁定时）
+    ↓ 或者
+query_engineref_list = parse_generic(...)  # 可能返回空（极端情况）
     ↓
 query_engineref_list = deduplicate_engineref_list(query_engineref_list)
     ↓
@@ -398,7 +418,9 @@ self.raw_text_query.enginerefs.extend(
 )
 ```
 
-**策略**：分类匹配时自动过滤掉用户禁用的引擎。如果分类下所有引擎都被禁用，则 `enginerefs` 为空，后续行为如第 5.3 节所述。
+**策略**：分类匹配时自动过滤掉用户禁用的引擎。如果分类下所有引擎都被禁用，则 `enginerefs` 为空。后续行为取决于 categories 是否锁定：
+- **未锁定**：使用空列表搜索，返回空结果（不回退）
+- **已锁定**：忽略空列表，使用管理员配置的分类
 
 ## 6. 完整解析流程图
 
@@ -441,9 +463,11 @@ query.py: RawTextQuery._parse_query()
             special_part == True → 加入 query_parts（特殊前缀）
             special_part == False → 加入 user_query_parts（普通文本）
     ↓
-webadapter.py: 组装 SearchQuery
+webadapter.py: 选择引擎列表
+    ├─ categories 未锁定 AND specific == True?
+    │   ├─ 是 → 使用 raw_text_query.enginerefs（可能为空，不回退）
+    │   └─ 否 → parse_generic() → 表单分类 → 用户偏好 → general
     ├─ 语言: 锁定? → 管理员配置 → 否则: 查询前缀 > 表单 > 偏好
-    ├─ 引擎: 未锁定且 specific==True? → 快捷前缀指定（可能为空）→ 否则: 表单/分类偏好 → 都空? → general
     ├─ 超时: 查询前缀 > 表单 > 默认
     └─ 安全级别: 锁定? → 管理员配置 → 否则: 表单 > 偏好
     ↓
@@ -496,7 +520,7 @@ engine_shortcuts = {}
 
 ### 8.1 核心设计原则
 
-SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松**的设计哲学：
+SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶段宽松、管理员配置优先级最高**的设计哲学：
 
 1. **配置阶段**：零容忍策略
    - 重复的快捷词或引擎名被视为严重配置错误
@@ -504,27 +528,32 @@ SearXNG 的引擎快捷前缀解析系统采用**配置阶段严格、查询阶�
 
 2. **查询阶段**：最大可用性策略
    - 无法识别的前缀不报错，作为普通文本继续搜索
-   - 但识别了前缀但引擎不可用时，**不做回退**，直接返回空结果
+   - 但识别了前缀但引擎不可用时，**不做回退**，直接返回空结果（仅 categories 未锁定时）
 
-3. **优先级设计**：用户意图优先
-   - 查询前缀（`:语言`、`<超时`、`!引擎`）优先级最高
-   - 其次是表单参数
-   - 最后是用户偏好和系统默认
-   - 管理员锁定配置具有最高优先级（覆盖所有用户输入）
+3. **管理员锁定**：最高优先级
+   - 任何配置项被锁定后，完全忽略用户的查询前缀和表单参数
+   - categories 锁定时，`!` 前缀完全失效
+   - language 锁定时，`:` 前缀完全失效
+
+4. **优先级设计**：
+   - 管理员锁定配置 > 查询前缀 > 表单参数 > 用户偏好 > 系统默认
 
 ### 8.2 关键行为澄清
 
 | 场景 | 实际行为 | 常见误解 |
 |------|---------|---------|
-| `!分类` 但分类下引擎全被禁用 | 返回空结果，不回退 | ❌ 误以为会回退到 general |
+| `!分类` 但分类下引擎全被禁用（categories 未锁定） | 返回空结果，不回退 | ❌ 误以为会回退到 general |
+| `!分类` 但分类下引擎全被禁用（categories 已锁定） | 忽略 `!` 前缀，使用管理员配置的分类搜索 | ❌ 误以为会使用 `!` 指定的分类 |
 | `!引擎` 但引擎 Token 验证失败 | 返回空结果，不回退 | ❌ 误以为会尝试其他引擎 |
 | validate 后 valid 为空 | 返回空结果，静默失败 | ❌ 误以为会有错误提示或回退 |
 | `!unknown` 无法匹配 | 作为普通文本搜索 | ✅ 正确 |
+| categories 已锁定时使用 `!g` | 忽略 `!g`，使用管理员配置的分类 | ❌ 误以为 `!` 前缀总是生效 |
 
 ### 8.3 多层回退机制（仅限特定场景）
 
 - **快捷词匹配失败时**：快捷词 → 引擎名 → 分类名 → 普通文本
-- **无快捷词时**：表单分类 → 用户偏好分类 → general 分类
+- **无快捷词且 categories 未锁定时**：表单分类 → 用户偏好分类 → general 分类
+- **categories 已锁定时**：管理员配置分类（忽略所有用户输入）
 - **引擎验证失败时**：静默过滤，不影响整体搜索（但可能导致空结果）
 
-这种设计在配置正确性和用户体验之间做了权衡：对于用户输入错误保持宽容，但对于已识别的用户意图（即使无法执行）保持忠实，不做静默的行为改变。
+这种设计在配置正确性、用户体验和管理员控制权之间做了权衡：对于用户输入错误保持宽容，对于已识别的用户意图保持忠实，同时确保管理员的锁定配置具有最高优先级。
