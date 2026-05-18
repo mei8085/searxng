@@ -737,6 +737,84 @@ SearXNG 的结果排序逻辑在 `ResultContainer` 中实现，主要考虑以�
 - **证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 中无任何错误检测逻辑
 - **影响**：当 Bing/Yahoo 返回状态码 200 但内容为空或异常时，框架无法识别为错误状态
 
-**结论3：空结果列表存在歧义，上层无法区分"无结果"与"被封禁"**
-- **证据**：[online.py:253-282](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L253-L282) 中 `_search_basic()` 函数将空列表视为有效返回值，仅在抛出异常时才标记错误
-- **影响**：Bing 和 Yahoo 的空结果可能意味着搜索引擎确实无
+**结论3：无自定义检测的引擎中，"无搜索结果"与"被软封禁/被限流"在代码路径上完全重合，上层无法区分**
+
+#### 触发路径对比
+
+| 场景 | HTTP状态码 | 网络层检测 | DOM解析 | XPath匹配 | response()返回 | _search_basic()行为 | 上层处理 | 可观测信号 |
+|-----|-----------|-----------|---------|-----------|---------------|---------------------|---------|-----------|
+| **无搜索结果**（正常业务） | 200 | 通过 | 成功 | 空列表 | `[]` | 返回空列表 | `extend_container()` 接收空列表，标记为 `successful` | 结果数=0，引擎状态=正常，指标=successful |
+| **被封禁/限流**（能被识别） | 403/429 或 CAPTCHA特征 | 抛出异常 | 不执行 | 不执行 | 不执行 | 抛出异常 | `handle_exception()` 调用，`suspend=True`，标记为 `error` | 引擎暂停，指标=error，有异常日志 |
+| **被软封禁/限流**（不能被识别） | 200 | 通过 | 成功（但页面结构异常） | 空列表 | `[]` | 返回空列表 | `extend_container()` 接收空列表，标记为 `successful` | 结果数=0，引擎状态=正常，指标=successful（与"无搜索结果"完全相同） |
+
+#### 完整证据链
+
+1. **网络层检测代码路径**：
+   - **证据**：[raise_for_httperror.py:61-79](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/network/raise_for_httperror.py#L61-L79) 仅检查 HTTP 状态码（402/403/429）和 Cloudflare 特征，不校验响应内容是否为有效搜索结果
+   - **证据**：[bing.py:122-168](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L122-L168)、[yahoo.py:215-256](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L215-L256) 中无任何自定义错误检测逻辑，直接进行 DOM 解析
+
+2. **空结果返回路径**：
+   - **证据**：[online.py:223-237](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L223-L237) 中 `_search_basic()` 直接返回 `self.engine.response(response)`，不检查返回列表是否为空
+   - **证据**：[bing.py:129](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/bing.py#L129) 中 `eval_xpath_list(dom, '//ol[@id="b_results"]/li[contains(@class, "b_algo")]')` 在封禁页面会返回空列表
+   - **证据**：[yahoo.py:230](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/yahoo.py#L230) 中 `eval_xpath_list(dom, '//div[contains(@class,"algo-sr")]')` 在封禁页面会返回空列表
+
+3. **上层处理路径**：
+   - **证据**：[online.py:251-252](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L251-L252) 中 `search_results = self._search_basic(...)` 后直接调用 `self.extend_container(...)`，不做空结果检查
+   - **证据**：[abstract.py:200-206](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L200-L206) 中 `_extend_container_basic()` 无论 `search_results` 是否为空，都会调用 `counter_inc('engine', self.engine.name, 'search', 'count', 'successful')` 标记为成功
+
+4. **异常触发路径（对比）**：
+   - **证据**：[online.py:273-278](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/online.py#L273-L278) 只有捕获到 `SearxEngineCaptchaException`、`SearxEngineTooManyRequestsException`、`SearxEngineAccessDeniedException` 时才会调用 `handle_exception(..., suspend=True)`
+   - **证据**：[abstract.py:187-191](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L187-L191) 中只有 `suspend=True` 时才会触发引擎暂停
+
+#### 影响描述
+
+1. **限流保护失效**：当 Bing/Yahoo 被软封禁时，框架不会触发任何限流保护，请求会持续发送，可能导致 IP 信誉持续恶化
+2. **结果质量下降**：被软封禁的引擎持续返回空结果，降低整体搜索结果的覆盖率
+3. **问题排查困难**：运维人员无法从指标（successful/error）区分"正常无结果"与"被封禁"，需要手动检查日志
+4. **错误归因错误**：空结果被归因于"搜索引擎无相关结果"，而非"适配层检测能力不足"
+5. **反检测策略滞后**：由于无法识别软封禁，反检测策略（如 UA 轮换、代理切换）不会被触发调整
+
+**结论4：DuckDuckGo 的 `suspended_time=0` 是唯一的引擎级限流策略定制**
+- **证据**：[duckduckgo.py:475](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/duckduckgo.py#L475) 中显式设置 `suspended_time=0`
+- **证据**：搜索所有引擎代码，仅 DuckDuckGo 在抛出 `SearxEngineCaptchaException` 时自定义了暂停时间
+- **影响**：DuckDuckGo 检测到 CAPTCHA 时不会触发 IP 封禁，可快速重试
+
+**结论5：框架的 `handle_exception()` 是限流保护的唯一入口**
+- **证据**：[abstract.py:187-191](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/search/processors/abstract.py#L187-L191) 中只有捕获到特定异常类型才会调用 `handle_exception(result_container, e, suspend=True)`
+- **影响**：漏检错误意味着无法触发限流保护，可能导致 IP 信誉持续恶化
+
+### 10.5 优化建议
+
+1. **增强 Bing/Yahoo 错误检测能力**
+   - 为 Bing 增加响应内容非空校验，识别软封禁
+   - 为 Yahoo 增加登录页面检测和地理封锁页面检测
+   - 参考 [quark.py:35](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/searx/engines/quark.py#L35) 的 `is_alibaba_captcha` 实现模式
+
+2. **建立结果质量反向校验机制**
+   - 对无自定义检测的引擎，增加结果数量/质量异常时的二次验证
+   - 连续返回空结果时自动触发限流保护
+
+3. **增加结果中间表示**
+   - 在引擎 response() 之上增加一层语义标准化，降低归并复杂度
+   - 统一错误状态码与结果质量评分
+
+4. **增强反检测能力**
+   - 引入请求指纹随机化、行为模拟等高级反检测技术
+   - 为不同检测能力的引擎配置差异化反检测策略
+
+5. **自适应限流优化**
+   - 基于历史成功率动态调整各引擎的请求频率
+   - 检测能力弱的引擎采用更保守的限流策略
+
+6. **统一测试框架**
+   - 为所有引擎建立标准化的错误检测测试用例集
+   - 覆盖正常响应、CAPTCHA、限流、封禁等多种场景
+   - **代码证据**：可参考 SearXNG 现有测试框架 [tests/unit/engines/](file:///d:/fz/0508-2/solo-dogfeeding/code/26-searxng/tests/unit/engines/) 目录结构
+
+---
+
+**报告生成说明**：
+- 本报告所有结论均基于 SearXNG 代码库静态分析
+- 代码引用路径：`d:\fz\0508-2\solo-dogfeeding\code\26-searxng\`
+- 分析时间：2025-07-01
+- 报告版本：v2.0（可追溯版）
