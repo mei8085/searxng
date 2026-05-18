@@ -197,17 +197,54 @@ def get_translated_errors(unresponsive_engines):
 
 ### 4.3 异常类名到用户文本的映射
 
+#### 访问拒绝 / 限流 / CAPTCHA 类
+
 | 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
 |----------|-------------------|----------------------|----------------------|
 | `searx.exceptions.SearxEngineAccessDeniedException` | `access denied` | `access denied` | `Suspended: access denied` |
 | `searx.exceptions.SearxEngineTooManyRequestsException` | `too many requests` | `too many requests` | `Suspended: too many requests` |
 | `searx.exceptions.SearxEngineCaptchaException` | `CAPTCHA` | `CAPTCHA` | `Suspended: CAPTCHA` |
+
+#### 超时类
+
+| 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
+|----------|-------------------|----------------------|----------------------|
+| `timeout` / `asyncio.TimeoutError` | `timeout` | `timeout` | `Suspended: timeout` |
 | `httpx.TimeoutException` / `httpx.ConnectTimeout` | `timeout` | `timeout` | `Suspended: timeout` |
-| `ssl.SSLCertVerificationError` | `SSL error: certificate validation has failed` | `SSL error: certificate validation has failed` | `Suspended: SSL error: certificate validation has failed` |
-| `httpx.ConnectError` | `HTTP connection error` | `HTTP connection error` | `Suspended: HTTP connection error` |
+| `httpx.ReadTimeout` / `httpx.WriteTimeout` | `timeout` | `timeout` | `Suspended: timeout` |
+
+#### 协议错误类
+
+| 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
+|----------|-------------------|----------------------|----------------------|
+| `httpx.RemoteProtocolError` | `HTTP protocol error` | `HTTP protocol error` | `Suspended: HTTP protocol error` |
+| `httpx.LocalProtocolError` | `HTTP protocol error` | `HTTP protocol error` | `Suspended: HTTP protocol error` |
+| `httpx.ProtocolError` | `HTTP protocol error` | `HTTP protocol error` | `Suspended: HTTP protocol error` |
 | `httpx.HTTPStatusError` | `HTTP error` | `HTTP error` | `Suspended: HTTP error` |
+| `httpx.ConnectError` | `HTTP connection error` | `HTTP connection error` | `Suspended: HTTP connection error` |
+| `httpx.ProxyError` | `proxy error` | `proxy error` | `Suspended: proxy error` |
+| `httpx.ReadError` / `httpx.WriteError` | `network error` | `network error` | `Suspended: network error` |
+
+#### SSL 错误类
+
+| 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
+|----------|-------------------|----------------------|----------------------|
+| `ssl.SSLCertVerificationError` | `SSL error: certificate validation has failed` | `SSL error: certificate validation has failed` | `Suspended: SSL error: certificate validation has failed` |
+| `ssl.CertificateError` | `SSL error: certificate validation has failed` | `SSL error: certificate validation has failed` | `Suspended: SSL error: certificate validation has failed` |
+| 其他 `ssl.SSLError` 子类（未匹配） | `unexpected crash`（回落） | `unexpected crash` | 视错误是否触发挂起而定 |
+
+#### 解析错误类
+
+| 异常类名 | 翻译后文本（英文） | 时机A展示（首次报错） | 时机B展示（命中挂起） |
+|----------|-------------------|----------------------|----------------------|
 | `json.decoder.JSONDecodeError` | `parsing error` | `parsing error` | （不会挂起，无时机B） |
-| 其他未匹配 | `unexpected crash` | 视 suspended 参数而定 | - |
+| `KeyError` | `parsing error` | `parsing error` | （不会挂起，无时机B） |
+| `lxml.etree.ParserError` | `parsing error` | `parsing error` | （不会挂起，无时机B） |
+| `searx.exceptions.SearxEngineXPathException` | `parsing error` | `parsing error` | （不会挂起，无时机B） |
+
+> **回落机制**：`exception_classname_to_text.get(error_type)` 使用字典的 `get` 方法，未匹配到的异常类名会返回 `None`，最终映射为 `unexpected crash`。
+
+[searx/webutils.py:36-67](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L36-L67)
 
 [searx/webutils.py:36-67](file:///d:/fz/0508-2/solo-dogfeeding/code/29-searxng/searx/webutils.py#L36-L67)
 
