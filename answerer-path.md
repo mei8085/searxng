@@ -152,14 +152,41 @@ def search(self) -> ResultContainer:
 - `pre_search` 返回 `True` 才执行 `super().search()`（即 answerer 流程）
 - `pre_search` 返回 `False` **仅跳过 `super().search()`，仍会执行 `post_search`**
 - `post_search` 无论 `pre_search` 返回值如何，**始终会执行**
-- `post_search` 是框架契约内**唯一可追加结果的扩展点**
 
-### 3.2 插件与 Answerer 完整时序
+### 3.2 插件 post_search 的真实分工
+
+**Plugin.post_search（插件侧）** (`searx/plugins/_core.py:169-175`)：
+```python
+def post_search(
+    self, request: SXNG_Request, search: "SearchWithPlugins"
+) -> "None | list[Result | LegacyResult] | EngineResults":
+    """Runs AFTER the search request.  Can return a list of
+    :py:obj:`Result <searx.result_types._base.Result>` objects to be added to the
+    final result list."""
+    return
+```
+
+**PluginStorage.post_search（框架侧）** (`searx/plugins/_core.py:282-306`)：
+```python
+def post_search(self, request: SXNG_Request, search: "SearchWithPlugins") -> None:
+    for plugin in [p for p in self.plugin_list if p.id in search.user_plugins]:
+        # 关键词过滤...
+        results = plugin.post_search(request=request, search=search) or []
+        # 框架统一注入结果
+        search.result_container.extend(f"plugin: {plugin.id}", results)
+```
+
+**契约分工**：
+- 插件侧：`Plugin.post_search` **返回**结果列表，不直接操作容器
+- 框架侧：`PluginStorage.post_search` 遍历插件，统一调用 `result_container.extend` 注入结果
+- 注入的结果会被标记 `engine = "plugin: {plugin.id}"`
+
+### 3.3 插件与 Answerer 完整时序
 
 ```
 SearchWithPlugins.search()
     ↓
-pre_search 插件钩子
+pre_search 插件钩子（PluginStorage 遍历调用）
     ├─→ 返回 True → 执行 super().search()
     │        ↓
     │   search_external_bang()
@@ -170,21 +197,23 @@ pre_search 插件钩子
     │
     └─→ 返回 False → 跳过 super().search()，不执行 answerer
     ↓
-post_search 插件钩子  ←─ 无论 pre_search 返回值如何，始终执行
+post_search 插件钩子（PluginStorage 遍历调用）
+    ├─ 每个 Plugin.post_search() 返回结果列表
+    └─ PluginStorage 统一调用 result_container.extend 注入
     ↓
 result_container.close()
     ↓
 返回结果
 ```
 
-### 3.3 pre_search 各分支的契约边界
+### 3.4 pre_search 各分支的契约边界
 
-| pre_search 返回值 | super().search() 执行 | post_search 执行 | answerer 调用 | 插件追加结果的机会 |
+| pre_search 返回值 | super().search() 执行 | post_search 执行 | answerer 调用 | 插件追加结果的机制 |
 |-------------------|----------------------|------------------|---------------|-------------------|
-| `True` | ✅ 执行 | ✅ 执行 | ✅ 可能被调用 | post_search |
-| `False` | ❌ 跳过 | ✅ 执行 | ❌ 不调用 | post_search（仍可追加结果） |
+| `True` | ✅ 执行 | ✅ 执行 | ✅ 可能被调用 | Plugin.post_search 返回结果 → PluginStorage 统一注入 |
+| `False` | ❌ 跳过 | ✅ 执行 | ❌ 不调用 | Plugin.post_search 返回结果 → PluginStorage 统一注入 |
 
-> **契约修正**：`pre_search` 返回 `False` 不会直接终止全流程，仅跳过搜索主体。`post_search` 始终执行，插件仍可在此时追加结果。
+> **契约修正**：`pre_search` 返回 `False` 不会直接终止全流程，仅跳过搜索主体。`post_search` 始终执行，插件仍可通过返回结果列表来追加内容。
 
 ## 四、缓存边界
 
@@ -306,16 +335,16 @@ class AnswerSet:
 
 ### 5.5 契约内并存场景分类
 
-按照 `SearchWithPlugins.search()` 的实际执行顺序，结果并存场景分为以下三类：
+按照 `SearchWithPlugins.search()` 和 `PluginStorage.post_search` 的实际执行顺序，结果并存场景分为以下三类：
 
 | 路径类型 | 场景 | 触发方式 | 契约合规性 |
 |----------|------|----------|------------|
-| **标准路径** | answerer 命中 → 仅显示 answers | 默认流程，`pre_search=True`，answerer 返回结果，`post_search` 不追加 | ✅ 标准 |
-| **扩展路径 A** | answerer 命中 + `post_search` 追加 MainResult | `pre_search=True`，answerer 返回结果，`post_search` 中调用 `result_container.extend()` 追加 | ✅ 框架契约内 |
-| **扩展路径 B** | `pre_search=False` + `post_search` 追加结果 | `pre_search=False` 跳过搜索主体，`post_search` 中追加结果（answerer 未被调用） | ✅ 框架契约内 |
+| **标准路径** | answerer 命中 → 仅显示 answers | `pre_search=True`，answerer 返回结果，所有插件 `post_search` 返回 `None` | ✅ 标准 |
+| **扩展路径 A** | answerer 命中 + 插件 `post_search` 追加结果 | `pre_search=True`，answerer 返回结果，某个插件 `post_search` 返回结果列表，由 `PluginStorage` 统一注入 | ✅ 框架契约内 |
+| **扩展路径 B** | `pre_search=False` + 插件 `post_search` 追加结果 | `pre_search=False` 跳过搜索主体，某个插件 `post_search` 返回结果列表，由 `PluginStorage` 统一注入（answerer 未被调用） | ✅ 框架契约内 |
 | **非标准路径** | answerer 直接返回 MainResult 类型 | answerer 的 `answer()` 方法违反接口声明，返回非 `BaseAnswer` 类型 | ⚠️ 不符合接口契约，不保证兼容 |
 
-> **设计意图**：SearXNG 设计 answerer 短路机制是为了性能优化。如果业务需要同时展示 answer 和传统搜索结果，**必须通过插件机制在 `post_search` 中实现**，这是框架契约内唯一支持的方式。
+> **设计意图**：SearXNG 设计 answerer 短路机制是为了性能优化。如果业务需要同时展示 answer 和传统搜索结果，**必须通过插件的 `post_search` 返回结果列表，由框架统一注入**，这是框架契约内唯一支持的方式。
 
 ## 六、完整执行路径图（按契约分层）
 
@@ -328,7 +357,7 @@ webapp.search() 视图
    ↓
 SearchWithPlugins.search()
    ↓
-plugins.pre_search() → 返回 True
+PluginStorage.pre_search() → 返回 True
    ↓
 Search.search()
    ├─→ search_external_bang() ──(命中)──→ 重定向
@@ -342,7 +371,8 @@ Search.search()
          │     └─ 存入 answers 集合（去重）
          └─(有结果)──→ 短路：跳过 search_standard()
    ↓
-plugins.post_search()  [不追加结果]
+PluginStorage.post_search()
+   └─→ 所有插件 post_search 返回 None → 无结果注入
    ↓
 result_container.close()
    ↓
@@ -350,7 +380,7 @@ result_container.close()
    └─ 仅显示 answers 区域（顶部）
 ```
 
-### 6.2 扩展路径 A（Answerer 命中 + post_search 插件追加）
+### 6.2 扩展路径 A（Answerer 命中 + 插件 post_search 追加）
 
 ```
 用户查询
@@ -359,21 +389,23 @@ webapp.search() 视图
    ↓
 SearchWithPlugins.search()
    ↓
-plugins.pre_search() → 返回 True
+PluginStorage.pre_search() → 返回 True
    ↓
 Search.search()
    └─→ search_answerers() 命中
          └─→ 存入 answers 集合  [仅 BaseAnswer 类型]
    ↓
-plugins.post_search()
-   └─→ 插件主动调用 result_container.extend(engine_name, [MainResult...])
+PluginStorage.post_search()
+   ├─→ 遍历插件，调用 Plugin.post_search()
+   │     └─→ 某个插件返回 [MainResult, ...]
+   └─→ PluginStorage 调用 result_container.extend("plugin: id", results)
          └─→ 主结果存入 main_results_map
    ↓
 result_container.close()
    ↓
 模板渲染
-   ├─ answers 区域（顶部）
-   └─ 主结果列表（插件追加的结果）
+   ├─ answers 区域（顶部，来自 answerer）
+   └─ 主结果列表（来自插件 post_search，由框架统一注入）
 ```
 
 ### 6.3 扩展路径 B（pre_search=False + post_search 追加）
@@ -385,20 +417,22 @@ webapp.search() 视图
    ↓
 SearchWithPlugins.search()
    ↓
-plugins.pre_search() → 返回 False
+PluginStorage.pre_search() → 返回 False
    ↓
 [跳过 super().search()]  ←─ answerer 未被调用，search_standard 也未执行
    ↓
-plugins.post_search()
-   └─→ 插件主动调用 result_container.extend() 追加结果
+PluginStorage.post_search()
+   ├─→ 遍历插件，调用 Plugin.post_search()
+   │     └─→ 某个插件返回 [BaseAnswer, MainResult, ...]
+   └─→ PluginStorage 调用 result_container.extend("plugin: id", results)
          ├─→ BaseAnswer 存入 answers 集合
          └─→ MainResult 存入 main_results_map
    ↓
 result_container.close()
    ↓
 模板渲染
-   ├─ answers 区域（插件追加的 answer）
-   └─ 主结果列表（插件追加的结果）
+   ├─ answers 区域（来自插件 post_search）
+   └─ 主结果列表（来自插件 post_search）
 ```
 
 ### 6.4 非标准路径（Answerer 违反接口契约）
@@ -408,14 +442,14 @@ result_container.close()
    ↓
 SearchWithPlugins.search()
    ↓
-plugins.pre_search() → 返回 True
+PluginStorage.pre_search() → 返回 True
    ↓
 Search.search()
    └─→ search_answerers()
          └─→ Answerer.answer()  [违反契约：返回 MainResult 而非 BaseAnswer]
                └─→ ResultContainer.extend() 中进入 _merge_main_result 分支
    ↓
-plugins.post_search()
+PluginStorage.post_search()
    ↓
 result_container.close()
    ↓
@@ -435,7 +469,8 @@ result_container.close()
 | **标准契约** | answerer 接口返回类型为 `list[BaseAnswer]` | `searx/answerers/_core.py:50` |
 | **标准契约** | answerer 结果存入 `answers` 集合，与主结果分离 | `searx/results.py:99-100` |
 | **扩展契约** | `pre_search=False` 仍执行 `post_search` | `searx/search/__init__.py:203-206` |
-| **扩展契约** | `post_search` 是框架内唯一可追加结果的合法扩展点 | `searx/search/__init__.py:206` |
+| **扩展契约** | 插件 `post_search` **返回**结果列表，不直接操作容器 | `searx/plugins/_core.py:169-175` |
+| **扩展契约** | `PluginStorage.post_search` 统一调用 `result_container.extend` 注入 | `searx/plugins/_core.py:282-306` |
 | **缓存契约** | 主搜索链路无缓存，answerer 缓存为内部实现 | 主流程无缓存调用 |
 | **非标准** | answerer 返回 `MainResult` 可工作但违反接口 | 依赖 `ResultContainer.extend()` 的宽松处理 |
 
@@ -444,8 +479,9 @@ result_container.close()
 1. **短路优化优先**：Answerer 命中后跳过传统搜索，显著降低延迟和网络请求
 2. **接口契约明确**：Answerer 应严格返回 `BaseAnswer` 类型结果
 3. **结果隔离展示**：Answer 与传统搜索结果分开展示，避免干扰
-4. **插件扩展唯一**：`post_search` 是框架契约内追加结果的唯一合法路径
-5. **pre_search 边界清晰**：`pre_search=False` 仅跳过搜索主体，不阻断 `post_search`
-6. **缓存边界清晰**：主搜索链路不做查询结果缓存，Answerer 按需自主实现局部缓存
-7. **可扩展性**：通过新增 `searx/answerers/` 下的模块即可扩展 answerer
-8. **互斥默认，扩展灵活**：默认 answerer 与传统检索互斥，特殊需求通过插件机制实现
+4. **插件扩展唯一**：`post_search` 返回结果是框架契约内追加结果的唯一合法方式
+5. **插件与框架分工清晰**：插件返回结果，`PluginStorage` 统一注入容器
+6. **pre_search 边界清晰**：`pre_search=False` 仅跳过搜索主体，不阻断 `post_search`
+7. **缓存边界清晰**：主搜索链路不做查询结果缓存，Answerer 按需自主实现局部缓存
+8. **可扩展性**：通过新增 `searx/answerers/` 下的模块即可扩展 answerer
+9. **互斥默认，扩展灵活**：默认 answerer 与传统检索互斥，特殊需求通过插件机制实现
