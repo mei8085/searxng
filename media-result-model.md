@@ -23,7 +23,7 @@
 | `iframe_src` | `str` | `""` | 视频 | 视频嵌入播放器URL |
 | `audio_src` | `str` | `""` | 音频 | 音频源URL |
 | `publishedDate` | `datetime` | `None` | 图片/视频 | 发布日期（datetime 对象，用于模板显示文本） |
-| `pubdate` | `str` | `""` | 图片/视频 | 发布日期字符串（格式 `%Y-%m-%d %H:%M:%S%z`，用于 `<time datetime="">` 属性） |
+| `pubdate` | `str` | `""` | 图片/视频 | 发布日期字符串（由 `_normalize_date_fields()` 派生，strftime 格式 `%Y-%m-%d %H:%M:%S%z`，用于 `<time datetime="">` 属性） |
 | `length` | `timedelta` | `None` | 视频 | 视频时长 |
 | `views` | `str` | `""` | 视频 | 观看次数（人性化格式） |
 | `author` | `str` | `""` | 图片/视频 | 作者/创作者 |
