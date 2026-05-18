@@ -129,12 +129,14 @@ def secret_hash(name: str):
 
 ### 2.5 窗口配置总览
 
-| 窗口类型 | 时间窗口 | 正常阈值 | 可疑阈值 | 用途 |
-|---------|---------|---------|---------|-----|
-| BURST_WINDOW | 20秒 | 15次 | 2次 | 防止突发请求 |
-| LONG_WINDOW | 600秒（10分钟） | 150次 | 10次 | 防止持续请求 |
-| API_WINDOW | 3600秒（1小时） | 4次 | - | API 请求限制 |
-| SUSPICIOUS_IP_WINDOW | 2592000秒（30天） | 3次 | - | 可疑 IP 长期限制 |
+| 窗口类型 | 时间窗口 | 正常阈值 | 可疑阈值 | 适用范围 | 用途 |
+|---------|---------|---------|---------|---------|-----|
+| BURST_WINDOW | 20秒 | 15次 | 2次 | /search 路径 | 防止突发请求 |
+| LONG_WINDOW | 600秒（10分钟） | 150次 | 10次 | /search 路径 | 防止持续请求 |
+| API_WINDOW | 3600秒（1小时） | 4次 | - | /search 路径且 format != html | API 请求限制 |
+| SUSPICIOUS_IP_WINDOW | 2592000秒（30天） | 3次 | - | /search 路径且 link_token 启用 | 可疑 IP 长期限制 |
+
+> **重要说明**：所有限流窗口仅在 `/search` 路径下生效。非 `/search` 路径（如首页、静态资源等）不会进入 `ip_limit.filter_request`，因此不会触发任何计数。
 
 **阈值硬编码位置**: `searx/botdetection/ip_limit.py:61-89`
 
