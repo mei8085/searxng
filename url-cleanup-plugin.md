@@ -6,7 +6,7 @@ SearXNG 的 URL 清理类插件基于统一的插件框架实现，核心注册�
 
 ### 1.1 插件基类与接口
 
-所有 URL 清理插件均继承自 `Plugin` 抽象基类（`searx/plugins/_core.py:68），通过实现 `on_result` 钩子介入搜索结果处理流程。插件必须实现以下核心要素：
+所有 URL 清理插件均继承自 `Plugin` 抽象基类（`searx/plugins/_core.py:68`），通过实现 `on_result` 钩子介入搜索结果处理流程。插件必须实现以下核心要素：
 
 - **类定义**：继承 `Plugin` 类，定义唯一 `id` 标识
 - **配置加载**：在 `settings.yml` 中声明插件的完整类路径和激活状态
@@ -41,7 +41,7 @@ plugins:
 
 ### 2.1 tracker_url_remover 插件
 
-**数据源**：ClearURLs 规则库（`searx/data/tracker_patterns.py:31-36）
+**数据源**：ClearURLs 规则库（`searx/data/tracker_patterns.py:31-36`）
 
 匹配维度：
 
@@ -51,19 +51,19 @@ RuleType = tuple[str, list[str], list[str]]
 # 即: (url_regexp, url_ignore, del_args)
 ```
 
-1. **URL 模式匹配** (`url_regexp) - 正则表达式匹配整个 URL
+1. **URL 模式匹配** (`url_regexp`) - 正则表达式匹配整个 URL
 2. **例外排除** (`url_ignore`) - 匹配此正则的 URL 跳过处理
 3. **参数删除** (`del_args`) - 匹配此正则的查询参数名被移除
 
 ```python
 # 匹配流程 (tracker_patterns.py:121-171)
 for rule in self.rules():
-    if re.match(rule[url_regexp], new_url):       # 1. URL 匹配
+    if re.match(rule[url_regexp], new_url):           # 1. URL 匹配
         if re.match(exception, new_url):              # 2. 例外检查
             continue
         for name, val in query_args:
-            if re.match(pattern, name):            # 3. 参数名匹配
-                query_args.remove((name, val))       # 4. 删除参数
+            if re.match(pattern, name):               # 3. 参数名匹配
+                query_args.remove((name, val))        # 4. 删除参数
 ```
 
 ### 2.2 hostnames 插件
@@ -87,7 +87,7 @@ for pattern, replacement in REPLACE.items():
 
 ### 2.3 oa_doi_rewrite 插件
 
-匹配维度基于**DOI 模式匹配**（`oa_doi_rewrite.py:70-81）：
+匹配维度基于**DOI 模式匹配**（`oa_doi_rewrite.py:70-81`）：
 
 ```python
 regex = re.compile(r'10\.\d{4,9}/[^\s]+')
@@ -100,7 +100,7 @@ def extract_doi(url):
 
 ## 三、被改写字段的范围
 
-所有 URL 清理插件通过 `result.filter_urls() 方法统一处理 URL 字段。在 `searx/result_types/_base.py:111-216` 中定义了完整的字段遍历逻辑。
+所有 URL 清理插件通过 `result.filter_urls()` 方法统一处理 URL 字段。在 `searx/result_types/_base.py:111-216` 中定义了完整的字段遍历逻辑。
 
 ### 3.1 主 URL 字段（一级字段）
 
@@ -151,119 +151,226 @@ if field_name == "url":
 
 ## 四、插件执行顺序与互相覆盖问题
 
-### 4.1 执行顺序的不确定性
+### 4.1 执行顺序的核心机制
 
-**核心问题**：`PluginStorage.plugin_list` 是一个 `set` 集合（`_core.py:195`），集合的迭代顺序是不确定的。
+#### 4.1.1 数据结构分析
+
+**关键事实**：`PluginStorage.plugin_list` 是一个 `set` 集合（`_core.py:199`），而非有序列表。
 
 ```python
 class PluginStorage:
-    plugin_list: set[Plugin]  # 无序集合
+    def __init__(self):
+        self.plugin_list = set()  # 无序集合
+    
+    def __iter__(self) -> Generator[Plugin]:
+        yield from self.plugin_list  # 按 set 迭代顺序返回
 ```
 
-在 `on_result` 钩子调用时（`_core.py:267-280`），插件按集合迭代顺序执行：
+#### 4.1.2 执行顺序的真实逻辑
+
+在 `on_result` 钩子调用时（`_core.py:267-280`），执行顺序完全由 set 的迭代顺序决定：
 
 ```python
 def on_result(self, request, search, result):
     ret = True
+    # 注意：这里遍历的是 self.plugin_list（set），然后过滤 user_plugins
+    # 执行顺序 = set 迭代顺序，与 user_plugins 列表顺序无关
     for plugin in [p for p in self.plugin_list if p.id in search.user_plugins]:
-        ret = bool(plugin.on_result(request=request, search=search, result=result)
+        ret = bool(plugin.on_result(request=request, search=search, result=result))
         if not ret:
             break
     return ret
 ```
 
-### 4.2 互相覆盖的风险场景
+#### 4.1.3 user_plugins 的真实作用
+
+`user_plugins` 列表仅用于**启用/禁用过滤**，不决定执行顺序：
+
+```python
+# webapp.py:512-518
+sxng_request.user_plugins = []
+allowed_plugins = preferences.plugins.get_enabled()
+disabled_plugins = preferences.plugins.get_disabled()
+for plugin in searx.plugins.STORAGE:  # 遍历 set，顺序不确定
+    if (plugin.id not in disabled_plugins) or plugin.id in allowed_plugins:
+        sxng_request.user_plugins.append(plugin.id)  # 顺序与 set 一致
+```
+
+### 4.2 前稿表述修正
+
+**❌ 错误表述**："在 settings.yml 中按期望的执行顺序声明插件（依赖 Python 3.7+ dict 有序特性）"
+
+**✅ 正确表述**：配置文件中插件的声明顺序不能稳定控制执行顺序。虽然 Python 3.7+ 的 dict 是有序的，`load_settings` 也按配置顺序加载插件，但插件被 `add` 到 `set` 后，顺序就丢失了。set 的迭代顺序取决于对象哈希值和内部存储结构，跨进程/重启可能发生变化。
+
+### 4.3 互相覆盖的风险场景
 
 当多个插件修改同一个 URL 字段时，**后执行的插件会覆盖先执行插件的修改**。
 
-**风险场景示例：
+**风险场景示例**：
 
-1. **tracker_url_remover 与 hostnames 冲突：
-   - 先 hostnames 先执行：youtube.com → invidious.example.com
-   - tracker_url_remover 后执行：可能无法匹配 invidious 的规则（因为规则是针对 youtube.com 的）
+1. **tracker_url_remover 与 hostnames 冲突**：
+   - hostnames 先执行：`youtube.com` → `invidious.example.com`
+   - tracker_url_remover 后执行：可能无法匹配 invidious 的规则（因为 ClearURLs 规则是针对 youtube.com 的）
+   - 结果：追踪参数残留
 
-2. **hostnames 与 oa_doi_rewrite 冲突：
-   - 先 hostnames 把 doi.org → 其他域名
-   - 后 oa_doi_rewrite 无法识别 DOI 路径
+2. **hostnames 与 oa_doi_rewrite 冲突**：
+   - hostnames 先执行：`doi.org` → 自定义镜像域名
+   - oa_doi_rewrite 后执行：无法识别 DOI 路径（因为 DOI 正则匹配基于原始 doi.org 路径）
+   - 结果：DOI 重定向失败
 
-3. **多个插件修改同一个 URL：
-   - 插件 A 修改 url 为 A'
-   - 插件 B 基于原始 url 修改为 B'
-   - 最终结果取决于执行顺序
+3. **多个插件修改同一个 URL**：
+   - 插件 A 修改 `url` 为 A'
+   - 插件 B 修改 `url` 为 B'（基于原始值）
+   - 最终结果取决于执行顺序，可能不符合预期
 
-### 4.3 推荐的执行顺序安排
+### 4.4 推荐的执行顺序原则
 
 为避免互相覆盖，应遵循以下原则：
 
-#### 原则 1：**先清理参数，后重写域名
+#### 原则 1：先清理参数，后重写域名
 
-推荐顺序：
+**推荐逻辑顺序**：
 ```
 tracker_url_remover → hostnames → oa_doi_rewrite
 ```
 
-原因：
-- tracker_url_remover 基于原始域名匹配追踪参数
-- hostnames 基于清理后的 URL 重写域名
-- oa_doi_rewrite 最后处理 DOI 重定向
+**原因**：
+- tracker_url_remover 基于原始域名匹配追踪参数（ClearURLs 规则针对原始域名）
+- hostnames 基于清理后的 URL 重写域名（避免重写后参数无法匹配）
+- oa_doi_rewrite 最后处理 DOI 重定向（基于已清理的 URL）
 
-#### 原则 2：**移除类插件优先执行
+#### 原则 2：移除类逻辑优先执行
 
 如果有插件会移除结果（如 hostnames 的 REMOVE 规则），应优先执行，避免无效处理即将被移除的结果。
 
-#### 原则 3：**在 filter_func 中避免假设原始 URL
+#### 原则 3：在 filter_func 中避免假设原始 URL
 
 插件的 filter_func 签名为：
 ```python
 def filter_url_field(result, field_name, url_src) -> bool | str:
 ```
 
-`url_src` 是**当前字段的值（可能已被之前插件修改过）。如果插件需要基于原始 URL 匹配，应在 `on_result` 中保存原始值。
+`url_src` 是**当前字段的值**（可能已被之前插件修改过）。如果插件需要基于原始 URL 匹配，应在 `on_result` 中保存原始值。
 
-#### 原则 4：**幂等性设计
+#### 原则 4：幂等性设计
 
 每个插件的 filter_func 应设计为幂等的，多次调用结果一致。
 
-### 4.4 执行顺序的控制方法
+### 4.5 当前实现下可落地的顺序管理方案
 
-**当前代码限制**：SearXNG 插件框架不支持显式的插件优先级配置。
+#### 方案 A：组合插件模式（推荐，零框架修改）
 
-**可行的控制方案：
+**原理**：创建一个统一的 URL 清理管道插件，内部按确定顺序调用多个清理逻辑。
 
-方案 A：**配置文件顺序控制
+**实现步骤**：
+1. 禁用原有独立插件
+2. 创建新的组合插件
+3. 内部按顺序执行清理逻辑
 
-在 `settings.yml` 中按期望的执行顺序声明插件（依赖 Python 3.7+ dict 有序特性）：
-```yaml
-plugins:
-  searx.plugins.tracker_url_remover.SXNGPlugin:  # 1. 先清理参数
-    active: true
-  searx.plugins.hostnames.SXNGPlugin:            # 2. 再重写域名
-    active: true
-  searx.plugins.oa_doi_rewrite.SXNGPlugin:  # 3. 最后 DOI 重定向
-    active: false
-```
-
-方案 B：**单一组合插件**
-
-创建一个组合插件，内部按顺序调用多个清理逻辑：
+**代码示例**：
 ```python
+from searx.plugins import Plugin, PluginInfo
+from searx.data import TRACKER_PATTERNS
+from searx.plugins.hostnames import filter_url_field as hostnames_filter
+from searx.plugins.oa_doi_rewrite import filter_url_field as doi_filter
+
 class URLCleanupPipeline(Plugin):
+    id = "url_cleanup_pipeline"
+    
     def on_result(self, request, search, result):
+        # 1. 先清理追踪参数
         result.filter_urls(self._clean_trackers)
-        result.filter_urls(self._rewrite_hostnames)
-        result.filter_urls(self._rewrite_doi)
+        # 2. 再重写主机名
+        result.filter_urls(hostnames_filter)
+        # 3. 最后 DOI 重定向
+        result.filter_urls(doi_filter)
+        return True
+    
+    def _clean_trackers(self, result, field_name, url_src):
+        if not url_src:
+            return True
+        return TRACKER_PATTERNS.clean_url(url=url_src)
 ```
 
-方案 C：**在 filter_func 中检查前置条件
+**优点**：
+- 执行顺序 100% 可控
+- 无需修改框架代码
+- 可灵活调整顺序和添加自定义清理逻辑
+- 性能最优（一次遍历所有字段即可完成多项清理，可优化为单次遍历）
 
-每个插件的 filter_func 检查字段是否已被修改：
+#### 方案 B：修改框架支持有序插件列表（需修改核心代码）
+
+**原理**：将 `plugin_list` 从 `set` 改为 `list`，保持配置顺序。
+
+**修改点**：
 ```python
-def filter_url_field(result, field_name, url_src):
-    # 检查 url_src 是否已被其他插件修改
-    original_url = result.get("original_url")
-    if original_url and original_url != url_src:
-        return True  # 跳过已修改的 URL
+# searx/plugins/_core.py:195
+class PluginStorage:
+    # plugin_list: set[Plugin]  # 改为 list
+    plugin_list: list[Plugin]    # 有序列表
+    
+    def register(self, plugin: Plugin):
+        # 查重逻辑保留
+        if plugin.id in [p.id for p in self.plugin_list]:
+            raise KeyError(f"name collision '{plugin.id}'")
+        # self.plugin_list.add(plugin)  # 改为 append
+        self.plugin_list.append(plugin)
 ```
+
+**优点**：
+- 配置文件顺序直接决定执行顺序
+- 无需修改业务插件
+
+**缺点**：
+- 需要修改框架核心代码
+- 可能影响依赖 set 特性的其他逻辑（如去重、成员判断等）
+- 需要充分测试
+
+#### 方案 C：基于 user_plugins 顺序的执行调度（需修改框架代码）
+
+**原理**：修改 `on_result` 等调度方法，按 `user_plugins` 列表顺序执行。
+
+**修改点**：
+```python
+# searx/plugins/_core.py:270
+def on_result(self, request, search, result):
+    ret = True
+    # 改为按 user_plugins 顺序执行
+    plugin_map = {p.id: p for p in self.plugin_list}
+    for plugin_id in search.user_plugins:
+        plugin = plugin_map.get(plugin_id)
+        if not plugin:
+            continue
+        try:
+            ret = bool(plugin.on_result(request=request, search=search, result=result))
+        except Exception:
+            plugin.log.exception("Exception while calling on_result")
+            continue
+        if not ret:
+            break
+    return ret
+```
+
+**优点**：
+- 用户偏好设置中的插件顺序决定执行顺序
+- 更灵活的用户控制
+
+**缺点**：
+- 需要修改框架核心代码
+- `user_plugins` 列表当前也是按 set 顺序构建的，需要一并修改
+
+### 4.6 方案对比与选型建议
+
+| 方案 | 可靠性 | 实现成本 | 可维护性 | 推荐场景 |
+|------|--------|----------|----------|----------|
+| A. 组合插件 | ⭐⭐⭐⭐⭐ | 低（新增插件） | ⭐⭐⭐⭐ | 生产环境、快速落地 |
+| B. 改为 list | ⭐⭐⭐⭐ | 中（修改核心） | ⭐⭐⭐ | 愿意维护 fork 版本 |
+| C. 按 user_plugins | ⭐⭐⭐ | 高（修改核心+偏好） | ⭐⭐ | 需要用户级顺序控制 |
+
+**首选推荐**：方案 A（组合插件模式）
+- 零框架侵入，不影响原有插件生态
+- 执行顺序完全可控，可随时调整
+- 可在组合插件中添加日志、调试、监控等增强功能
 
 ## 五、完整链路时序图
 
@@ -272,30 +379,30 @@ def filter_url_field(result, field_name, url_src):
     ↓
 SearchWithPlugins.search()
     ↓
-pre_search 钩子（所有插件）
+pre_search 钩子（所有插件，按 set 顺序）
     ↓
 引擎搜索，产生结果
     ↓
 结果进入 ResultContainer
     ↓
-on_result 钩子（按 plugin_list 顺序）
-    ├─→ tracker_url_remover.on_result()
+on_result 钩子（按 plugin_list set 顺序）
+    ├─→ 【顺序不确定】tracker_url_remover.on_result()
     │     └─→ result.filter_urls(filter_url_field)
     │           ├─→ 遍历 url, iframe_src, img_src, ...
     │           ├─→ 遍历 infobox urls
     │           └─→ 遍历 infobox attributes
     │           └─→ TRACKER_PATTERNS.clean_url()
     │
-    ├─→ hostnames.on_result()
+    ├─→ 【顺序不确定】hostnames.on_result()
     │     ├─→ 检查主 URL 是否匹配 REMOVE
     │     └─→ result.filter_urls(filter_url_field)
     │           └─→ 主机名重写
     │
-    └─→ oa_doi_rewrite.on_result()
+    └─→ 【顺序不确定】oa_doi_rewrite.on_result()
           └─→ result.filter_urls(filter_url_field)
                 └─→ 仅处理 url 字段
     ↓
-post_search 钩子（所有插件）
+post_search 钩子（所有插件，按 set 顺序）
     ↓
 结果返回
 ```
@@ -310,5 +417,78 @@ post_search 钩子（所有插件）
 | 追踪模式数据库 | `searx/data/tracker_patterns.py:26-176` |
 | hostnames 插件 | `searx/plugins/hostnames.py:110-200` |
 | oa_doi_rewrite | `searx/plugins/oa_doi_rewrite.py:45-89` |
-| 插件执行调度 | `searx/plugins/_core.py:267-280` |
+| 插件执行调度（关键） | `searx/plugins/_core.py:267-280` |
+| plugin_list 定义 | `searx/plugins/_core.py:198-199` |
+| user_plugins 构建 | `searx/webapp.py:512-518` |
 | 搜索结果钩子 | `searx/search/__init__.py:198-199` |
+
+## 七、附录：可落地的组合插件完整实现
+
+以下是一个可直接使用的 URL 清理管道插件示例：
+
+```python
+# searx/plugins/url_cleanup_pipeline.py
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+import typing as t
+from flask_babel import gettext
+from searx.plugins import Plugin, PluginInfo
+from searx.data import TRACKER_PATTERNS
+from searx.plugins.hostnames import filter_url_field as hostnames_filter
+from searx.plugins.oa_doi_rewrite import filter_url_field as doi_filter
+
+if t.TYPE_CHECKING:
+    import flask
+    from searx.search import SearchWithPlugins
+    from searx.extended_types import SXNG_Request
+    from searx.result_types import Result, LegacyResult
+    from searx.plugins import PluginCfg
+
+
+class SXNGPlugin(Plugin):
+    """统一的 URL 清理管道，按确定顺序执行多个清理逻辑"""
+
+    id = "url_cleanup_pipeline"
+
+    def __init__(self, plg_cfg: "PluginCfg") -> None:
+        super().__init__(plg_cfg)
+        self.info = PluginInfo(
+            id=self.id,
+            name=gettext("URL Cleanup Pipeline"),
+            description=gettext("Unified URL cleanup with controlled execution order"),
+            preference_section="privacy",
+        )
+
+    def init(self, app: "flask.Flask") -> bool:
+        TRACKER_PATTERNS.init()
+        return True
+
+    def on_result(self, request: "SXNG_Request", search: "SearchWithPlugins", result: "Result") -> bool:
+        # 执行顺序：清理参数 → 重写主机名 → DOI 重定向
+        result.filter_urls(self._clean_trackers)
+        result.filter_urls(hostnames_filter)
+        result.filter_urls(doi_filter)
+        return True
+
+    @classmethod
+    def _clean_trackers(cls, result: "Result|LegacyResult", field_name: str, url_src: str) -> bool | str:
+        if not url_src:
+            return True
+        return TRACKER_PATTERNS.clean_url(url=url_src)
+```
+
+**配置方式**：
+```yaml
+plugins:
+  # 禁用原有独立插件
+  searx.plugins.tracker_url_remover.SXNGPlugin:
+    active: false
+  searx.plugins.hostnames.SXNGPlugin:
+    active: false  # 如果需要主机名重写功能，可保留或在管道中集成
+  searx.plugins.oa_doi_rewrite.SXNGPlugin:
+    active: false
+  
+  # 启用统一管道插件
+  searx.plugins.url_cleanup_pipeline.SXNGPlugin:
+    active: true
+```
