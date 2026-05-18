@@ -1,12 +1,12 @@
-# SearxNG 搜索结果渲染上下文深度分析（严谨补证版）
+# SearxNG 搜索结果渲染上下文深度分析（严谨补证版 v2）
 
 ## 概述
 
 本文档对 SearxNG 后端搜索结果渲染上下文进行严谨化分析，重点修正和补充：
-- 即时答案短路的边界条件（限定在常规引擎检索阶段，后置插件仍可改写）
-- 结果对象构建层的字段约束与失效条件
-- 字段缺失时的三级行为分类：**对象失效** / **显示占位** / **渲染降级**
-- 可复核的判定准则
+- **pre_search 短路语义修正**：与源码执行语义完全对齐
+- **post_search 插件全覆盖**：纳入 hash_plugin，明确各插件在命中条件下的行为
+- **图像结果 parsed_url 判定修正**：区分 hash 豁免与模板字段必需性
+- **异常传播链路**：结果对象抛错后在处理器层被捕获并转成引擎异常信号的完整链路
 
 ---
 
@@ -28,16 +28,27 @@ class SearchWithPlugins(Search):
         return self.result_container
 ```
 
+**源码语义的精确解读**：
+- `pre_search` 返回 `True` → 继续执行 `super().search()`
+- `pre_search` 返回 `False` → **跳过整个 `super().search()`**（包括 bang、answerers 和常规引擎）
+- **无论如何**，`post_search` 和 `result_container.close()` 始终执行
+
 **短路边界的精确定义**：
 
 | 阶段 | 是否可被短路 | 短路条件 | 始终执行 |
 |------|-------------|----------|---------|
 | `pre_search` 插件 | ❌ 否 | - | ✅ 始终执行 |
-| 外部 bang 检查 | ✅ 是 | 匹配到 bang 语法 | ❌ |
-| Answerers 内部答案 | ✅ 是 | `search_answerers()` 返回非空 | ❌ |
-| 常规引擎检索 | ✅ 是 | 前两者任一命中 | ❌ |
+| 外部 bang 检查 | ✅ 是 | `pre_search` 未阻止 + 匹配到 bang 语法 | ❌ |
+| Answerers 内部答案 | ✅ 是 | `pre_search` 未阻止 + `search_answerers()` 返回非空 | ❌ |
+| 常规引擎检索 | ✅ 是 | 前三者任一阻止或命中 | ❌ |
 | `post_search` 插件 | ❌ 否 | - | ✅ 始终执行 |
 | `result_container.close()` | ❌ 否 | - | ✅ 始终执行 |
+
+**pre_search 短路的代码证据**：`searx/search/__init__.py:203-204`
+```python
+if searx.plugins.STORAGE.pre_search(self.request, self):  # 返回 True 才进入
+    super().search()                                      # 返回 False 则整个跳过
+```
 
 ### 1.2 Answerers 短路的代码证据
 
@@ -57,13 +68,22 @@ def search(self) -> ResultContainer:
 - `if` 条件不满足，**直接跳过 `search_standard()`**
 - 但 `post_search` 插件在 `super().search()` 返回后仍会执行
 
-### 1.3 后置插件改写上下文的能力
+### 1.3 post_search 插件全覆盖分析
 
 **文件位置**：`searx/plugins/_core.py:282-306`
 
 ```python
 def post_search(self, request: SXNG_Request, search: "SearchWithPlugins") -> None:
+    keyword = None
+    for keyword in search.search_query.query.split():
+        if keyword:
+            break
+    
     for plugin in [p for p in self.plugin_list if p.id in search.user_plugins]:
+        if plugin.keywords:
+            # 有关键词的插件：仅当查询首词匹配时执行
+            if keyword and keyword not in plugin.keywords:
+                continue
         try:
             results = plugin.post_search(request=request, search=search) or []
         except Exception:
@@ -73,36 +93,38 @@ def post_search(self, request: SXNG_Request, search: "SearchWithPlugins") -> Non
         search.result_container.extend(f"plugin: {plugin.id}", results)
 ```
 
-**实际生效的后置插件**：
+**所有 post_search 插件的完整清单**：
 
-| 插件 | 功能 | 可添加的结果类型 |
-|------|------|-----------------|
-| `unit_converter` | 单位转换 | `Answer`（即时答案） |
-| `tor_check` | Tor 出口节点检测 | `Answer`（即时答案） |
-| `time_zone` | 时区查询 | `Answer`（即时答案） |
-| `self_info` | 实例自信息 | 多种结果类型 |
+| 插件 | 关键词 | 命中条件 | 新增结果类型 |
+|------|--------|---------|-------------|
+| `unit_converter` | 无关键词 | 查询含 "in", "to", "=", "->" 等转换关键词 | ✅ `Answer`（即时答案） |
+| `tor_check` | `["tor", "tor check"]` | 查询首词为 "tor" 或 "tor" 且 pageno=1 | ✅ `Answer`（即时答案） |
+| `time_zone` | `["time", "date", "tz", "timezone"]` | 查询首词匹配且 pageno=1 | ✅ `Answer`（即时答案） |
+| `self_info` | `["ip", "user-agent"]` | 查询首词为 "ip" 或 "user-agent" 且 pageno=1 | ✅ `Answer`（即时答案） |
+| `hash_plugin` | `["md5", "sha1", "sha224", "sha256", "sha384", "sha512"]` | 查询首词为 hash 算法名且 pageno=1 | ✅ `Answer`（即时答案） |
 
-**边界修正结论**：
-> 即时答案的短路仅限定在**常规引擎检索阶段**（`search_standard()`）。`post_search` 插件始终执行，可通过 `result_container.extend()` 向上下文中添加新的结果、答案或信息盒，改写最终的渲染上下文。
-
-### 1.4 pre_search 的独立短路能力
-
-**文件位置**：`searx/plugins/_core.py:253-265`
-
+**hash_plugin 证据**：`searx/plugins/hash_plugin.py:41-66`
 ```python
-def pre_search(self, request: SXNG_Request, search: "SearchWithPlugins") -> bool:
-    for plugin in [...]:
-        ret = bool(plugin.pre_search(request=request, search=search))
-        if not ret:
-            break  # 第一个返回 False 的插件终止整个搜索
-    return ret
+def post_search(self, request, search) -> EngineResults:
+    results = EngineResults()
+    if search.search_query.pageno > 1:
+        return results
+    
+    m = self.parser_re.match(search.search_query.query)  # 匹配 "md5 xxx" 格式
+    if not m:
+        return results
+    
+    # ... hash 计算 ...
+    results.add(results.types.Answer(answer=answer))  # 新增即时答案
+    return results
 ```
 
-**独立短路**：`pre_search` 返回 `False` 时，**跳过整个搜索流程**（包括 bang、answerers 和常规引擎），但 `post_search` 仍会执行。
+**边界修正结论**：
+> 即时答案的短路仅限定在**常规引擎检索阶段**（`search_standard()`）。`post_search` 插件始终执行，上述 5 个插件在命中条件下均可通过 `result_container.extend()` 向上下文中添加新的答案或结果，改写最终的渲染上下文。
 
 ---
 
-## 2. 结果对象构建层的字段约束
+## 2. 结果对象构建层的字段约束与异常链路
 
 ### 2.1 对象失效的硬约束：hash 计算
 
@@ -126,7 +148,7 @@ def __hash__(self) -> int:
 ```python
 def __hash__(self) -> int:
     if self.template == "images.html":
-        # 图像结果特殊 hash：不依赖 parsed_url
+        # 图像结果特殊 hash：不依赖 parsed_url，仅需要 url 和 img_src
         return hash(f"{self.template}|{self.url}|{self.img_src}")
     
     if not any(cls in self for cls in ["suggestion", "correction", "infobox", ...]):
@@ -144,7 +166,63 @@ def _merge_main_result(self, result: MainResult | LegacyResult, position: int):
     # ... 后续合并逻辑
 ```
 
-### 2.2 URL 字段规范化流程
+### 2.2 异常传播完整链路
+
+**关键发现**：`ResultContainer.extend()` 调用 `_merge_main_result()` 时**没有捕获** `ValueError` 异常，异常会向上传播到 processor 层被捕获。
+
+**完整链路**：
+
+```
+引擎返回结果列表
+    ↓
+OnlineProcessor.search() [try 块内]
+    ↓
+_extend_container_basic()
+    ↓
+ResultContainer.extend()
+    ↓
+_merge_main_result()
+    ↓
+hash(result) → 抛出 ValueError (parsed_url 为 None)
+    ↓
+异常向上传播
+    ↓
+OnlineProcessor.search() 的 except Exception 捕获 [online.py:280-282]
+    ↓
+handle_exception(result_container, e)
+    ├─ result_container.add_unresponsive_engine(engine_name, "ValueError")
+    ├─ metrics 计数：counter_inc error
+    └─ count_exception 记录异常
+    ↓
+结果未加入 main_results_map，引擎被标记为异常
+```
+
+**代码证据**：`searx/search/processors/online.py:280-282`
+```python
+except Exception as e:  # pylint: disable=broad-except
+    self.handle_exception(result_container, e)  # 转成引擎异常信号
+    self.logger.exception("exception : {0}".format(e))
+```
+
+**handle_exception 实现**：`searx/search/processors/abstract.py:165-191`
+```python
+def handle_exception(self, result_container, exception_or_message, suspend=False):
+    if isinstance(exception_or_message, BaseException):
+        error_message = module_name + exception_class.__qualname__  # 如 "builtins.ValueError"
+    else:
+        error_message = exception_or_message
+    
+    result_container.add_unresponsive_engine(self.engine.name, error_message)
+    counter_inc('engine', self.engine.name, 'search', 'count', 'error')
+    # ... 可选挂起引擎
+```
+
+**最终表现**：
+- 异常结果被丢弃，不进入渲染上下文
+- 该引擎在结果页底部显示为 "unresponsive"，错误信息为 "ValueError"
+- 不影响其他引擎的结果
+
+### 2.3 URL 字段规范化流程
 
 **文件位置**：`searx/result_types/_base.py:38-57`
 
@@ -159,58 +237,18 @@ def _normalize_url_fields(result: "Result | LegacyResult"):
             result.parsed_url = urllib.parse.urlparse(result.url)
     
     if result.parsed_url:
-        # 补全 scheme，重建 url
         result.parsed_url = result.parsed_url._replace(scheme=result.parsed_url.scheme or "http")
         result.url = result.parsed_url.geturl()
 ```
 
 **规范化后状态矩阵**：
 
-| 原始 url | 原始 parsed_url | 规范化后 url | 规范化后 parsed_url | 后续 hash 结果 |
-|---------|----------------|-------------|--------------------|--------------|
-| 有效字符串 | None | 规范化后的 URL | ParseResult 对象 | ✅ 成功 |
-| 非字符串（如 int） | None | `""` | `None` | ❌ ValueError |
-| `None` / `""` | None | 不变 | `None` | ❌ ValueError（非图像结果） |
-| 任意值 | 已设置 | 规范化后的 URL | 补全 scheme 后的 ParseResult | ✅ 成功 |
-
-### 2.3 文本字段规范化
-
-**文件位置**：`searx/result_types/_base.py:85-108`
-
-```python
-def _normalize_text_fields(result: "MainResult | LegacyResult"):
-    if result.title and not isinstance(result.title, str):
-        log.debug("result: invalid type of field 'title': %s", str(result))
-        result.title = str(result)  # 强制转换，永不失效
-    
-    if result.content and not isinstance(result.content, str):
-        result.content = str(result)  # 强制转换，永不失效
-    
-    # 去重空格、去除首尾空白
-    if result.title:
-        result.title = WHITESPACE_REGEX.sub(" ", result.title).strip()
-    if result.content:
-        result.content = WHITESPACE_REGEX.sub(" ", result.content).strip()
-    if result.content == result.title:
-        result.content = ""  # 避免重复
-```
-
-**行为**：始终降级，永不导致对象失效。
-
-### 2.4 日期字段规范化
-
-**文件位置**：`searx/result_types/_base.py:219-225`
-
-```python
-def _normalize_date_fields(result: "MainResult | LegacyResult"):
-    if result.publishedDate:
-        try:
-            result.pubdate = result.publishedDate.strftime('%Y-%m-%d %H:%M:%S%z')
-        except ValueError:
-            result.publishedDate = None  # 降级为 None，不失效
-```
-
-**行为**：异常时降级为 None，永不导致对象失效。
+| 原始 url | 原始 parsed_url | 规范化后 url | 规范化后 parsed_url | 后续 hash 结果 | 异常传播结果 |
+|---------|----------------|-------------|--------------------|--------------|-------------|
+| 有效字符串 | None | 规范化后的 URL | ParseResult 对象 | ✅ 成功 | 正常合并 |
+| 非字符串（如 int） | None | `""` | `None` | ❌ ValueError | 引擎标记为异常 |
+| `None` / `""` | None | 不变 | `None` | ❌ ValueError（非图像） | 引擎标记为异常 |
+| 任意值 | 已设置 | 规范化后的 URL | 补全 scheme 后的 ParseResult | ✅ 成功 | 正常合并 |
 
 ---
 
@@ -220,30 +258,54 @@ def _normalize_date_fields(result: "MainResult | LegacyResult"):
 
 | 行为类型 | 判定依据 | 代码位置 | 结果 |
 |---------|---------|---------|------|
-| **对象失效** | 触发未捕获异常导致结果无法进入结果容器 | `MainResult.__hash__()` 抛出 `ValueError` | 结果被丢弃，不进入渲染上下文 |
+| **对象失效** | hash 计算抛出未捕获异常，向上传播到 processor 被捕获为引擎异常 | `MainResult.__hash__()` 抛出 `ValueError` + `except Exception as e` | 结果被丢弃，引擎标记为 unresponsive |
 | **显示占位** | 模板中有条件判断，字段为空时显示占位符或跳过 | `{% if result.field %}...{% else %}&nbsp;{% endif %}` | 页面显示空白占位或提示文本 |
 | **渲染降级** | 核心增强字段缺失，模板使用备用值或隐藏部分功能 | 如 `{{ result.thumbnail_src or result.img_src }}` | 功能减弱但结果正常显示 |
 
 ### 3.2 对象失效场景清单
 
-**仅有的硬失效条件**：`parsed_url` 为 `None` 且调用 `hash()`
+**硬失效条件**：`parsed_url` 为 `None` 且调用 `hash()`
 
 | 结果类型 | 触发条件 | 失效路径 |
 |---------|---------|---------|
-| 普通 URL 结果（default.html 等） | `url` 缺失 / 类型无效 / 解析失败 → `parsed_url = None` | `_merge_main_result` → `hash(result)` → `ValueError` → 结果未加入 `main_results_map` |
+| 普通 URL 结果（default.html 等） | `url` 缺失 / 类型无效 / 解析失败 → `parsed_url = None` | `_merge_main_result` → `hash(result)` → `ValueError` → processor 捕获 → 引擎标记异常 |
 | 视频结果（videos.html） | 同上 | 同上 |
-| 图像结果（images.html） | ✅ 豁免：hash 不依赖 `parsed_url`，只需要 `url` 和 `img_src` | 永不因 URL 解析失败失效 |
+| 图像结果（images.html） | ✅ hash 豁免：hash 不依赖 `parsed_url`，但 `parsed_url` 仍为模板必需字段 | hash 成功，但模板消费 `parsed_url.netloc` 时可能异常* |
 | 信息盒（infobox） | ✅ 豁免：走独立分支，不经过 `_merge_main_result` | 永不失效 |
 | 建议/纠正 | ✅ 豁免：走独立分支 | 永不失效 |
 
-**图像结果豁免证据**：`searx/result_types/_base.py:527-530`
+*注：图像结果的 `parsed_url` 如果为 None，虽然 hash 计算不会抛错，但模板第 6 行消费 `result.parsed_url.netloc` 时会抛出 `AttributeError`，该异常同样会被 processor 层捕获为引擎异常。
+
+### 3.3 图像结果 parsed_url 的双重判定修正
+
+**之前的矛盾**：hash 豁免 ≠ 模板字段可缺失
+
+**修正后的精确判定**：
+
+| 层面 | parsed_url 状态 | 结果 |
+|------|----------------|------|
+| hash 计算层 | None | ✅ 豁免，不抛 ValueError |
+| 模板消费层（第 6 行） | None | ❌ `result.parsed_url.netloc` 抛出 AttributeError |
+| 最终结果 | None | ❌ 异常传播到 processor，引擎标记为异常 |
+
+**图像结果实际必需字段**：
+- `url` → 用于解析 `parsed_url`，缺失或无效则最终异常
+- `img_src` → hash 必需，缺失则 hash 抛 ValueError
+- `parsed_url` → 模板必需，缺失则模板抛 AttributeError
+
+**图像结果 hash 豁免证据**：`searx/result_types/_base.py:527-530`
 ```python
 if self.template == "images.html":
-    # 图像结果 hash 不依赖 parsed_url
+    # 仅使用 url 和 img_src，不依赖 parsed_url
     return hash(f"{self.template}|{self.url}|{self.img_src}")
 ```
 
-### 3.3 显示占位场景清单
+**但模板仍消费 parsed_url**：`searx/templates/simple/result_templates/images.html:6`
+```jinja
+<span class="url">{{ result.parsed_url.netloc }}</span>
+```
+
+### 3.4 显示占位场景清单
 
 模板中明确使用条件判断，字段为空时显示占位：
 
@@ -269,7 +331,7 @@ if self.template == "images.html":
 | `author` | `result_sub_header` 宏中的条件判断 | 不显示上传者 |
 | `content` | `{% if result.content %}...{% else %}<p class="content empty_element">...</p>{% endif %}` | 显示 "This site did not provide any description." |
 
-### 3.4 渲染降级场景清单
+### 3.5 渲染降级场景清单
 
 核心增强字段缺失，使用备用值或隐藏功能：
 
@@ -285,13 +347,6 @@ if self.template == "images.html":
 |------|---------|---------|
 | `thumbnail` | 宏 `result_header` 中 `{% if result.thumbnail %}...{% endif %}` | 不显示视频缩略图，仅文字链接 |
 | `iframe_src` | `{% if result.iframe_src %}<p class="altlink">...show video...</p>{% endif %}` | 不显示内嵌播放按钮，需跳转外部网站 |
-
-#### 通用降级
-
-| 字段 | 降级逻辑 | 降级表现 |
-|------|---------|---------|
-| `parsed_url` | 由系统自动从 `url` 解析 | 解析失败可能导致对象失效（见 3.2） |
-| `title` | 系统强制转换为字符串 | 始终有值，永不失效 |
 
 ---
 
@@ -374,40 +429,44 @@ if self.template == "images.html":
 
 **文件位置**：`searx/templates/simple/result_templates/images.html`
 
-| 行号 | 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|------|---------|----------|
-| 1 | `result.category` | CSS 类名 | 显示占位 | 可选 |
-| 2 | `result.img_src` | 图片链接目标 | 对象失效* | **必需** |
-| 3 | `result.thumbnail_src` | 缩略图 src（优先） | 渲染降级 | 可选 |
-| 3 | `result.img_src` | 缩略图 src（降级） | 对象失效* | **必需** |
-| 3 | `result.title` | 图片 alt 属性 | 显示占位 | **必需** |
-| 4 | `result.resolution` | 分辨率标签 | 显示占位 | 可选 |
-| 5 | `result.title` | 图片标题显示 | 显示占位 | **必需** |
-| 6 | `result.parsed_url.netloc` | 来源域名 | 对象失效 | **必需** |
-| 12 | `result.img_src` | 详情面板原图链接 | 对象失效* | **必需** |
-| 13 | `result.img_src` | 详情面板原图 src | 对象失效* | **必需** |
-| 13 | `result.title` | 详情面板 alt 属性 | 显示占位 | **必需** |
-| 16 | `result.title` | 详情面板标题 | 显示占位 | **必需** |
-| 17 | `result.content` | 详情面板描述 | 显示占位 | 可选 |
-| 19 | `result.author` | 详情面板作者 | 显示占位 | 可选 |
-| 20 | `result.resolution` | 详情面板分辨率 | 显示占位 | 可选 |
-| 21 | `result.img_format` | 详情面板格式 | 显示占位 | 可选 |
-| 22 | `result.filesize` | 详情面板文件大小 | 显示占位 | 可选 |
-| 23 | `result.source` | 详情面板来源 | 显示占位 | 可选 |
-| 24 | `result.engine` | 详情面板引擎 | 显示占位 | **必需** |
-| 25 | `result.url` | 详情面板来源链接 | 对象失效* | **必需** |
+| 行号 | 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|------|---------|----------|---------|
+| 1 | `result.category` | CSS 类名 | 显示占位 | 可选 | 不显示 category CSS 类 |
+| 2 | `result.img_src` | 图片链接目标 | 对象失效* | **必需** | 图片链接失效，hash 计算抛 ValueError |
+| 3 | `result.thumbnail_src` | 缩略图 src（优先） | 渲染降级 | 可选 | 使用原图作为缩略图 |
+| 3 | `result.img_src` | 缩略图 src（降级） | 对象失效* | **必需** | 同上 |
+| 3 | `result.title` | 图片 alt 属性 | 显示占位 | **必需** | 无 alt 属性，可访问性问题 |
+| 4 | `result.resolution` | 分辨率标签 | 显示占位 | 可选 | 不显示分辨率标签 |
+| 5 | `result.title` | 图片标题显示 | 显示占位 | **必需** | 无标题文本 |
+| 6 | `result.parsed_url.netloc` | 来源域名 | 对象失效 | **必需** | 抛 AttributeError，引擎标记异常 |
+| 12 | `result.img_src` | 详情面板原图链接 | 对象失效* | **必需** | 详情面板图片失效 |
+| 13 | `result.img_src` | 详情面板原图 src | 对象失效* | **必需** | 详情面板无图片 |
+| 13 | `result.title` | 详情面板 alt 属性 | 显示占位 | **必需** | 无 alt 属性 |
+| 16 | `result.title` | 详情面板标题 | 显示占位 | **必需** | 详情面板无标题 |
+| 17 | `result.content` | 详情面板描述 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 19 | `result.author` | 详情面板作者 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 20 | `result.resolution` | 详情面板分辨率 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 21 | `result.img_format` | 详情面板格式 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 22 | `result.filesize` | 详情面板文件大小 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 23 | `result.source` | 详情面板来源 | 显示占位 | 可选 | 详情面板显示 `&nbsp;` |
+| 24 | `result.engine` | 详情面板引擎 | 显示占位 | **必需** | 无来源引擎信息 |
+| 25 | `result.url` | 详情面板来源链接 | 对象失效** | **必需** | 来源链接失效，且用于解析 parsed_url |
 
-*注：`img_src` 和 `url` 虽不直接触发 hash 失效（图像结果豁免），但缺失会导致图片链接完全失效，实际等同于对象不可用。
+*注：`img_src` 缺失会导致 hash 计算抛 ValueError，被 processor 捕获为引擎异常。
+
+**注：`url` 缺失会导致：
+1. hash 计算使用空字符串（可能与其他结果碰撞）
+2. `parsed_url` 为 None，模板第 6 行抛 AttributeError
+3. 最终同样被捕获为引擎异常
 
 ### 5.2 必需字段清单（对象可用的最低要求）
 
 | 字段 | 缺失后果 |
 |------|---------|
-| `img_src` | 图片无法显示，所有链接失效 |
-| `url` | 来源页面链接失效 |
-| `title` | 图片无标题和 alt 属性，可访问性问题 |
-| `parsed_url` | 来源域名无法显示，但图像结果 hash 豁免，对象仍有效 |
-| `engine` | 来源引擎无法显示 |
+| `img_src` | hash 抛 ValueError → 引擎标记异常 |
+| `url` | parsed_url 为 None → 模板抛 AttributeError → 引擎标记异常 |
+| `title` | 无标题和 alt 属性，结果可用但用户体验差 |
+| `engine` | 无来源引擎信息 |
 
 ### 5.3 引擎附带字段与渲染影响
 
@@ -446,45 +505,45 @@ if self.template == "images.html":
 
 #### 宏 1: result_header (`searx/templates/simple/macros.html:21-35`)
 
-| 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|---------|----------|
-| `result.url` | 标题链接目标 | 对象失效 | **必需** |
-| `result.parsed_url` | 域名显示 + favicon | 对象失效 | **必需** |
-| `result.thumbnail` | 视频缩略图 | 渲染降级 | 可选 |
-| `result.length` | 缩略图上的时长标签 | 显示占位 | 可选 |
-| `result.title` | 结果标题 | 显示占位 | **必需** |
-| `result.template` | CSS 类名 `result-videos` | 显示占位 | **必需** |
-| `result.category` | CSS 类名 `category-*` | 显示占位 | 可选 |
+| 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|---------|----------|---------|
+| `result.url` | 标题链接目标 | 对象失效 | **必需** | hash 抛 ValueError → 引擎标记异常 |
+| `result.parsed_url` | 域名显示 + favicon | 对象失效 | **必需** | hash 抛 ValueError → 引擎标记异常 |
+| `result.thumbnail` | 视频缩略图 | 渲染降级 | 可选 | 不显示缩略图，仅文字链接 |
+| `result.length` | 缩略图上的时长标签 | 显示占位 | 可选 | 不显示时长 |
+| `result.title` | 结果标题 | 显示占位 | **必需** | 无标题文本 |
+| `result.template` | CSS 类名 `result-videos` | 显示占位 | **必需** | 无正确 CSS 类 |
+| `result.category` | CSS 类名 `category-*` | 显示占位 | 可选 | 无 category CSS 类 |
 
 #### 宏 2: result_sub_header (`searx/templates/simple/macros.html:38-45`)
 
-| 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|---------|----------|
-| `result.publishedDate` / `result.pubdate` | 发布日期 | 显示占位 | 可选 |
-| `result.length` | 播放时长（无缩略图时） | 显示占位 | 可选 |
-| `result.views` | 观看次数 | 显示占位 | 可选 |
-| `result.author` | 上传者 | 显示占位 | 可选 |
-| `result.metadata` | 元数据高亮 | 显示占位 | 可选 |
+| 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|---------|----------|---------|
+| `result.publishedDate` / `result.pubdate` | 发布日期 | 显示占位 | 可选 | 不显示发布日期 |
+| `result.length` | 播放时长（无缩略图时） | 显示占位 | 可选 | 不显示播放时长 |
+| `result.views` | 观看次数 | 显示占位 | 可选 | 不显示观看次数 |
+| `result.author` | 上传者 | 显示占位 | 可选 | 不显示上传者 |
+| `result.metadata` | 元数据高亮 | 显示占位 | 可选 | 不显示元数据 |
 
 #### 宏 3: result_sub_footer (`searx/templates/simple/macros.html:48-54`)
 
-| 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|---------|----------|
-| `result.engines` | 来源引擎列表 | 显示占位 | **必需**（系统填充） |
-| `result.url` | 缓存链接 | 对象失效 | **必需** |
+| 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|---------|----------|---------|
+| `result.engines` | 来源引擎列表 | 显示占位 | **必需**（系统填充） | 无来源引擎列表 |
+| `result.url` | 缓存链接 | 对象失效 | **必需** | 无缓存链接 |
 
 #### 宏 4: iframe (`searx/templates/simple/macros.html:72-79`)
 
-| 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|---------|----------|
-| `result.parsed_url.hostname` | YouTube 特殊权限处理 | 显示占位 | 可选 |
+| 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|---------|----------|---------|
+| `result.parsed_url.hostname` | YouTube 特殊权限处理 | 显示占位 | 可选 | 无 YouTube 特殊处理 |
 
 #### 模板自身消费字段
 
-| 字段 | 用途 | 行为类型 | 必需/可选 |
-|------|------|---------|----------|
-| `result.iframe_src` | 嵌入式播放器 URL | 渲染降级 | 可选 |
-| `result.content` | 视频描述 | 显示占位 | 可选 |
+| 字段 | 用途 | 行为类型 | 必需/可选 | 缺失后果 |
+|------|------|---------|----------|---------|
+| `result.iframe_src` | 嵌入式播放器 URL | 渲染降级 | 可选 | 不显示内嵌播放按钮 |
+| `result.content` | 视频描述 | 显示占位 | 可选 | 显示 "This site did not provide any description." |
 
 ### 6.3 必需字段清单
 
@@ -495,7 +554,7 @@ if self.template == "images.html":
 - `parsed_url` - 系统从 `url` 自动解析（但解析失败会导致对象失效）
 
 **引擎必需提供**：
-- `url` - 视频源页面链接（缺失导致对象失效）
+- `url` - 视频源页面链接（缺失导致 hash 抛 ValueError）
 - `title` - 视频标题
 
 ### 6.4 引擎附带字段与渲染影响
@@ -595,19 +654,24 @@ Result (msgspec.Struct)
     ↓
 SearchQuery 构建
     ↓
-pre_search 插件 → 返回 False 则跳过整个搜索
+pre_search 插件 → 返回 False 则跳过整个 super().search()
     ↓
-Search.search()
+Search.search() （仅当 pre_search 返回 True 时执行）
     ├─ external_bang 检查 → 命中则设置 redirect_url 并终止
     ├─ answerers 调用 → 命中则短路，不调用 search_standard()
     └─ search_standard() → 并行调用各搜索引擎
         ↓
-ResultContainer.extend()
-    ├─ normalize_result_fields() → URL/文本/日期规范化
-    ├─ on_result 插件钩子 → 可修改或丢弃结果
-    └─ _merge_main_result → hash 计算（可能触发 ValueError）
+OnlineProcessor.search() [try 块内]
+    ├─ 引擎返回结果列表
+    ├─ _extend_container_basic()
+    │   └─ ResultContainer.extend()
+    │       ├─ normalize_result_fields() → URL/文本/日期规范化
+    │       ├─ on_result 插件钩子 → 可修改或丢弃结果
+    │       └─ _merge_main_result
+    │           └─ hash(result) → 可能抛 ValueError
+    └─ 异常被 except Exception 捕获 → handle_exception() → 引擎标记异常
         ↓
-post_search 插件（始终执行！）→ 可通过 extend() 添加新结果
+post_search 插件（始终执行！）→ 5 个插件可通过 extend() 添加新结果
     ↓
 result_container.close() → 计算分数
     ↓
@@ -634,9 +698,11 @@ only_template 检测
 
 ### 对象失效判定
 - ✅ 复核代码：`MainResult.__hash__()` 检查 `parsed_url` 是否为 `None`
-- ✅ 复核代码：`_merge_main_result()` 调用 `hash(result)`
-- ❌ 豁免：图像结果 hash 不依赖 `parsed_url`
-- ❌ 豁免：信息盒、建议、纠正走独立分支
+- ✅ 复核代码：`_merge_main_result()` 调用 `hash(result)`，无异常捕获
+- ✅ 复核代码：`OnlineProcessor.search()` 的 `except Exception as e` 捕获异常
+- ✅ 复核代码：`handle_exception()` 调用 `add_unresponsive_engine()` 标记引擎
+- ❌ 豁免：图像结果 hash 不依赖 `parsed_url`，但模板仍消费 `parsed_url.netloc`
+- ❌ 豁免：信息盒、建议、纠正走独立分支，不经过 `_merge_main_result`
 
 ### 显示占位判定
 - ✅ 复核代码：模板中 `{% if result.field %}...{% else %}&nbsp;{% endif %}` 模式
@@ -646,6 +712,11 @@ only_template 检测
 - ✅ 复核代码：模板中 `{{ result.field_a or result.field_b }}` 模式
 - ✅ 复核代码：条件渲染整个功能块 `{% if result.field %}...{% endif %}`
 - ✅ 复核代码：`_normalize_date_fields()` 异常时降级为 None
+
+### pre_search 短路语义判定
+- ✅ 复核代码：`searx/search/__init__.py:203-204` 的 `if` 条件结构
+- ✅ 复核代码：`pre_search` 返回 `False` 时，`super().search()` 整行不执行
+- ✅ 复核代码：`post_search` 和 `close()` 在 `if` 块之外，始终执行
 
 ---
 
@@ -658,3 +729,5 @@ only_template 检测
 - 样式目录：`client/simple/src/less/`
 - 规范化逻辑：`searx/result_types/_base.py`
 - 插件核心：`searx/plugins/_core.py`
+- 处理器异常处理：`searx/search/processors/abstract.py:165-191`
+- Online 处理器搜索：`searx/search/processors/online.py:239-282`
