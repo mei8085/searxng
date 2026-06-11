@@ -521,88 +521,124 @@ reliabilities[e.name]['errors'] = reliabilities_errors
 
 **逐行执行分析——三种错误场景的走向：**
 
+首先明确两个关键 Python 语义：
+
+```python
+# 1. 非空字典的布尔值：永远为 True
+error = {'filename': 'x.py', 'exception_classname': None}  # 9个 key
+bool(error)   # → True
+not error     # → False  ★ 关键：if not error: 永远不执行！
+
+# 2. dict.get(key) 查找：None 本身就是 exception_classname_to_text 的合法 key
+exception_classname_to_text = {
+    None: 'unexpected crash',
+    'httpx.TimeoutException': 'timeout',
+}
+exception_classname_to_text.get(None)    # → 'unexpected crash' （命中 key）
+exception_classname_to_text.get('unknown')  # → None （未命中，get 返回默认值）
+```
+
+---
+
 **场景 A：`exception_classname` 为 `None`（即 `count_error()` 产生的消息类错误）**
 
-`get_engine_errors()`（[metrics/__init__.py#L123-L137](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L123-L137)）总是将 `context.exception_classname` 作为字典 key 输出：
+`count_error()` 记录的错误中，`context.exception_classname` 为 `None`，`context.log_message` 为字符串（如 "rate limit exceeded"）。`get_engine_errors()`（[metrics/__init__.py#L123-L137](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L123-L137)）总是将 `context.exception_classname` 作为字典 key 输出：
 ```python
 r.append({
-    'exception_classname': context.exception_classname,  # count_error() 时值为 None
-    'log_message': context.log_message,                  # count_error() 时值为字符串
+    'exception_classname': context.exception_classname,  # 值为 None
+    'log_message': context.log_message,                  # 值为 "rate limit exceeded"
     ...
 })
 ```
 因此 `count_error()` 产生的错误字典中 `exception_classname` 这个 **key 存在**，但 **值为 `None`**。
 
-逐行执行：
-1. `error.get('secondary')` → `False`（非次要）
+逐行执行（[webapp.py#L945-L953](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L945-L953)）：
+```python
+for error in errors:
+    error_user_text = None
+    if error.get('secondary') or 'exception_classname' not in error:
+        continue
+    error_user_text = exception_classname_to_text.get(error.get('exception_classname'))
+    if not error:                                # ★ not 非空字典 = False，永远不执行
+        error_user_text = exception_classname_to_text[None]
+    if error_user_text not in reliabilities_errors:
+        reliabilities_errors.append(error_user_text)
+```
+
+1. `error.get('secondary')` → `False`（非次要错误）
 2. `'exception_classname' not in error` → **`False`**（key 存在！值为 `None`，但 `not in` 检查的是 key 存在性）
 3. → **不跳过**，继续执行
-4. `exception_classname_to_text.get(error.get('exception_classname'))` → `exception_classname_to_text.get(None)` → 返回 `'unexpected crash'`
-5. `if not error:` → `error` 是字典，始终 truthy → **`True`** → **覆盖** `error_user_text = exception_classname_to_text[None]` → 仍为 `'unexpected crash'`
+4. `exception_classname_to_text.get(None)` → 命中字典的 `None` key → 返回 `'unexpected crash'`
+5. `if not error:` → `not {'filename': ...}` → `False` → **不执行**
 6. 最终 `reliabilities_errors` 中添加 `'unexpected crash'`
 
-**结论**：`count_error()` 产生的消息类错误在偏好设置页显示为 **"unexpected crash"**，而非被过滤掉。这与直觉相反——虽然代码注释暗示只想展示有异常类名的错误，但 `'exception_classname' not in error` 检查的是 key 存在性而非值，`None` 值的 key 会通过此检查。
+**界面显示结果**：tooltip 中显示 **"unexpected crash"**。
+
+**问题**：`log_message` 中包含的有价值信息（如 "rate limit exceeded"）被**完全丢失**，用户看不到具体的错误原因。
 
 ---
 
 **场景 B：`exception_classname` 有值但未命中字典（未知异常类）**
 
+例如异常类为 `requests.exceptions.SSLError`，`exception_classname_to_text` 字典中没有收录这个类名。
+
 逐行执行：
 1. `error.get('secondary')` → `False`
-2. `'exception_classname' not in error` → `False`（key 存在，值为字符串如 `'requests.exceptions.SSLError'`）
+2. `'exception_classname' not in error` → `False`（key 存在，值为 `'requests.exceptions.SSLError'`）
 3. → 不跳过
-4. `exception_classname_to_text.get('requests.exceptions.SSLError')` → 字典中无此 key → 返回 `None`
-5. `if not error:` → `error` 是字典，始终 truthy → **`True`** → `error_user_text = exception_classname_to_text[None]` → `'unexpected crash'`
-6. 最终添加 `'unexpected crash'`
+4. `exception_classname_to_text.get('requests.exceptions.SSLError')` → 字典无此 key → `get()` 返回默认值 `None`
+5. `if not error:` → `False` → **不执行**（降级逻辑完全没起作用！）
+6. `error_user_text` 为 `None` → `None not in []` → `True` → 添加到列表
 
-**结论**：未知异常类正确降级为 **"unexpected crash"**，但走的是 `if not error:` 分支（因为 `error` 字典始终 truthy），而非逻辑上应该走的 `if not error_user_text:` 分支。
+**界面显示结果**：Jinja2 模板执行 `{{ error }}` 时，`str(None)` → 显示字符串 **`"None"`**。
+
+**真正的 bug**：`if not error:` 应该是 `if not error_user_text:`，这样当 `get()` 返回 `None`（字典未命中）时，才会降级为 `'unexpected crash'`。当前代码导致未知异常类显示 `"None"` 而非预期的 "unexpected crash"。
+
+作为对比，同项目中 `get_translated_errors()`（[webutils.py#L70-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webutils.py#L70-L76)）的写法是正确的：
+```python
+error_user_text = exception_classname_to_text.get(unresponsive_engine.error_type)
+if not error_user_text:              # ← 正确：检查的是 error_user_text 是否为空
+    error_user_text = exception_classname_to_text[None]
+```
 
 ---
 
 **场景 C：`exception_classname` 有值且命中字典（已知异常类）**
 
+例如 `httpx.ConnectTimeout`，字典中有收录，翻译为 "timeout"。
+
 逐行执行：
 1. `error.get('secondary')` → `False`
 2. `'exception_classname' not in error` → `False`
 3. → 不跳过
-4. `exception_classname_to_text.get('httpx.ConnectTimeout')` → `'timeout'`
-5. `if not error:` → `True`（字典始终 truthy）→ `error_user_text = exception_classname_to_text[None]` → `'unexpected crash'` ⚠️
-6. **覆盖了第 4 步的 `'timeout'`！** 最终添加 `'unexpected crash'`
+4. `exception_classname_to_text.get('httpx.ConnectTimeout')` → 命中 → 返回 `'timeout'`
+5. `if not error:` → `False` → 不执行
+6. 最终添加 `'timeout'`
 
-**结论**：这是一个 **bug**。`if not error:` 判断的是 `error` 字典是否为空（永远为 `True`），而非 `error_user_text` 是否为空。正确代码应为 `if not error_user_text:`。当前代码导致**所有错误都被降级为 "unexpected crash"**，第 4 步的字典翻译结果被覆盖。
-
----
-
-**`if not error:` 是 bug 的详细论证：**
-
-```python
-# 第 449 行
-error_user_text = exception_classname_to_text.get(error.get('exception_classname'))
-# 第 450 行
-if not error:
-    error_user_text = exception_classname_to_text[None]
-```
-
-- `error` 是 `get_engine_errors()` 返回的字典对象（包含 filename、function 等字段），**永远为 truthy**
-- 因此 `if not error:` 恒为 `True`，**第 451 行永远执行**
-- 无论 `error_user_text` 在第 449 行查到了什么（`'timeout'`、`'CAPTCHA'`、`None`），都会被覆盖为 `'unexpected crash'`
-- 正确写法应为 `if not error_user_text:`，仅在字典查不到友好文本时才降级
-
-**实际效果**：当前偏好设置页的所有引擎错误 tooltip 中，只会显示 **"unexpected crash"** 这一个文本，永远不会出现 "timeout"、"CAPTCHA" 等友好翻译。这破坏了 `exception_classname_to_text` 字典的设计意图。
-
-作为对比，同一项目中 `get_translated_errors()` 函数（[webutils.py#L70-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webutils.py#L70-L76)）的写法是正确的：
-```python
-error_user_text = exception_classname_to_text.get(unresponsive_engine.error_type)
-if not error_user_text:              # ← 正确：检查的是 error_user_text，不是 error
-    error_user_text = exception_classname_to_text[None]
-```
+**界面显示结果**：tooltip 中正确显示 **"timeout"**。这是三种场景中唯一工作正常的情况。
 
 ---
 
-**三种场景的界面最终效果：**
+**为什么 `if not error` 不会稳定导致意外崩溃？**
 
-| 场景 | 预期行为 | 实际行为（受 bug 影响） |
+关键在于 Python 的布尔值规则：
+- `bool({})` → `False`（空字典）
+- `bool({'a': 1})` → `True`（非空字典）
+
+`get_engine_errors()` 返回的每个 `error` 字典都包含 9 个 key（`filename`、`function`、`line_no`、`code`、`exception_classname`、`log_message`、`log_parameters`、`secondary`、`percentage`），所以 `error` **永远是非空字典**，`not error` 永远为 `False`，因此 `if not error:` 分支**永远不会执行**。
+
+这就是它不会稳定地将所有错误都降级为 "unexpected crash" 的原因——降级代码实际上是**死代码**，从未被执行。场景 A 中显示 "unexpected crash" 不是因为降级分支，而是因为 `get(None)` 直接命中了字典中的 `None` key。
+
+---
+
+**三种场景的界面最终效果总结：**
+
+| 场景 | 预期行为 | 实际行为 |
 |------|---------|----------------------|
+| A. `exception_classname = None`（`count_error()` 消息类） | 应显示 `log_message` 内容或被过滤 | 显示 **"unexpected crash"**（`get(None)` 命中字典 key），`log_message` 丢失 |
+| B. 未知异常类（字典未收录） | 降级为 "unexpected crash" | 显示字符串 **`"None"`**（`get()` 返回 `None`，降级分支不执行，`str(None)` 渲染） |
+| C. 已知异常类（字典已收录） | 显示友好翻译（"timeout"等） | 正确显示友好翻译（唯一正常的场景） |
+| D. `secondary = True` 的次要错误 | 被过滤不显示 | **正确**被 `error.get('secondary')` 短路过滤 |
 | A. `exception_classname` 为 `None`（`count_error()` 消息类） | 应被过滤不显示 | 显示 "unexpected crash"（`not in` 检查 key 存在性，`None` 值 key 通过） |
 | B. 未知异常类（字典未收录） | 降级为 "unexpected crash" | 显示 "unexpected crash"（结果正确，但走了 bug 分支） |
 | C. 已知异常类（字典已收录） | 显示友好翻译（"timeout"等） | 显示 "unexpected crash"（第 450 行覆盖了翻译结果） |
@@ -835,13 +871,13 @@ technical_report = ' '.join(technical_report)
 
 #### 7.3.5 友好文案 vs 原始详情：切换条件总览
 
-| 场景 | /preferences 行为 | /stats 行为 |
+| 场景 | /preferences 行为（受 bug 影响） | /stats 行为 |
 |------|------------------|------------|
-| **count_exception() 产生的异常（有 exception_classname）** | 查 `exception_classname_to_text` 字典 → 友好文本 | 直接显示 `exception_classname` 原始字符串 |
-| **字典中不存在的未知异常** | 降级为 `"unexpected crash"` | 直接显示原始类名（如 `requests.exceptions.SSLError`） |
-| **count_error() 产生的消息（有 log_message，无 exception_classname）** | **被过滤，完全不显示** | 直接显示 `log_message` 原始文本 |
-| **secondary=True 的次要错误** | **被过滤，完全不显示** | 归入 "Warnings" 分组，显示完整技术详情 |
-| **同类错误多次出现** | 去重，tooltip 中只显示一次 | 按 `ErrorContext` 分组，不同上下文（不同行号/参数）分开显示 |
+| **已知异常类（字典已收录）** | 预期：友好翻译；实际：被 `if not error:` 覆盖为 **"unexpected crash"** | 直接显示 `exception_classname` 原始字符串 |
+| **未知异常类（字典未收录）** | 降级为 **"unexpected crash"**（结果正确，但走了 bug 分支） | 直接显示原始类名（如 `requests.exceptions.SSLError`） |
+| **消息类错误（count_error，exception_classname 为 None）** | 预期：被 `not in` 过滤；实际：显示 **"unexpected crash"**（key 存在值为 None，通过 `not in` 检查后 `get(None)` 命中字典） | 直接显示 `log_message` 原始文本 |
+| **secondary=True 的次要错误** | **被过滤不显示**（短路求值，正确） | 归入 "Warnings" 分组，显示完整技术详情 |
+| **同类错误多次出现** | 去重，tooltip 中只显示一次（但都显示 "unexpected crash"） | 按 `ErrorContext` 分组，不同上下文分开显示 |
 | **无任何错误** | 无告警图标，无超链接，无 tooltip | 列表视图正常显示可靠性，单引擎展开无错误区块 |
 
 ---
@@ -850,12 +886,12 @@ technical_report = ' '.join(technical_report)
 
 | 维度 | /preferences | /stats |
 |------|-------------|--------|
-| **后端处理** | 三重过滤 + 翻译 + 去重 | 不做任何处理，原始透传 |
-| **传给模板的 errors** | 友好文本字符串列表（如 `['timeout']`） | 原始字典列表（含完整技术字段） |
-| **错误范围** | 仅 primary 且含 exception_classname | primary + secondary，全量展示 |
-| **消息类错误（count_error）** | 完全过滤不显示 | 归入 Message 行展示 |
-| **异常名称** | 友好翻译（"timeout"、"CAPTCHA"…） | 原始类名（"httpx.ConnectTimeout"…） |
-| **未知异常降级** | 翻译为 "unexpected crash" | 直接显示原始类名 |
+| **后端处理** | 三重过滤 + 翻译 + 去重（但有 bug） | 不做任何处理，原始透传 |
+| **传给模板的 errors** | 实际全是 `'unexpected crash'`（应有友好翻译） | 原始字典列表（含完整技术字段） |
+| **错误范围** | 预期仅 primary 且含 exception_classname；实际包含 exception_classname 为 None 的消息类错误 | primary + secondary，全量展示 |
+| **消息类错误（count_error）** | 预期过滤不显示；实际显示 "unexpected crash" | 归入 Message 行展示 |
+| **异常名称** | 预期友好翻译；实际全是 "unexpected crash" | 原始类名（"httpx.ConnectTimeout"…） |
+| **未知异常降级** | 翻译为 "unexpected crash"（结果正确） | 直接显示原始类名 |
 | **展示形式** | 单元格超链接 + hover tooltip | 列表缩略（仅数值）+ 单引擎展开（完整详情） |
 | **单引擎展开入口** | 可靠性单元格的超链接 | 引擎名称的超链接 |
 | **面向用户** | 普通用户，快速判断引擎状态 | 管理员/开发者，问题定位与 bug 报告 |
