@@ -508,27 +508,108 @@ reliabilities[e.name]['errors'] = 友好文本字符串列表
 reliabilities[e.name] = {'reliability': reliability, 'errors': []}
 reliabilities_errors = []
 for error in errors:
-    # 过滤条件1：跳过 secondary 异常 或 无 exception_classname 的错误
-    # 即：count_error() 产生的消息类错误在这里被完全过滤掉！
+    error_user_text = None
     if error.get('secondary') or 'exception_classname' not in error:
         continue
-    # 过滤条件2：异常类名必须在 error 字典中（且非空）
-    # 翻译：查字典获取友好文本
     error_user_text = exception_classname_to_text.get(error.get('exception_classname'))
-    # 降级：字典查不到 → "unexpected crash"
-    if not error_user_text:  # 注意：原代码写的是 if not error，疑似 bug，实际应为 if not error_user_text
+    if not error:
         error_user_text = exception_classname_to_text[None]
-    # 去重：同类错误合并，只保留一个
     if error_user_text not in reliabilities_errors:
         reliabilities_errors.append(error_user_text)
 reliabilities[e.name]['errors'] = reliabilities_errors
 ```
 
-**关键过滤逻辑：**
-- `secondary=True` → **跳过**（如软重定向超限等警告类错误）
-- 无 `exception_classname` → **跳过**（`count_error()` 产生的消息类错误完全不展示）
-- 字典查不到 → **降级**为 "unexpected crash"
-- 同类重复 → **去重**
+**逐行执行分析——三种错误场景的走向：**
+
+**场景 A：`exception_classname` 为 `None`（即 `count_error()` 产生的消息类错误）**
+
+`get_engine_errors()`（[metrics/__init__.py#L123-L137](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L123-L137)）总是将 `context.exception_classname` 作为字典 key 输出：
+```python
+r.append({
+    'exception_classname': context.exception_classname,  # count_error() 时值为 None
+    'log_message': context.log_message,                  # count_error() 时值为字符串
+    ...
+})
+```
+因此 `count_error()` 产生的错误字典中 `exception_classname` 这个 **key 存在**，但 **值为 `None`**。
+
+逐行执行：
+1. `error.get('secondary')` → `False`（非次要）
+2. `'exception_classname' not in error` → **`False`**（key 存在！值为 `None`，但 `not in` 检查的是 key 存在性）
+3. → **不跳过**，继续执行
+4. `exception_classname_to_text.get(error.get('exception_classname'))` → `exception_classname_to_text.get(None)` → 返回 `'unexpected crash'`
+5. `if not error:` → `error` 是字典，始终 truthy → **`True`** → **覆盖** `error_user_text = exception_classname_to_text[None]` → 仍为 `'unexpected crash'`
+6. 最终 `reliabilities_errors` 中添加 `'unexpected crash'`
+
+**结论**：`count_error()` 产生的消息类错误在偏好设置页显示为 **"unexpected crash"**，而非被过滤掉。这与直觉相反——虽然代码注释暗示只想展示有异常类名的错误，但 `'exception_classname' not in error` 检查的是 key 存在性而非值，`None` 值的 key 会通过此检查。
+
+---
+
+**场景 B：`exception_classname` 有值但未命中字典（未知异常类）**
+
+逐行执行：
+1. `error.get('secondary')` → `False`
+2. `'exception_classname' not in error` → `False`（key 存在，值为字符串如 `'requests.exceptions.SSLError'`）
+3. → 不跳过
+4. `exception_classname_to_text.get('requests.exceptions.SSLError')` → 字典中无此 key → 返回 `None`
+5. `if not error:` → `error` 是字典，始终 truthy → **`True`** → `error_user_text = exception_classname_to_text[None]` → `'unexpected crash'`
+6. 最终添加 `'unexpected crash'`
+
+**结论**：未知异常类正确降级为 **"unexpected crash"**，但走的是 `if not error:` 分支（因为 `error` 字典始终 truthy），而非逻辑上应该走的 `if not error_user_text:` 分支。
+
+---
+
+**场景 C：`exception_classname` 有值且命中字典（已知异常类）**
+
+逐行执行：
+1. `error.get('secondary')` → `False`
+2. `'exception_classname' not in error` → `False`
+3. → 不跳过
+4. `exception_classname_to_text.get('httpx.ConnectTimeout')` → `'timeout'`
+5. `if not error:` → `True`（字典始终 truthy）→ `error_user_text = exception_classname_to_text[None]` → `'unexpected crash'` ⚠️
+6. **覆盖了第 4 步的 `'timeout'`！** 最终添加 `'unexpected crash'`
+
+**结论**：这是一个 **bug**。`if not error:` 判断的是 `error` 字典是否为空（永远为 `True`），而非 `error_user_text` 是否为空。正确代码应为 `if not error_user_text:`。当前代码导致**所有错误都被降级为 "unexpected crash"**，第 4 步的字典翻译结果被覆盖。
+
+---
+
+**`if not error:` 是 bug 的详细论证：**
+
+```python
+# 第 449 行
+error_user_text = exception_classname_to_text.get(error.get('exception_classname'))
+# 第 450 行
+if not error:
+    error_user_text = exception_classname_to_text[None]
+```
+
+- `error` 是 `get_engine_errors()` 返回的字典对象（包含 filename、function 等字段），**永远为 truthy**
+- 因此 `if not error:` 恒为 `True`，**第 451 行永远执行**
+- 无论 `error_user_text` 在第 449 行查到了什么（`'timeout'`、`'CAPTCHA'`、`None`），都会被覆盖为 `'unexpected crash'`
+- 正确写法应为 `if not error_user_text:`，仅在字典查不到友好文本时才降级
+
+**实际效果**：当前偏好设置页的所有引擎错误 tooltip 中，只会显示 **"unexpected crash"** 这一个文本，永远不会出现 "timeout"、"CAPTCHA" 等友好翻译。这破坏了 `exception_classname_to_text` 字典的设计意图。
+
+作为对比，同一项目中 `get_translated_errors()` 函数（[webutils.py#L70-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webutils.py#L70-L76)）的写法是正确的：
+```python
+error_user_text = exception_classname_to_text.get(unresponsive_engine.error_type)
+if not error_user_text:              # ← 正确：检查的是 error_user_text，不是 error
+    error_user_text = exception_classname_to_text[None]
+```
+
+---
+
+**三种场景的界面最终效果：**
+
+| 场景 | 预期行为 | 实际行为（受 bug 影响） |
+|------|---------|----------------------|
+| A. `exception_classname` 为 `None`（`count_error()` 消息类） | 应被过滤不显示 | 显示 "unexpected crash"（`not in` 检查 key 存在性，`None` 值 key 通过） |
+| B. 未知异常类（字典未收录） | 降级为 "unexpected crash" | 显示 "unexpected crash"（结果正确，但走了 bug 分支） |
+| C. 已知异常类（字典已收录） | 显示友好翻译（"timeout"等） | 显示 "unexpected crash"（第 450 行覆盖了翻译结果） |
+
+---
+
+**`secondary=True` 的错误确实被正确过滤**，因为 `error.get('secondary')` 在条件短路中先求值，直接 `continue`。
 
 **最终传给模板的数据结构：**
 ```python
