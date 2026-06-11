@@ -2,52 +2,515 @@
 
 ## 1. 概述
 
-SearXNG 作为一款隐私优先的元搜索引擎，对外链（搜索结果中的 URL）实施了一套多层次的安全处理流水线，涵盖 **规范化 → 去追踪 → 主机重写 → 代理中转 → 渲染输出** 全链路。本报告基于源码逐层分析各环节的实现机制与安全考量。
+SearXNG 作为一款隐私优先的元搜索引擎，对外链（搜索结果中的 URL）实施了一套多层次的安全处理流水线，涵盖 **规范化 → 去追踪 → 主机重写 → 代理中转 → 渲染输出** 全链路。本报告基于源码逐层分析各环节的实现机制、触发条件与安全考量。
 
 ---
 
-## 2. 外链处理流水线总览
+## 2. 外链点击前的六条分流路径总览
+
+从用户提交搜索请求，到外链最终呈现在浏览器中被点击，SearXNG 内部共有六条不同的分流路径，它们在不同条件下触发：
 
 ```
-搜索引擎返回原始 URL
-       │
-       ▼
-  ┌──────────────┐
-  │ URL 规范化     │  ← _normalize_url_fields() / normalize_url()
-  └──────┬───────┘
-         │
-       插件管道（按注册顺序执行）
-  ┌──────▼───────┐
-  │ Tracker Remover│  ← TRACKER_PATTERNS.clean_url()
-  └──────┬───────┘
-  ┌──────▼───────┐
-  │ Hostnames     │  ← replace / remove / priority
-  └──────┬───────┘
-  ┌──────▼───────┐
-  │ OA DOI Rewrite│  ← DOI 重写为开放获取链接
-  └──────┬───────┘
-         │
-       渲染层
-  ┌──────▼───────┐
-  │ Image Proxify │  ← 图片代理中转
-  └──────┬───────┘
-  ┌──────▼───────┐
-  │ Favicon Proxy │  ← 图标代理中转
-  └──────┬───────┘
-  ┌──────▼───────┐
-  │ 模板渲染      │  ← rel="noreferrer" / target="_blank"
-  └──────────────┘
+用户提交查询 q
+   │
+   ├─→ 查询解析阶段 ──────────────────────────────────────────────┐
+   │    ├─ 命中外部 bang (!!xxx)  → 路径A: Bang 服务端 302 重定向  │
+   │    └─ 命中 !! 前缀          → 路径B: 首结果 302 重定向        │
+   │                                                               │
+   ▼                                                               │
+搜索引擎返回原始 URL                                               │
+   │                                                               │
+   ▼                                                               │
+结果规范化 + 插件管道                                               │
+   │                                                               │
+   ├─ 含 img_src / thumbnail_src / thumbnail → 路径C: 图片代理中转 │
+   │                                                               │
+   ├─ 含 iframe_src / audio_src  → 路径D: iframe 延迟加载           │
+   │                                                               │
+   └─ 其他所有结果 URL          → 路径E: 普通搜索结果直出            │
+                                                                   │
+   ▼                                                               │
+每个结果还附带 favicon → 路径F: Favicon 代理中转                    │
+                                                                   │
+   └───────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. URL 规范化（Normalization）
+## 3. 六条分流路径详解（含触发条件）
 
-### 3.1 结果级规范化 — `_normalize_url_fields()`
+### 路径 A：Bang 服务端 302 重定向
 
-**源码位置**: [result_types/_base.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L38-L83)
+**触发条件**：用户查询包含外部 bang 前缀（如 `!!g hello`）
 
-每个搜索结果在进入 `ResultContainer` 时，都会调用 `normalize_result_fields()`，其核心逻辑在 `_normalize_url_fields()` 中：
+完整调用链：
+
+1. **查询解析** — [query.py:163-168](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/query.py#L163-L168)
+
+   `ExternalBangParser._parse()` 在查询词中匹配 `!!<bang>`：
+   ```python
+   def _parse(self, value):
+       bang_definition, bang_ac_list = get_bang_definition_and_autocomplete(value)
+       if bang_definition is not None:
+           self.raw_text_query.external_bang = value  # 标记为外部 bang
+           found = True
+       return found, bang_ac_list
+   ```
+
+2. **Web 适配** — [webadapter.py:259](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webadapter.py#L259)
+
+   ```python
+   external_bang = raw_text_query.external_bang  # 传递给 SearchQuery
+   ```
+
+3. **搜索阶段触发** — [search/__init__.py:59-69](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/search/__init__.py#L59-L69)
+
+   `Search.search_external_bang()` 在普通搜索之前抢先执行：
+   ```python
+   def search_external_bang(self) -> bool:
+       if self.search_query.external_bang:
+           self.result_container.redirect_url = get_bang_url(self.search_query)
+           if isinstance(self.result_container.redirect_url, str):
+               return True  # 跳过重定向之外的所有搜索
+       return False
+   ```
+
+   在 [Search.search()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/search/__init__.py#L174-L179) 中，它享有最高优先级：
+   ```python
+   def search(self) -> ResultContainer:
+       self.start_time = default_timer()
+       if not self.search_external_bang():     # 1. 先试 bang 重定向
+           if not self.search_answerers():     # 2. 再试 answerer
+               self.search_standard()          # 3. 最后才标准搜索
+       return self.result_container
+   ```
+
+4. **Bang URL 构造** — [external_bang.py:93-109](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/external_bang.py#L93-L109)
+
+   ```python
+   def get_bang_url(search_query, external_bangs_db=None):
+       if search_query.external_bang:
+           bang_definition, _ = get_bang_definition_and_ac(
+               external_bangs_db, search_query.external_bang)
+           if bang_definition and isinstance(bang_definition, str):
+               ret_val = resolve_bang_definition(
+                   bang_definition, search_query.query)[0]
+       return ret_val
+   ```
+
+5. **Bang URL 规范化** — [external_bang.py:49-61](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/external_bang.py#L49-L61)
+
+   ```python
+   def resolve_bang_definition(bang_definition: str, query: str):
+       url, rank = bang_definition.split(chr(1))
+       if url.startswith('//'):
+           url = 'https:' + url               # //xxx → https://xxx
+       if query:
+           url = url.replace(chr(2), quote_plus(query))  # 编码查询
+       else:
+           o = urlparse(url)
+           url = o.scheme + '://' + o.netloc   # 无查询时只留主页
+       return (url, int(rank))
+   ```
+
+6. **服务端 302** — [webapp.py:665-667](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L665-L667)
+
+   在搜索路由的最开始检查：
+   ```python
+   # 1. check if the result is a redirect for an external bang
+   if result_container.redirect_url:
+       return redirect(result_container.redirect_url)  # Flask redirect → 302
+   ```
+
+**路径 A 关键特征**：
+- 用户浏览器 **从未收到 HTML 结果页**，直接 302 跳转到目标引擎
+- 触发优先级最高（先于 answerer 和标准搜索）
+- `//` 协议相对 URL 强制升级为 `https:`
+- 查询内容经 `quote_plus()` URL 编码
+
+---
+
+### 路径 B：首结果 302 重定向（`!!`）
+
+**触发条件**：用户查询包含独立的 `!!` 前缀（如 `!! python docs`）
+
+1. **查询解析** — [query.py:241-247](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/query.py#L241-L247)
+
+   `RedirectFirstResultParser` 将标记设为 `True`：
+   ```python
+   class RedirectFirstResultParser:
+       @staticmethod
+       def check(raw_value):
+           return raw_value == '!!'
+
+       def __call__(self, raw_value):
+           self.raw_text_query.redirect_to_first_result = True
+           return True
+   ```
+
+   在 [RawTextQuery.__init__](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/query.py#L277) 中默认值为 `False`。
+
+2. **服务端 302** — [webapp.py:698-699](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L698-L699)
+
+   在渲染 HTML 之前检查：
+   ```python
+   if search_query.redirect_to_first_result and results:
+       return redirect(results[0]['url'], 302)
+   ```
+
+**路径 B 关键特征**：
+- 仅对 `output_format='html'` 生效（JSON/RSS/CSV 不走这个分支）
+- 必须有搜索结果才重定向（`and results`）
+- 目标 URL 是 `results[0]['url']`，即经过完整规范化 + 插件管道处理后的首个结果 URL
+- 在 bang 重定向之后、HTML 渲染之前执行
+
+---
+
+### 路径 C：图片代理中转
+
+**触发条件**：结果中含有 `img_src`、`thumbnail_src` 或 `thumbnail` 字段，且用户偏好 `image_proxy=True`
+
+#### C.1 调用位置
+
+图片代理在两个层面被调用：
+
+**① 模板层显式调用** — 所有结果模板在渲染时将图片 URL 传给 `image_proxify()`：
+
+| 模板 | 字段 | 代码位置 |
+|---|---|---|
+| [images.html:3](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/images.html#L3) | thumbnail_src / img_src | `<img src="{{ image_proxify(result.thumbnail_src or result.img_src) }}"` |
+| [images.html:13](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/images.html#L13) | img_src | `<img data-src="{{ image_proxify(result.img_src) }}">` |
+| [macros.html:33](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L33) | thumbnail | `<img src="{{ image_proxify(result.thumbnail) }}">` |
+
+**② 插件管道隐式处理**：Tracker URL Remover 和 Hostnames 插件的 `filter_urls()` 会对 `img_src`、`thumbnail_src`、`thumbnail` 字段先执行去追踪/主机重写（见 [_base.py:272](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L272)）。
+
+#### C.2 代理 URL 生成决策树
+
+**源码位置**：[webapp.py:298-321](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L298-L321)
+
+```python
+def image_proxify(url: str):
+    if not url:                    # ① 空值 → 原样返回
+        return url
+    if url.startswith('//'):
+        url = 'https:' + url       # ② //xxx → https://xxx
+    if not sxng_request.preferences.get_value('image_proxy'):
+        return url                 # ③ 用户关闭代理 → 直连返回
+    if url.startswith('data:image/'):
+        # 白名单格式校验
+        if (合法 base64 图片格式):
+            return url             # ④ data: 合法图片 → 原样放行
+        return None                # ⑤ data: 非法 → 阻止（返回 None）
+    # ⑥ 其他 → 生成代理 URL
+    h = new_hmac(settings['server']['secret_key'], url.encode())
+    return '{0}?{1}'.format(
+        url_for('image_proxy'),
+        urlencode(dict(url=url.encode(), h=h)))
+```
+
+**六种分支**：
+
+| # | 条件 | 输出 | 举例 |
+|---|---|---|---|
+| ① | `url` 为空/None | 原样返回空值 | `""` |
+| ② | `url` 以 `//` 开头 | 先补 `https:`，然后继续判断 | `//x.com/a.png` → `https://x.com/a.png` |
+| ③ | 用户偏好 `image_proxy=False` | 直连（不代理） | `https://x.com/a.png` 原样输出 |
+| ④ | `data:image/{合法格式};base64,` | 原样放行 data URL | `data:image/png;base64,iVBOR...` |
+| ⑤ | `data:` 但不符合白名单 | 返回 `None`（阻止） | `data:text/html,<script>...` |
+| ⑥ | 其他所有情况（http/https URL） | `/image_proxy?url=<URL>&h=<HMAC>` | 带签名的代理 URL |
+
+**④ 中合法 data: 格式白名单**（精确匹配）：
+```
+['gif', 'png', 'jpeg', 'pjpeg', 'webp', 'tiff', 'bmp']
+```
+且必须包含 `;base64,` 标记。非图片 `data:`（如 `data:text/html`、`data:application/javascript`）或非 base64 编码的图片均被阻止。
+
+#### C.3 服务端代理校验
+
+**源码位置**：[webapp.py:1002-L1071](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L1002-L1071)
+
+```python
+@app.route('/image_proxy', methods=['GET'])
+def image_proxy():
+    url = sxng_request.args.get('url')
+    if not url:                                   # 1. 参数存在性
+        return '', 400
+    if not is_hmac_of(secret_key, url.encode(), args.get('h', '')):
+        return '', 400                            # 2. HMAC 签名
+    maximum_size = 5 * 1024 * 1024                # 3. 5MB 上限
+    resp, stream = http_stream('GET', url, ..., allow_redirects=True)
+    if content_length and int(content_length) > maximum_size:
+        return 'Max size', 400                    # 4. 大小限制
+    if resp.status_code != 200:
+        return '', 400                            # 5. 状态码必须 200
+    ct = resp.headers.get('Content-Type', '')
+    if not ct.startswith('image/') and not ct.startswith('binary/octet-stream'):
+        return '', 400                            # 6. Content-Type 白名单
+    # 通过所有校验 → 流式转发响应
+```
+
+**注意**：图片点击跳转的 `<a href="{{ result.img_src }}">`（见 [images.html:2](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/images.html#L2) 和 [images.html:12](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/images.html#L12)）**不经过图片代理**，直接直连原图 URL，仅 `<img>` 的 `src` 走代理。
+
+---
+
+### 路径 D：iframe 媒体延迟加载
+
+**触发条件**：结果含有 `iframe_src` 字段（常见于视频结果）
+
+#### D.1 模板层渲染
+
+**源码位置**：[macros.html:72-79](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L72-L79)
+
+```html
+{% macro iframe(iframe_src) %}
+  <iframe data-src="{{iframe_src}}" frameborder="0" allowfullscreen
+    {% if result.parsed_url.hostname in ("www.youtube.com",) %}
+    allow="picture-in-picture" referrerpolicy="origin"
+    {% endif %}>
+  </iframe>
+{% endmacro %}
+```
+
+关键属性：
+- **`data-src` 而非 `src`**：浏览器初始不会加载 iframe，需要 JS 端将 `data-src` 复制到 `src`
+- **YouTube 特殊处理**：`allow="picture-in-picture"` 限制 iframe 权限，`referrerpolicy="origin"` 仅发送源站 Referer
+
+#### D.2 触发加载 — 用户点击展开
+
+在 [default.html:5-6](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/default.html#L5-L6) 和 [videos.html:5-7](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/videos.html#L5-L7) 中，iframe 被折叠在 `btn-collapse` 按钮之后：
+
+```html
+{% if result.iframe_src %}
+<p class="altlink">
+  <a class="btn-collapse collapsed media-loader disabled_if_nojs"
+     data-target="#result-media-{{ index }}"
+     data-btn-text-collapsed="{{ _('show media') }}"
+     data-btn-text-not-collapsed="{{ _('hide media') }}">
+     {{ icon_small('play') }} {{ _('show media') }}
+  </a>
+</p>
+```
+
+按钮带 `media-loader` class，由前端 JS 监听点击事件，点击后将对应 iframe 的 `data-src` → `src`，触发加载。
+
+#### D.3 插件管道预处理
+
+在 [_base.py:272](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L272) 的 URL 字段列表中，`iframe_src` 和 `audio_src` 与 `url`、`img_src` 同列，因此：
+- Tracker URL Remover 会清理 iframe URL 中的追踪参数
+- Hostnames 插件会对 iframe 主机名执行 replace/remove
+
+---
+
+### 路径 E：普通搜索结果直出
+
+**触发条件**：所有未被路径 A/B 拦截的常规搜索结果
+
+#### E.1 完整流程
+
+```
+ResultContainer.extend()
+   │
+   ├─ result.normalize_result_fields()
+   │    └─ _normalize_url_fields(result)         # URL 规范化
+   │
+   ├─ self.on_result(result)                      # 插件 on_result 钩子
+   │    ├─ tracker_url_remover.on_result()
+   │    │    └─ result.filter_urls(clean_url)     # 清追踪参数（所有 URL 字段）
+   │    ├─ hostnames.on_result()
+   │    │    ├─ 主机名匹配 → return False (删除整个结果)
+   │    │    ├─ result.filter_urls(replace/remove_host)
+   │    │    └─ 设置 priority
+   │    └─ oa_doi_rewrite.on_result()
+   │         └─ result.filter_urls(rewrite_doi)   # 仅重写 url 字段
+   │
+   └─ 加入结果列表
+```
+
+调用顺序见 [results.py:83-133](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/results.py#L83-L133)：
+
+```python
+def extend(self, engine_name, results):
+    for result in list(results):
+        result.normalize_result_fields()            # 先规范化
+        if not self.on_result(result):              # 再跑插件管道
+            continue                                # 插件返回 False → 丢弃
+        # 加入对应结果列表...
+```
+
+插件管道由 [SearchWithPlugins._on_result()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/search/__init__.py#L198-L199) 触发：
+```python
+def _on_result(self, result):
+    return searx.plugins.STORAGE.on_result(self.request, self, result)
+```
+
+#### E.2 filter_urls() 覆盖字段
+
+**源码位置**：[_base.py:261-286](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L261-L286)
+
+```python
+def filter_urls(self, filter_func):
+    # 覆盖字段列表：
+    ["url", "iframe_src", "audio_src", "img_src", "thumbnail_src", "thumbnail"]
+    # + Infobox 的 urls 列表
+    # + Infobox attributes 中的 image.src
+```
+
+`filter_func` 返回值约定：
+- `True` → 字段保持不变
+- `False` → 删除该 URL（整个字段清空或结果被移除）
+- `str` → 用返回值替换原 URL
+
+#### E.3 HTML 渲染
+
+**① 结果标题链接** — [macros.html:8-10](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L8-L10)
+
+```html
+{% macro result_open_link(url, classes='') %}
+    <a href="{{ url }}"
+       {% if classes %}class="{{ classes }}"{% endif %}
+       {% if results_on_new_tab %}
+           target="_blank" rel="noopener noreferrer"
+       {% else %}
+           rel="noreferrer"
+       {% endif %}>
+{% endmacro %}
+```
+
+`results_on_new_tab` 来自 [settings.yml:145](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/settings.yml#L145)（默认 `false`）。
+
+**② URL 面包屑展示** — [macros.html:27-30](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L27-L30)
+
+```html
+<div class="url_wrapper">
+  {% for part in get_pretty_url(result.parsed_url) %}
+  <span class="url_o{{loop.index}}"><span class="url_i{{loop.index}}">{{ part }}</span></span>
+  {% endfor %}
+</div>
+```
+
+`get_pretty_url()` 格式由偏好 `url_formatting` 控制（[preferences.py:487-490](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/preferences.py#L487-L490)）：
+
+| 值 | 输出（以 `https://example.com/foo/bar?q=1` 为例） |
+|---|---|
+| `full` | `["https://example.com/foo/bar?q=1"]` |
+| `host` | `["example.com"]` |
+| `pretty`（默认） | `["example.com", " › foo", " › bar"]` |
+
+**③ 缓存链接** — [macros.html:48-54](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L48-L54)
+
+```html
+{{ icon_small('ellipsis-vertical')
+   + result_link(cache_url + result.url, _('cached'), "cache_link") }}
+```
+
+`cache_url` 来自 [settings.yml:139-140](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/settings.yml#L139-L140)（默认空字符串，可配置为如 `"https://webcache.googleusercontent.com/search?q=cache:"`）。当为空时，`cache_url + result.url` 就是 `result.url` 本身。
+
+**④ 磁力/种子链接** — [torrent.html:6-9](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/torrent.html#L6-L9)
+
+```html
+<p class="altlink">
+  {% if result.magnetlink %}
+    {{ result_link(result.magnetlink, ...) }}
+  {% endif %}
+  {% if result.torrentfile %}
+    {{ result_link(result.torrentfile, ...) }}
+  {% endif %}
+</p>
+```
+
+`magnet:` 协议链接不经过任何代理，直接通过 `result_link()` 渲染，带 `rel="noreferrer"` 保护。
+
+---
+
+### 路径 F：Favicon 代理中转
+
+**触发条件**：偏好 `favicon_resolver != ""`
+
+#### F.1 调用位置
+
+**源码位置**：[macros.html:21-35](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L21-L35)
+
+```html
+{% macro result_header(result, favicons, image_proxify) %}
+<article ...>
+  {{ result_open_link(result.url, "url_header") }}
+  {% if favicon_resolver != "" %}
+  <div class="favicon">
+    <img loading="lazy" src="{{ favicon_url(result.parsed_url.netloc) }}">
+  </div>
+  {% endif %}
+  ...
+```
+
+传入参数是 `result.parsed_url.netloc`（主机名+端口，不含路径），而非完整 URL。
+
+#### F.2 favicon_url() 决策树
+
+**源码位置**：[favicons/proxy.py:195-237](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L195-L237)
+
+```python
+def favicon_url(authority):
+    theme = sxng_request.preferences.get_value("theme")
+    favicon = db_session.get(theme, authority)  # 查缓存
+
+    if favicon is not None:
+        if not favicon:
+            # 缓存标记：无 favicon → 返回默认 SVG data URL
+            _, fav = CFG.resolver_map['']
+            return fav(theme)
+        # 缓存命中 → 返回 data URL（base64 内嵌，不走代理）
+        return favicon
+
+    # 缓存未命中 → 生成带 HMAC 的代理 URL
+    h = webutils.new_hmac(CFG.secret_key, authority.encode())
+    return '{0}?{1}'.format(
+        url_for('favicon_proxy'),
+        urlencode({
+            'authority': authority,
+            'h': h
+        }))
+```
+
+**三种分支**：
+
+| # | 条件 | 输出 | 举例 |
+|---|---|---|---|
+| ① | 缓存命中且有内容 | `data:image/png;base64,....`（直出 data URL） | 内嵌图片，无额外请求 |
+| ② | 缓存命中但标记为空 | 默认主题 SVG data URL | `data:image/svg+xml,...` |
+| ③ | 缓存未命中 | `/favicon_proxy?authority=<host>&h=<HMAC>` | 走代理路由 |
+
+这是一个**缓存优先策略**：首次加载走代理，代理成功后将 favicon 存入缓存（转为 data URL），后续请求直接从缓存返回 data URL，不再产生额外网络请求。
+
+#### F.3 服务端代理校验
+
+**源码位置**：[favicons/proxy.py:112-157](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L112-L157)
+
+```python
+def favicon_proxy():
+    authority = sxng_request.args.get('authority')
+    if not authority or "/" in authority:      # 1. authority 格式校验（不允许含 /）
+        return '', 400
+    if not is_hmac_of(CFG.secret_key, authority.encode(), args.get('h', '')):
+        return '', 400                          # 2. HMAC 签名校验
+    resolver = sxng_request.preferences.get_value('favicon_resolver')
+    if not resolver or resolver not in CFG.resolver_map:
+        return "", 400                          # 3. 解析器必须在白名单
+
+    # 请求 favicon，成功后写入缓存（转为 data URL）
+    ...
+    # 降级路径：失败时返回默认 SVG favicon
+    theme = sxng_request.preferences.get_value("theme")
+    fav, mimetype = CFG.favicon(theme=theme)
+    return flask.send_from_directory(fav.parent, fav.name, mimetype=mimetype)
+```
+
+---
+
+## 4. 无 scheme 地址的最终形态与降级路径
+
+### 4.1 降级入口：_normalize_url_fields()
+
+**源码位置**：[result_types/_base.py:38-L83](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L38-L83)
 
 ```python
 def _normalize_url_fields(result):
@@ -60,531 +523,153 @@ def _normalize_url_fields(result):
 
     if result.parsed_url:
         result.parsed_url = result.parsed_url._replace(
-            scheme=result.parsed_url.scheme or "http",
+            scheme=result.parsed_url.scheme or "http",  # ← 降级核心
             path=result.parsed_url.path,
         )
         result.url = result.parsed_url.geturl()
 ```
 
-**关键安全行为**：
-- **缺失协议降级为 `http`**：如果 URL 没有 scheme（如 `example.com/path`），默认补全为 `http://`。这是一个有意的保守选择——比猜测 `https` 更安全，因为 `http` 不会产生虚假的安全承诺。
-- **类型校验**：非字符串类型的 URL 被强制清空为 `""`，防止类型混淆攻击。
-- **同步 `url` 与 `parsed_url`**：规范化后用 `parsed_url.geturl()` 回写 `url` 字段，确保两者始终一致。
+**核心语句**：`scheme=result.parsed_url.scheme or "http"`
 
-Infobox 中的 URL 也经过同样的规范化处理（第 59-83 行），包括 `urls` 列表和 `id` 字段中的 URL。
+对于以下三处 URL，规则完全一致：
+1. 主结果 `result.url`（第 52-54 行）
+2. Infobox 的 `urls[]` 列表（第 68-70 行）
+3. Infobox 的 `id` 字段（第 77-79 行）
 
-### 3.2 引擎级规范化 — `normalize_url()`
+### 4.2 urllib.parse.urlparse() 对无 scheme URL 的行为
 
-**源码位置**: [utils.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/utils.py#L256-L303)
-
-引擎在解析搜索结果时使用的工具函数，处理更复杂的相对 URL 场景：
-
-```python
-def normalize_url(url: str, base_url: str) -> str:
-    if url.startswith('//'):
-        parsed_search_url = urlparse(base_url)
-        url = '{0}:{1}'.format(parsed_search_url.scheme or 'http', url)
-    elif url.startswith('/'):
-        url = urljoin(base_url, url)
-
-    if '://' not in url:
-        url = urljoin(base_url, url)
-
-    parsed_url = urlparse(url)
-    if not parsed_url.netloc:
-        raise ValueError('Cannot parse url')
-    if not parsed_url.path:
-        url += '/'
-
-    return url
+`urllib.parse.urlparse("example.com/path?q=1")` 的解析结果：
+```
+ParseResult(
+    scheme='',          # 空字符串 → 或运算后变成 "http"
+    netloc='',          # 空！没有 // 前缀时，urlparse 把整段当作 path
+    path='example.com/path',
+    params='',
+    query='q=1',
+    fragment=''
+)
 ```
 
-**处理场景**：
-| 输入 URL | base_url | 输出 |
+### 4.3 四类典型输入的最终形态
+
+| 输入（原始 URL） | `urlparse()` 解析后各字段 | `_replace(scheme=scheme or "http")` 后 | `.geturl()` 最终输出 |
+|---|---|---|---|
+| `"example.com"` | `scheme=""`, `netloc=""`, `path="example.com"` | `scheme="http"`, `path="example.com"` | `**http://example.com**` |
+| `"example.com/path?q=1"` | `scheme=""`, `netloc=""`, `path="example.com/path"`, `query="q=1"` | `scheme="http"` | `**http://example.com/path?q=1**` |
+| `"//example.com/path"` | `scheme=""`, `**netloc="example.com"**`, `path="/path"` | `scheme="http"` | `**http://example.com/path**` |
+| `"ftp://example.com/file"` | `scheme="ftp"`, `netloc="example.com"` | `scheme="ftp"`（保持不变） | `ftp://example.com/file` |
+
+**关键发现**：
+- 形如 `example.com`（无 `//` 前缀）的 URL，`urllib.parse` 会将其完全放入 `path` 字段，`netloc` 为空。但 `geturl()` 在输出时会正确地把 `http://` 加上，并将路径起始的域名部分识别为 netloc——最终输出是符合直觉的 `http://example.com`。
+- 形如 `//example.com`（协议相对 URL），`netloc` 被正确识别，scheme 为空 → 补为 `http`。
+
+### 4.4 其他位置的无 scheme 处理
+
+| 位置 | 处理方式 | 最终 scheme |
 |---|---|---|
-| `//example.com` | `https://engine.com/` | `https://example.com/` |
-| `/path?a=1` | `https://engine.com` | `https://engine.com/path?a=1` |
-| `relative/path` | `https://engine.com/page/` | `https://engine.com/page/relative/path` |
+| `_normalize_url_fields()` 主/infobox URL | `scheme or "http"` | `http` |
+| `utils.normalize_url()` 中 `//xxx` | `base_url.scheme or 'http'` | 与 base_url 一致或 `http` |
+| `utils.normalize_url()` 中 `/path` | `urljoin(base_url, ...)` | 继承 base_url 的 scheme |
+| `webapp.image_proxify()` 中 `//xxx` | 硬编码 `'https:'` | `https` |
+| `external_bang.resolve_bang_definition()` 中 `//xxx` | 硬编码 `'https:'` | `https` |
 
-**协议继承**：`//` 开头的 URL 从 `base_url` 继承 scheme，而非硬编码 `https`。这确保了协议一致性。
+**不一致性**：`_normalize_url_fields()` 对 `//xxx` 补 `http`，但 `image_proxify()` 和 `resolve_bang_definition()` 对 `//xxx` 补 `https`。三处实现不统一。
 
-### 3.3 HTTPS 升级 — `merge_two_main_results()`
+### 4.5 合并阶段的 HTTPS 升级
 
-**源码位置**: [results.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/results.py#L377-L381)
-
-当相同结果来自多个引擎时，合并逻辑会自动升级到更安全的协议：
+**源码位置**：[results.py:377-L381](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/results.py#L377-L381)
 
 ```python
+# merge_two_main_results() 中
 if origin.parsed_url and not origin.parsed_url.scheme.endswith("s"):
+    # 当前 scheme 不以 s 结尾（http, ftp）
     if other.parsed_url and other.parsed_url.scheme.endswith("s"):
+        # 另一来源有安全 scheme（https, ftps）
         origin.parsed_url = origin.parsed_url._replace(scheme=other.parsed_url.scheme)
         origin.url = origin.parsed_url.geturl()
 ```
 
-这实现了 **自动 HTTPS 优先合并**：如果任一来源提供了 `https`（或 `ftps` 等安全变体），最终结果会使用安全协议。
+这意味着：**即使在规范化阶段降级为 `http`，如果同一结果的另一引擎返回了 `https` URL，最终结果仍会被升级为 `https`**。
+
+最终的降级-升级路径：
+```
+example.com
+   │ urlparse
+   ▼
+scheme="", netloc=""
+   │ _normalize_url_fields: scheme or "http"
+   ▼
+http://example.com
+   │ （如有另一引擎返回 https://example.com）
+   ▼ merge_two_main_results: endswith("s") 升级
+https://example.com
+```
 
 ---
 
-## 4. 追踪器移除（Tracker URL Remover）
+## 5. 特殊协议处理
 
-### 4.1 插件实现
+### 5.1 `//` 协议相对 URL
 
-**源码位置**: [plugins/tracker_url_remover.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/plugins/tracker_url_remover.py#L44-L58)
-
-该插件通过 `on_result` 钩子，对每个搜索结果的所有 URL 字段执行追踪参数清理：
-
-```python
-def on_result(self, request, search, result):
-    result.filter_urls(self.filter_url_field)
-    return True
-
-@classmethod
-def filter_url_field(cls, result, field_name, url_src):
-    if not url_src:
-        return True
-    return TRACKER_PATTERNS.clean_url(url=url_src)
-```
-
-`filter_urls()` 方法会对结果中 **所有 URL 字段** 执行过滤：
-- `url`, `iframe_src`, `audio_src`, `img_src`, `thumbnail_src`, `thumbnail`
-- Infobox 的 `urls` 列表和 `attributes` 中的 `image.src`
-
-### 4.2 ClearURLs 规则引擎 — `TrackerPatternsDB.clean_url()`
-
-**源码位置**: [data/tracker_patterns.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/data/tracker_patterns.py#L111-L176)
-
-这是追踪参数清理的核心引擎，基于开源项目 [ClearURLs](https://clearurls.xyz) 的规则：
-
-**规则数据结构**：
-```python
-RuleType = tuple[str, list[str], list[str]]
-# Fields: (url_regexp, url_ignore, del_args)
-```
-
-**清理流程**：
-
-1. **URL 匹配**：用 `url_regexp` 正则匹配完整 URL
-2. **忽略检查**：如果 URL 命中 `url_ignore` 中的任一模式，跳过此规则
-3. **参数清理**：遍历查询参数，删除匹配 `del_args` 中正则的参数名
-4. **非标准查询处理**：对于 `?/foo/bar` 这类非键值对查询，如果匹配则直接清空整个查询字符串
-
-**规则来源**（第 31-36 行）：
-```python
-CLEAR_LIST_URL = [
-    "https://rules1.clearurls.xyz/data.minify.json",
-    "https://rules2.clearurls.xyz/data.minify.json",
-    "https://raw.githubusercontent.com/ClearURLs/Rules/refs/heads/master/data.min.json",
-]
-```
-
-采用多源容灾设计，按顺序尝试获取规则列表，首个返回 HTTP 200 的源即为有效源。
-
----
-
-## 5. 主机名重写与过滤（Hostnames Plugin）
-
-**源码位置**: [plugins/hostnames.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/plugins/hostnames.py#L110-L200)
-
-### 5.1 四种操作模式
-
-| 配置项 | 类型 | 行为 |
+| 位置 | 处理方式 | 代码 |
 |---|---|---|
-| `hostnames.replace` | 正则→主机名映射 | 将匹配的主机名替换为新主机名 |
-| `hostnames.remove` | 正则列表 | 从结果中移除匹配主机的所有结果 |
-| `hostnames.high_priority` | 正则列表 | 提升匹配主机结果的排序优先级 |
-| `hostnames.low_priority` | 正则列表 | 降低匹配主机结果的排序优先级 |
+| `_normalize_url_fields()` | `or "http"` → `http://` | [_base.py:54](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L54) |
+| `utils.normalize_url()` | 继承 base_url scheme，兜底 `http` | [utils.py:284-286](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/utils.py#L284-L286) |
+| `webapp.image_proxify()` | 硬编码 `https:` | [webapp.py:293-294](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L293-L294) |
+| `external_bang.resolve_bang_definition()` | 硬编码 `https:` | [external_bang.py:51-52](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/external_bang.py#L51-L52) |
 
-### 5.2 `filter_url_field()` — URL 级重写与删除
+### 5.2 `data:` 协议
 
-```python
-def filter_url_field(result, field_name, url_src):
-    url_src_parsed = urlparse(url_src)
+仅在 `image_proxify()` 中有显式处理（见路径 C 第 ④⑤ 分支）：
+- `data:image/{gif,png,jpeg,pjpeg,webp,tiff,bmp};base64,...` → 放行
+- 其他所有 `data:`（含非图片类型、非 base64 编码）→ 返回 `None` 阻止
 
-    for pattern in REMOVE:
-        if pattern.search(url_src_parsed.netloc):
-            return False  # 删除此 URL
+其他代码路径中 `data:` URL 没有特殊处理，按普通字符串传递。
 
-    for pattern, replacement in REPLACE.items():
-        if pattern.search(url_src_parsed.netloc):
-            new_url = url_src_parsed._replace(
-                netloc=pattern.sub(replacement, url_src_parsed.netloc)
-            )
-            new_url = urlunparse(new_url)
-            return new_url  # 重写主机名
+### 5.3 `magnet:` 协议
 
-    return True  # 保持不变
-```
+- 来自 torrent 结果，通过 `result_link()` 宏渲染为 `<a href="magnet:...">`，带 `rel="noreferrer"`
+- 不经过代理、不经过规范化（`magnet:` 不是 `http/https`，`_normalize_url_fields()` 的 `scheme or "http"` 不会改写它）
+- Tracker URL Remover 和 Hostnames 插件可能会对 `magnet:` URL 的查询参数执行清理/重写
 
-**安全意义**：
-- **隐私保护**：可将 `youtube.com` 重写为 `invidious.example.com` 等前端替代品，避免用户直接访问跟踪型网站
-- **内容过滤**：`remove` 规则可完全移除特定主机的结果，如屏蔽 `facebook.com`
-- **仅重写 netloc**：使用 `urlparse._replace(netloc=...)` 精确替换，保留路径、查询等部分不变
+### 5.4 `javascript:` / `vbscript:` / `data:`（非图片）等危险协议
 
-### 5.3 结果级操作 — `on_result()`
+代码中 **没有显式 scheme 黑名单**。但以下机制提供间接防护：
 
-```python
-def on_result(self, request, search, result):
-    for pattern in REMOVE:
-        if result.parsed_url and pattern.search(result.parsed_url.netloc):
-            return False  # 从结果列表中移除
-
-    result.filter_urls(filter_url_field)  # URL 级操作
-
-    if isinstance(result, (MainResult, LegacyResult)):
-        for pattern in LOW:
-            if result.parsed_url and pattern.search(result.parsed_url.netloc):
-                result.priority = "low"
-        for pattern in HIGH:
-            if result.parsed_url and pattern.search(result.parsed_url.netloc):
-                result.priority = "high"
-
-    return True
-```
-
-### 5.4 外部配置文件支持
-
-主机名规则支持从外部 YAML 文件加载（第 168-169 行），方便大规模部署时独立管理重写规则：
-```yaml
-hostnames:
-  replace: 'rewrite-hosts.yml'
-```
-
----
-
-## 6. DOI 开放获取重写（OA DOI Rewrite）
-
-**源码位置**: [plugins/oa_doi_rewrite.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/plugins/oa_doi_rewrite.py#L25-L89)
-
-该插件将学术出版物的 DOI 链接重写为开放获取版本：
-
-```python
-def filter_url_field(result, field_name, url_src):
-    if field_name != "url":
-        return True  # 仅重写主 URL 字段
-
-    doi = extract_doi(result.parsed_url)
-    if doi and len(doi) < 50:
-        for suffix in ("/", ".pdf", ".xml", "/full", "/meta", "/abstract"):
-            doi = doi.removesuffix(suffix)
-        new_url = get_doi_resolver() + doi
-        return new_url
-
-    return True
-```
-
-**安全防护**：
-- **DOI 长度限制**（`len(doi) < 50`）：防止过长的 DOI 导致重写后 URL 异常
-- **后缀清理**：移除 `.pdf`、`.xml` 等常见后缀，确保解析器获得干净的 DOI
-- **仅重写 `url` 字段**：其他字段如 `img_src` 不受影响
-
----
-
-## 7. 图片代理中转（Image Proxy）
-
-### 7.1 代理 URL 生成 — `image_proxify()`
-
-**源码位置**: [webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L298-L321)
-
-```python
-def image_proxify(url: str):
-    if not url:
-        return url
-
-    if url.startswith('//'):
-        url = 'https:' + url
-
-    if not sxng_request.preferences.get_value('image_proxy'):
-        return url  # 用户未启用代理，直连
-
-    if url.startswith('data:image/'):
-        partial_base64 = url[len('data:image/') : 50].split(';')
-        if (
-            len(partial_base64) == 2
-            and partial_base64[0] in ['gif', 'png', 'jpeg', 'pjpeg', 'webp', 'tiff', 'bmp']
-            and partial_base64[1].startswith('base64,')
-        ):
-            return url  # 合法 data: URL，直接放行
-        return None  # 非法 data: URL，阻止
-
-    h = new_hmac(settings['server']['secret_key'], url.encode())
-    return '{0}?{1}'.format(url_for('image_proxy'), urlencode(dict(url=url.encode(), h=h)))
-```
-
-**防护要点**：
-
-1. **协议补全**：`//` 开头的 URL 强制升级为 `https:`
-2. **data: URL 白名单**：仅放行格式合法的 base64 编码图片（白名单格式：gif, png, jpeg 等），阻止可能的恶意 data: URL
-3. **HMAC 签名**：对代理 URL 计算 HMAC-SHA256，防止伪造请求
-4. **用户可控**：通过 `image_proxy` 偏好设置，用户可自行决定是否启用
-
-### 7.2 图片代理服务端 — `image_proxy()`
-
-**源码位置**: [webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L1002-L1071)
-
-```python
-@app.route('/image_proxy', methods=['GET'])
-def image_proxy():
-    url = sxng_request.args.get('url')
-    if not url:
-        return '', 400
-
-    if not is_hmac_of(settings['server']['secret_key'], url.encode(), sxng_request.args.get('h', '')):
-        return '', 400  # HMAC 校验失败
-
-    maximum_size = 5 * 1024 * 1024  # 5MB 大小限制
-
-    resp, stream = http_stream(method='GET', url=url, headers=request_headers, allow_redirects=True)
-
-    # Content-Length 检查
-    if content_length and int(content_length) > maximum_size:
-        return 'Max size', 400
-
-    # 状态码检查
-    if resp.status_code != 200:
-        return '', 400
-
-    # Content-Type 白名单
-    if not resp.headers.get('Content-Type', '').startswith('image/') and \
-       not resp.headers.get('Content-Type', '').startswith('binary/octet-stream'):
-        return '', 400
-```
-
-**多层防护**：
-
-| 层级 | 检查项 | 安全意义 |
-|---|---|---|
-| 1 | HMAC 签名校验 | 防止攻击者伪造代理请求，将 SearXNG 变为开放代理 |
-| 2 | 5MB 大小限制 | 防止资源耗尽攻击 |
-| 3 | HTTP 状态码校验 | 仅转发成功的响应 |
-| 4 | Content-Type 白名单 | 仅转发 `image/*` 和 `binary/octet-stream`，阻止 HTML/JS 等恶意内容 |
-| 5 | 随机 User-Agent | 代理请求使用随机浏览器 UA，防止指纹追踪 |
-
-### 7.3 HMAC 实现
-
-**源码位置**: [webutils.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webutils.py#L212-L218)
-
-```python
-def new_hmac(secret_key, url):
-    return hmac.new(secret_key.encode(), url, hashlib.sha256).hexdigest()
-
-def is_hmac_of(secret_key, value, hmac_to_check):
-    hmac_of_value = new_hmac(secret_key, value)
-    return len(hmac_of_value) == len(hmac_to_check) and \
-           hmac.compare_digest(hmac_of_value, hmac_to_check)
-```
-
-使用 `hmac.compare_digest()` 进行**恒定时间比较**，防止时序攻击。长度检查作为前置快速失败条件。
-
----
-
-## 8. Favicon 代理中转
-
-**源码位置**: [favicons/proxy.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L112-L157)
-
-Favicon 代理与图片代理采用类似的 HMAC 保护模式：
-
-```python
-def favicon_proxy():
-    authority = sxng_request.args.get('authority')
-
-    if not authority or "/" in authority:  # 仅允许合法域名
-        return '', 400
-
-    if not is_hmac_of(CFG.secret_key, authority.encode(), sxng_request.args.get('h', '')):
-        return '', 400  # HMAC 校验失败
-
-    resolver = sxng_request.preferences.get_value('favicon_resolver')
-    if not resolver or resolver not in CFG.resolver_map.keys():
-        return "", 400  # 解析器未配置
-```
-
-**额外防护**：
-- **Authority 校验**：参数中不允许包含 `/`，确保只传递域名而非完整 URL
-- **解析器白名单**：仅允许使用配置中注册的解析器
-
-### 8.1 降级路径
-
-当 favicon 不可用时，有优雅的降级策略（第 153-156 行）：
-```python
-# 返回默认空 favicon（SVG data URL）
-theme = sxng_request.preferences.get_value("theme")
-fav, mimetype = CFG.favicon(theme=theme)
-return flask.send_from_directory(fav.parent, fav.name, mimetype=mimetype)
-```
-
-`favicon_url()` 函数（第 195-237 行）还实现了**缓存优先策略**：
-1. 如果 favicon 已在缓存中 → 直接返回 data URL（避免额外 HTTP 请求）
-2. 如果缓存标记为"无 favicon" → 返回默认 SVG data URL
-3. 如果未缓存 → 返回代理 URL（带 HMAC 签名）
-
----
-
-## 9. 特殊协议处理
-
-### 9.1 `//` 协议相对 URL
-
-多处代码对 `//` 开头的协议相对 URL 进行处理：
-
-| 位置 | 处理方式 |
+| 机制 | 防护原理 |
 |---|---|
-| [webapp.py:302-303](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L302-L303) `image_proxify()` | 强制 `https:` |
-| [utils.py:283-286](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/utils.py#L283-L286) `normalize_url()` | 从 base_url 继承 scheme |
-| [external_bang.py:51-52](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/external_bang.py#L51-L52) `resolve_bang_definition()` | 强制 `https:` |
-
-### 9.2 `data:` 协议
-
-`image_proxify()` 对 `data:image/` URL 实施严格的白名单验证：
-- 格式必须为 `data:image/{type};base64,...`
-- `{type}` 仅允许：`gif`, `png`, `jpeg`, `pjpeg`, `webp`, `tiff`, `bmp`
-- 不符合规范的 data URL 返回 `None`（完全阻止）
-
-### 9.3 `magnet:` 协议
-
-**源码位置**: [templates/simple/result_templates/torrent.html](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/torrent.html#L7-L8)
-
-磁力链接和 torrent 文件链接在模板中直接渲染，不经过代理：
-```html
-{%- if result.magnetlink %}{{ result_link(result.magnetlink, ...) }}{%- endif -%}
-{%- if result.torrentfile %}{{ result_link(result.torrentfile, ...) }}{%- endif -%}
-```
-
-`result_link()` 宏（[macros.html:16-18](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L16-L18)）会为这些链接添加 `rel="noreferrer"` 或 `rel="noopener noreferrer"` 保护。
-
-### 9.4 `javascript:` / `vbscript:` 等危险协议
-
-SearXNG 没有显式的危险协议黑名单，但通过以下机制间接防护：
-1. **`_normalize_url_fields()`** 中 `urllib.parse.urlparse()` 会对异常 scheme 进行解析
-2. **引擎代码** 通常只返回 `http`/`https` URL
-3. **Tracker URL Remover** 和 **Hostnames 插件** 的正则匹配通常不会匹配 `javascript:` 等 scheme
-4. **`normalize_url()`** 中 `://` 检查会拒绝无 `://` 的非标准 URL
-
-### 9.5 无 scheme 降级
-
-**默认降级为 `http`**：`_normalize_url_fields()` 中 `scheme=result.parsed_url.scheme or "http"` 意味着所有无 scheme 的 URL 都降级为 HTTP。
-
-**合并时 HTTPS 升级**：在 `merge_two_main_results()` 中，如果任一来源提供了安全 scheme，会自动升级。
+| 引擎代码约束 | 绝大多数搜索引擎只返回 http/https URL，恶意 scheme 很难进入结果集 |
+| `urlparse()` 行为 | `javascript:alert(1)` 被解析为 `scheme="javascript"`, `path="alert(1)"` |
+| Hostnames 插件 | 对 netloc 为空的 URL（如 `javascript:` 的 netloc 为空字符串），正则通常不匹配，不执行 replace，但也不阻止 |
+| Tracker URL Remover | 同理，正则通常只匹配正常互联网域名，不匹配 `javascript:` |
+| `normalize_url()` | 含 `'://' not in url` 检查，但 `javascript:alert(1)` 不含 `://`，会走 `urljoin(base_url, ...)` → 变为 `base_url + javascript:alert(1)`，实际上仍然异常 |
 
 ---
 
-## 10. 渲染层防护
+## 6. 完整安全机制矩阵
 
-### 10.1 Referrer 泄露防护
-
-**源码位置**: [macros.html](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L8-L10)
-
-所有外链统一添加 `rel="noreferrer"` 属性：
-
-```html
-<a href="{{ url }}" {% if results_on_new_tab %}
-   target="_blank" rel="noopener noreferrer"
-{% else %}
-   rel="noreferrer"
-{% endif %}>
-```
-
-- **`noreferrer`**：阻止浏览器在跳转时发送 Referer 头，防止目标站点获知用户来源
-- **`noopener`**（新标签页时附加）：防止 `window.opener` 漏洞，目标页面无法通过 `opener` 访问来源页
-
-### 10.2 新标签页策略
-
-通过 `results_on_new_tab` 配置项（[settings.yml:145](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/settings.yml#L145)），用户可选择：
-- **同标签打开**：`rel="noreferrer"`
-- **新标签打开**：`target="_blank" rel="noopener noreferrer"`（双重保护）
-
-### 10.3 iframe 安全
-
-**源码位置**: [macros.html](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L72-L79)
-
-```html
-<iframe data-src="{{iframe_src}}" frameborder="0" allowfullscreen
-  {% if result.parsed_url.hostname in ("www.youtube.com",) -%}
-  allow="picture-in-picture" referrerpolicy="origin"
-  {%- endif -%}
->
-</iframe>
-```
-
-- **延迟加载**：使用 `data-src` 而非 `src`，iframe 在用户点击后才加载（由 JS 端 `media-loader` 控制）
-- **YouTube 特殊处理**：添加 `referrerpolicy="origin"` 仅发送源站信息（而非完整路径），限制 `allow` 权限
+| 分流路径 | Referrer 保护 | 代理中转 | HMAC 签名 | 延迟加载 | 参数清洗 | 主机重写 |
+|---|---|---|---|---|---|---|
+| **A: Bang 302** | —（浏览器自身行为） | ✗ | ✗ | ✗ | ✓（quote_plus） | ✗ |
+| **B: 首结果 302** | — | ✗ | ✗ | ✗ | ✓（插件管道已执行） | ✓（插件管道已执行） |
+| **C: 图片 `<img>`** | — | ✓ `/image_proxy` | ✓ | ✓ `loading="lazy"` | ✓（filter_urls） | ✓（filter_urls） |
+| **C: 图片 `<a>` 跳转** | ✓ `rel="noreferrer"` | ✗（直连） | ✗ | ✗ | ✓ | ✓ |
+| **D: iframe 媒体** | YouTube 特供 `referrerpolicy="origin"` | ✗ | ✗ | ✓ `data-src` + 点击触发 | ✓（filter_urls） | ✓（filter_urls） |
+| **E: 普通结果** | ✓ `rel="noreferrer"` / `rel="noopener noreferrer"` | ✗ | ✗ | ✗ | ✓ | ✓ |
+| **F: Favicon** | — | ✓ `/favicon_proxy` | ✓ | ✓ `loading="lazy"` | ✗ | ✗（仅传 authority） |
 
 ---
 
-## 11. Bang 重定向保护
+## 7. 潜在改进建议
 
-**源码位置**: [external_bang.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/external_bang.py#L49-L61)
+1. **scheme 显式白名单**：在 `_normalize_url_fields()` 中增加 scheme 白名单校验（仅允许 `http`、`https`、`ftp`、`ftps`、`magnet`），其他 scheme（`javascript:`、`vbscript:`、`data:` 等）直接清空 URL，杜绝间接防护的盲区。
 
-当用户使用 bang 搜索（如 `!g query`）时，系统会重定向到外部搜索引擎：
+2. **统一 `//` 协议处理**：当前三处 `//` 处理逻辑不一致（两处补 `https`，一处补 `http`）。建议统一为 `https`，与现代 Web 实际情况一致。
 
-```python
-def resolve_bang_definition(bang_definition, query):
-    url, rank = bang_definition.split(chr(1))
-    if url.startswith('//'):
-        url = 'https:' + url  # 强制 HTTPS
-    if query:
-        url = url.replace(chr(2), quote_plus(query))  # URL 编码查询
-    else:
-        o = urlparse(url)
-        url = o.scheme + '://' + o.netloc  # 无查询时仅跳转主页
-    return (url, int(rank))
-```
+3. **规范化阶段默认 HTTPS**：无 scheme URL 当前降级为 `http`，可考虑改为 `https` 或通过 `settings.yml` 配置项控制。
 
-**安全考量**：
-- `//` 开头的 bang URL 强制升级为 `https:`
-- 查询参数通过 `quote_plus()` 编码，防止注入
-- bang 定义数据来自 `searx/data/external_bangs.json`，由项目维护
+4. **图片代理重定向限制**：`image_proxy()` 使用 `allow_redirects=True` 但未限制重定向次数和内网目标，建议增加最大重定向次数（如 3 次）并限制目标为公网 IP。
 
-在 [webapp.py:665-667](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L665-L667) 中，重定向直接通过 HTTP 302 实现：
-```python
-if result_container.redirect_url:
-    return redirect(result_container.redirect_url)
-```
+5. **代理 HMAC 有效期**：当前 HMAC 无时间戳，签名永久有效。建议在 HMAC 输入中加入时间戳，服务端校验时限制有效期（如 24 小时）。
 
----
-
-## 12. robots.txt 防爬
-
-**源码位置**: [webapp.py:1187-1198](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L1187-L1198)
-
-```
-User-agent: *
-Allow: /info/en/about
-Disallow: /stats
-Disallow: /image_proxy
-Disallow: /preferences
-Disallow: /*?*q=*
-```
-
-`/image_proxy` 被 `Disallow`，防止搜索引擎索引代理的图片资源。
-
----
-
-## 13. 安全机制总结
-
-| 防护层级 | 机制 | 防止的威胁 |
-|---|---|---|
-| URL 规范化 | scheme 补全、类型校验 | 格式异常导致的解析漏洞 |
-| HTTPS 优先 | 合并时自动升级 | 中间人攻击 |
-| Tracker 移除 | ClearURLs 规则引擎 | 追踪参数泄露用户行为 |
-| 主机名重写 | 正则替换/删除 | 隐私泄露（直访追踪站点） |
-| DOI 重写 | 开放获取替代 | 付费墙追踪 |
-| 图片代理 | HMAC + Content-Type 白名单 | IP 泄露、恶意内容注入 |
-| Favicon 代理 | HMAC + authority 校验 | 开放代理滥用 |
-| Referrer 保护 | `rel="noreferrer"` | 来源信息泄露 |
-| 新标签保护 | `rel="noopener noreferrer"` | `window.opener` 攻击 |
-| data: URL 白名单 | 格式+类型严格校验 | XSS via data: URI |
-| HMAC 签名 | SHA256 + 恒定时间比较 | 代理伪造、时序攻击 |
-| iframe 延迟加载 | `data-src` + 点击触发 | 意外加载追踪资源 |
-
----
-
-## 14. 潜在改进建议
-
-1. **危险协议显式黑名单**：当前对 `javascript:`、`vbscript:`、`data:`（非图片）等危险协议缺少显式过滤，建议在 `_normalize_url_fields()` 中添加 scheme 白名单（仅允许 `http`、`https`、`ftp`、`ftps`、`magnet`）。
-
-2. **规范化阶段 HTTPS 优先**：当前无 scheme URL 默认降级为 `http`，可考虑默认 `https`（现代 Web 环境下更合理），或通过配置项控制。
-
-3. **图片代理重定向限制**：`image_proxy()` 使用 `allow_redirects=True` 但未限制重定向次数和目标域，可能被利用为 SSRF 向内网探测。
-
-4. **代理 URL 过期机制**：当前 HMAC 签名无时间戳，生成的代理 URL 永久有效。添加时间窗口可限制签名有效期。
-
-5. **Content-Security-Policy**：模板中未设置 CSP 头，建议添加严格的 CSP 策略进一步限制外链加载行为。
+6. **Content-Security-Policy 头**：建议在渲染结果页时设置严格的 CSP（如 `default-src 'self'`、`img-src 'self' data:`、`frame-src *`），从浏览器层面进一步约束外链行为。
