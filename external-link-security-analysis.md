@@ -424,76 +424,339 @@ def filter_urls(self, filter_func):
 
 ### 路径 F：Favicon 代理中转
 
-**触发条件**：偏好 `favicon_resolver != ""`
+#### F.1 模板层前置判断 → 完整触发链
 
-#### F.1 调用位置
+favicon 的渲染有**两道前置关卡**：模板层的 `{% if favicon_resolver != "" %}` 判断是第一道，`favicon_url()` 函数内部的 resolver 校验是第二道。
 
-**源码位置**：[macros.html:21-35](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L21-L35)
+##### F.1.1 `favicon_resolver` 变量注入模板
 
-```html
-{% macro result_header(result, favicons, image_proxify) %}
-<article ...>
-  {{ result_open_link(result.url, "url_header") }}
-  {% if favicon_resolver != "" %}
-  <div class="favicon">
-    <img loading="lazy" src="{{ favicon_url(result.parsed_url.netloc) }}">
-  </div>
-  {% endif %}
-  ...
+**源码位置**：[webapp.py:380](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/webapp.py#L380)
+
+`get_base_context()` 将用户偏好的 `favicon_resolver` 值注入所有模板上下文：
+
+```python
+def get_base_context():
+    return {
+        # ...
+        'favicon_resolver': req_pref.get_value('favicon_resolver'),  # 注入模板全局变量
+        # ...
+    }
 ```
 
-传入参数是 `result.parsed_url.netloc`（主机名+端口，不含路径），而非完整 URL。
+取值来源是用户偏好对象 `req_pref.get_value('favicon_resolver')`，偏好定义见 [preferences.py:425-429](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/preferences.py#L425-L429)：
 
-#### F.2 favicon_url() 决策树
+```python
+'favicon_resolver': EnumStringSetting(
+    settings['search']['favicon_resolver'],            # 默认值来自 settings.yml
+    locked=is_locked('favicon_resolver'),
+    choices=list(favicons.proxy.CFG.resolver_map.keys()) + ['']  # 可选：可用 resolver 名 + 空字符串
+),
+```
+
+`EnumStringSetting` 在用户传入非法值（不在 choices 中）时，会**自动回退到默认值**（即 `settings['search']['favicon_resolver']`，通常为 `""`）。
+
+##### F.1.2 模板层条件判断
+
+**源码位置**：[macros.html:24-26](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L24-L26)
+
+`result_header` 宏中：
+
+```html
+{%- if favicon_resolver != "" %}
+<div class="favicon">
+  <img loading="lazy" src="{{ favicon_url(result.parsed_url.netloc) }}">
+</div>
+{%- endif -%}
+```
+
+**判断逻辑**：`favicon_resolver != ""`
+- **成立**（非空字符串）：渲染 `<div class="favicon"><img ...></div>`，调用 `favicon_url()`
+- **不成立**（空字符串）：整个 favicon 区块完全不输出，`favicon_url()` **根本不会被调用**
+
+##### F.1.3 `CFG.resolver_map` 的初始化与可用 resolver 来源
+
+**源码位置**：[proxy.py:34-41](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L34-L41)
+
+```python
+def _initial_resolver_map():
+    d = {}
+    name: str = get_setting("search.favicon_resolver", None)
+    if name:
+        func = DEFAULT_RESOLVER_MAP.get(name)
+        if func:
+            d = {name: f"searx.favicons.resolvers.{func.__name__}"}
+    return d
+```
+
+**关键**：`CFG.resolver_map` 的内容取决于 `settings.yml` 中 `search.favicon_resolver` 的配置值。只有当管理员在全局 settings 中配置了某个 resolver 名（且该名字在 `DEFAULT_RESOLVER_MAP` 中存在），`CFG.resolver_map` 才会有一个条目。
+
+`DEFAULT_RESOLVER_MAP` 定义在 [resolvers.py:94-99](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/resolvers.py#L94-L99)：
+```python
+DEFAULT_RESOLVER_MAP = {
+    "allesedv": allesedv,
+    "duckduckgo": duckduckgo,
+    "google": google,
+    "yandex": yandex,
+}
+```
+
+**举例**：
+- 若 `settings.yml` 中 `search.favicon_resolver: "duckduckgo"`，则 `CFG.resolver_map = {"duckduckgo": "searx.favicons.resolvers.duckduckgo"}`
+- 若 `settings.yml` 中 `search.favicon_resolver: ""`（默认），则 `CFG.resolver_map = {}`（空 dict）
+
+##### F.1.4 完整触发链
+
+```
+settings.yml 配置
+   │
+   ▼
+favicon_proxy._initial_resolver_map()
+   │  仅当 settings 中配置了合法 resolver 名时，CFG.resolver_map 才有内容
+   │  否则 CFG.resolver_map = {}（空）
+   ▼
+preferences.py: EnumStringSetting
+   │  choices 来自 CFG.resolver_map.keys() + ['']
+   │  非法值自动回退为 settings 中的默认值
+   ▼
+webapp.py: get_base_context()
+   │  注入 'favicon_resolver' 模板变量
+   ▼
+模板层 macros.html:
+   │  {% if favicon_resolver != "" %}
+   │    → 空字符串：不渲染 favicon 区块，不调用 favicon_url()
+   │    → 非空字符串：调用 favicon_url(authority)
+   ▼
+favicon_url() 函数内
+   │  再次校验 resolver → 情况①
+   ▼
+缓存查询 / 代理 URL 生成
+```
+
+##### F.1.5 调用位置与参数
+
+`favicon_url()` 由模板 [macros.html:25](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/macros.html#L25) 调用：
+
+```html
+<img loading="lazy" src="{{ favicon_url(result.parsed_url.netloc) }}">
+```
+
+传入参数是 `result.parsed_url.netloc`（主机名+端口，不含路径和 scheme），而非完整 URL。
+
+---
+
+#### F.2 favicon_url() 决策树 — 四种情况的精确代码实现
 
 **源码位置**：[favicons/proxy.py:195-237](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L195-L237)
 
+以下为 `favicon_url()` 的逐行精确实现，标注四种情况：
+
 ```python
 def favicon_url(authority: str) -> str:
+    # ─────────────────────────────────────────────────────────────────
+    # 【情况 ①-A】resolver 为空字符串
+    # 【情况 ①-B】resolver 非空但不在 CFG.resolver_map 白名单中
+    # ─────────────────────────────────────────────────────────────────
+    # L218: 从用户偏好中获取 favicon_resolver
     resolver = sxng_request.preferences.get_value('favicon_resolver')
+
+    # L220: `not resolver` 等价于 resolver == ""（因为 choices 是字符串列表）
+    #       → 覆盖情况 ①-A
+    # L220: `resolver not in CFG.resolver_map.keys()`
+    #       → 覆盖情况 ①-B（非空但不合法）
     if not resolver or resolver not in CFG.resolver_map.keys():
-        return ""                            # ① resolver 未配置 → 空字符串
+        return ""                          # → 两个子情况都返回空字符串
+    #
+    # 【情况 ①-A】resolver 为空字符串
+    #   触发条件：用户偏好 favicon_resolver = ""（默认值）
+    #   实际效果：模板中 <img src="">
+    #   注意：模板层 {% if favicon_resolver != "" %} 已在此时提前拦截，
+    #         favicon_url() 甚至不会被调用。此分支更多作为防御性兜底。
+    #
+    # 【情况 ①-B】resolver 非空但不在白名单
+    #   触发条件：
+    #     1. 管理员在 settings.yml 中配置了合法 resolver
+    #        （如 "duckduckgo"），因此 CFG.resolver_map 非空；
+    #     2. 但用户通过某种方式传入的 resolver 值虽然是非空字符串，
+    #        但不等于 CFG.resolver_map 的 key；
+    #     3. 模板层判断 {% if favicon_resolver != "" %} 为真，
+    #        因此 favicon_url() 被调用。
+    #   注意：正常情况下 EnumStringSetting 会将非法值自动回退为默认值（""），
+    #         因此 ①-B 实际极难触发，属于"深度防御"设计。
+    #   实际效果：<img src="">，图片元素存在但 src 为空，浏览器不加载任何图片。
+    #
+    # 为什么需要双重防御？
+    #   模板层只能做"是否为空"的粗判断，无法获知 CFG.resolver_map 的
+    #   合法值列表。favicon_url() 在 Python 侧持有 CFG 对象，可以执行
+    #   精确的白名单校验，从而防御模板层无法覆盖的边缘场景。
+    # ─────────────────────────────────────────────────────────────────
 
-    data_mime = cache.CACHE(resolver, authority)  # 调用 FaviconCache.__call__()
+    # L223: 调用 CACHE.__call__() 查询缓存
+    #   cache.CACHE 是 FaviconCacheSQLite / FaviconCacheMEM 的全局单例
+    #   入参：(resolver 名称, authority=域名:端口)
+    data_mime = cache.CACHE(resolver, authority)
 
+    # ─────────────────────────────────────────────────────────────────
+    # 【情况 ②】缓存命中 FALLBACK_ICON（该域名已确认无 favicon）
+    # ─────────────────────────────────────────────────────────────────
+    # L225: data_mime == (None, None) 是 FALLBACK_ICON 的返回值
     if data_mime == (None, None):
-        # 缓存命中：已确认为 FALLBACK_ICON（无 favicon）
-        return CFG.favicon_data_url(theme=theme)  # ② → data:image/svg+xml;utf8,...
+        # L227: 获取当前主题名，用于定位对应主题的默认空 favicon
+        theme = sxng_request.preferences.get_value("theme")
+        # L228: 调用 CFG.favicon_data_url(theme=theme)
+        #   → 内部读取 empty_favicon.svg → URL 编码后封装为 data URL
+        return CFG.favicon_data_url(theme=theme)
+    #
+    #   触发条件示例：某域名此前已查询过且返回空，缓存中已标记 FALLBACK_ICON
+    #   实际效果：返回 data:image/svg+xml;utf8,<URL编码的SVG内容>
+    # ─────────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────────
+    # 【情况 ③】缓存命中实际 favicon 数据
+    # ─────────────────────────────────────────────────────────────────
+    # L230: data_mime is not None → 说明缓存中有 (bytes_data, mime_str)
     if data_mime is not None:
-        # 缓存命中：有实际 favicon 数据
+        # L231: 解包为 (二进制字节数据, MIME 类型字符串)
         data, mime = data_mime
-        return f"data:{mime};base64,{base64}"    # ③ → data:image/xxx;base64,...
+        # L232: 对二进制 data 做 base64 编码后封装为 data URL
+        return f"data:{mime};base64,{str(base64.b64encode(data), 'utf-8')}"
+    #
+    #   触发条件示例：某域名的 favicon 已被成功抓取并缓存
+    #   实际效果：返回 data:image/png;base64,iVBORw0KGgoAAAANSU... （直接内嵌，无额外 HTTP 请求）
+    # ─────────────────────────────────────────────────────────────────
 
-    # 缓存未命中 → 生成代理 URL
+    # ─────────────────────────────────────────────────────────────────
+    # 【情况 ④】缓存未命中（data_mime 为 None）
+    # ─────────────────────────────────────────────────────────────────
+    # L234: 用 secret_key 对 authority 做 HMAC-SHA256 签名
     h = new_hmac(CFG.secret_key, authority.encode())
+    # L235: 通过 Flask url_for 生成 /favicon_proxy 路由 URL
     proxy_url = flask.url_for('favicon_proxy')
+    # L236: URL 编码 authority 和 h 参数
     query = urllib.parse.urlencode({"authority": authority, "h": h})
-    return f"{proxy_url}?{query}"                  # ④ → 代理 URL
+    # L237: 拼接为完整代理 URL
+    return f"{proxy_url}?{query}"
+    #
+    #   触发条件示例：首次访问某域名的 favicon，缓存中无记录
+    #   实际效果：返回 /favicon_proxy?authority=example.com&h=abc123def...
+    #           浏览器后续访问该路由，由 favicon_proxy() 服务端函数处理
+    # ─────────────────────────────────────────────────────────────────
 ```
 
-**缓存查询**：`cache.CACHE(resolver, authority)` 调用的是 [FaviconCacheSQLite.__call__()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L320-L336)，其返回值语义：
+##### F.2.1 缓存查询的精确实现 — `FaviconCacheSQLite.__call__()`
 
-| 返回值 | 含义 |
-|---|---|
-| `None` | 缓存未命中（无此 resolver+authority 记录） |
-| `(None, None)` | 缓存命中，但标记为 `FALLBACK_ICON`（已确认无 favicon） |
-| `(bytes_data, mime_str)` | 缓存命中，有实际 favicon 数据 |
+**源码位置**：[favicons/cache.py:320-336](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L320-L336)
 
-`FALLBACK_ICON` 是 [cache.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py) 中的常量，表示"已查询但该域名无 favicon"。`cache.set()` 在 `data is None` 时将 `sha256` 设为 `FALLBACK_ICON`，查询时匹配到 `FALLBACK_ICON` 则返回 `(None, None)`。
+```python
+def __call__(self, resolver: str, authority: str) -> None | tuple[None | bytes, None | str]:
+    # 第一步：在 blob_map 表中查 resolver+authority 对应的 sha256
+    sql = "SELECT sha256 FROM blob_map WHERE resolver = ? AND authority = ?"
+    res = self.DB.execute(sql, (resolver, authority)).fetchone()
+    if res is None:
+        return None                       # → 缓存未命中 → 返回 None（对应情况 ④）
 
-**四种分支**：
+    data, mime = (None, None)
+    sha256 = res[0]
 
-| # | 条件 | 输出 | 举例 |
-|---|---|---|---|
-| ① | `resolver` 未配置或不在白名单 | `""`（空字符串，不渲染 favicon） | 偏好 `favicon_resolver=""` 时 |
-| ② | 缓存命中 `(None, None)`（FALLBACK_ICON） | `data:image/svg+xml;utf8,...`（默认空 favicon SVG） | 主题对应的 `empty_favicon.svg` |
-| ③ | 缓存命中 `(data, mime)` | `data:{mime};base64,{base64}` | `data:image/x-icon;base64,AAABAA...` |
-| ④ | 缓存未命中 `None` | `/favicon_proxy?authority={host}&h={HMAC}` | 带签名的代理 URL |
+    if sha256 == FALLBACK_ICON:          # FALLBACK_ICON = b"FALLBACK_ICON"
+        return data, mime                # → (None, None) → 对应情况 ②
 
-**注意**：分支 ② 中 `CFG.favicon_data_url()` 返回的是 `data:image/svg+xml;utf8,{url_encoded_svg}` 格式（[proxy.py:107](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L107)），编码方式为 `utf8` 而非 `base64`。分支 ③ 中缓存命中的 favicon 数据则使用 `base64` 编码。
+    # 有实际 sha256，去 blobs 表取实际数据和 MIME
+    sql = "SELECT data, mime FROM blobs WHERE sha256 = ?"
+    res = self.DB.execute(sql, (sha256,)).fetchone()
+    if res is not None:
+        data, mime = res
+    return data, mime                    # → (bytes, str) 或 (None, None) → 对应情况 ③
+```
 
-这是一个**缓存优先策略**：首次加载走代理（④），代理成功后将 favicon 存入 SQLite 缓存（[cache.py:338-373](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L338-L373)），后续请求直接从缓存返回 data URL（③），不再产生额外网络请求。
+**三种返回值与四种情况的映射**：
+
+| `CACHE(resolver, authority)` 返回值 | `favicon_url()` 中分支 | 对应情况 |
+|---|---|---|
+| `None` | 跳过前两个 `if`，落到最后 | ④ 缓存未命中 |
+| `(None, None)` | 命中第一个 `if data_mime == (None, None)` | ② FALLBACK_ICON |
+| `(bytes_data, mime_str)` | 跳过第一个 `if`，命中第二个 `if data_mime is not None` | ③ 命中实际数据 |
+
+**注意**：内存缓存 `FaviconCacheMEM.__call__()`（[cache.py:463-471](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L463-L471)）与 SQLite 实现完全一致，同样返回 `None` / `(None, None)` / `(bytes, str)` 三种值。
+
+##### F.2.2 `FALLBACK_ICON` 的写入与标记流程
+
+**源码位置**：`FaviconCacheSQLite.set()` [cache.py:338-373](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L338-L373)
+
+写入时的关键判断：
+
+```python
+def set(self, resolver: str, authority: str, mime: str | None, data: bytes | None) -> bool:
+    # ... 前置校验：数据大小、MIME 完整性 ...
+
+    if data is None:
+        sha256 = FALLBACK_ICON          # ← 无 favicon 时，sha256 标记为字节常量
+    else:
+        sha256 = hashlib.sha256(data).hexdigest()  # ← 有数据时，对 bytes 做 sha256
+
+    with self.connect() as conn:
+        if sha256 != FALLBACK_ICON:
+            # 仅当有实际数据时才写入 blobs 表（避免插入无意义的 FALLBACK_ICON 占位）
+            conn.execute(self.SQL_INSERT_BLOBS, (sha256, bytes_c, mime, data))
+        # blob_map 表始终写入：建立 (resolver, authority) → sha256 的映射
+        conn.execute(self.SQL_INSERT_BLOB_MAP, (sha256, resolver, authority))
+```
+
+写入流程的触发点在 `search_favicon()`（[proxy.py:183-192](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L183-L192)）：
+
+```python
+try:
+    data, mime = func(authority, timeout=CFG.resolver_timeout)
+    if data is None or mime is None:
+        data, mime = (None, None)        # ← 任一为空 → 规范化为 (None, None)
+except (HTTPError, SearxEngineResponseException):
+    pass                                 # ← 异常时保持 data,mime = (None,None) 不变
+
+cache.CACHE.set(resolver, authority, mime, data)  # ← 写入缓存
+return data, mime
+```
+
+##### F.2.3 `CFG.favicon_data_url()` 的精确实现
+
+**源码位置**：[proxy.py:93-109](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L93-L109)
+
+```python
+def favicon_data_url(self, **replacements):
+    # 对替换参数排序后构造 cache_key（如 "theme:simple"）
+    cache_key = ", ".join(f"{x}:{replacements[x]}" for x in sorted(replacements.keys(), key=str))
+    # DEFAULT_FAVICON_URL 是进程内 dict，避免重复读取 SVG 文件
+    data_url = DEFAULT_FAVICON_URL.get(cache_key)
+    if data_url is not None:
+        return data_url
+
+    # 首次调用：读取 empty_favicon.svg 的原始文本
+    fav, mimetype = CFG.favicon(**replacements)
+    with fav.open("r", encoding="utf-8") as f:
+        data_url = f.read()
+
+    # 对 SVG 原文做 URL 百分号编码，封装为 data URL
+    data_url = urllib.parse.quote(data_url)
+    data_url = f"data:{mimetype};utf8,{data_url}"
+    # 写回进程内 dict 缓存
+    DEFAULT_FAVICON_URL[cache_key] = data_url
+    return data_url
+```
+
+**格式细节**：`favicon_data_url()` 使用的是 **`;utf8,` + URL 百分号编码**，与情况 ③ 中 `;base64,` + base64 编码 **完全不同**：
+
+| 情况 | 编码方式 | data URL 格式示例 |
+|---|---|---|
+| ② FALLBACK_ICON（CFG.favicon_data_url） | `urllib.parse.quote(SVG文本)` | `data:image/svg+xml;utf8,%3Csvg%20xmlns%3D...` |
+| ③ 命中缓存数据 | `base64.b64encode(二进制数据)` | `data:image/png;base64,iVBORw0KGgo...` |
+
+##### F.2.4 四种分支（含子情况）最终输出对照
+
+| # | 触发条件 | 模板层是否调用 `favicon_url()` | `favicon_url()` 返回值 | 用户端效果 |
+|---|---|---|---|---|
+| **①-A** | `favicon_resolver = ""` | **否**（`{% if favicon_resolver != "" %}` 提前拦截） | 不执行 | favicon 区块 DOM 完全不存在 |
+| **①-B** | `favicon_resolver` 非空但不在 `CFG.resolver_map.keys()` | **是**（模板层判断为真） | `""`（空字符串） | `<img src="">`，DOM 存在但浏览器不加载任何图片 |
+| **②** | 缓存命中 FALLBACK_ICON | 是 | `data:image/svg+xml;utf8,<URL编码SVG>` | 内嵌默认空 favicon，无额外 HTTP 请求 |
+| **③** | 缓存命中实际数据 | 是 | `data:{mime};base64,<base64>` | 内嵌真实 favicon，无额外 HTTP 请求 |
+| **④** | 缓存未命中 | 是 | `/favicon_proxy?authority=<host>&h=<HMAC>` | 浏览器再发起一次请求，由 `favicon_proxy()` 处理并降级 |
 
 #### F.3 服务端代理校验
 
