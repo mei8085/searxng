@@ -95,11 +95,9 @@ def favicon_url(authority: str) -> str:
     return f"{proxy_url}?{query}"   # ← 也不调用 set()！
 ```
 
-### 3.2 关键修正：favicon_url 中**没有任何 set() 调用**
+### 3.2 关键事实：favicon_url 中**没有任何 set() 调用**
 
-**之前的错误**：认为"每次访问命中失败缓存都会续期 `m_time`"。
-
-**正确结论**：`favicon_url()` 只是**只读**地查缓存，三种分支都不会调用 `cache.set()`。因此：
+`favicon_url()` 只是**只读**地查缓存，三种分支都不会调用 `cache.set()`。因此：
 
 - 命中失败缓存 → 直接返回占位图 Data URL，**不刷新 `m_time`，不续期**
 - 命中成功缓存 → 直接返回 Base64 Data URL，**不刷新 `m_time`，不续期**
@@ -211,7 +209,7 @@ def search_favicon(resolver: str, authority: str) -> tuple[None | bytes, None | 
     return data, mime
 ```
 
-### 4.3 关键结论：唯一会写入缓存的时机
+### 4.3 关键事实：唯一会写入缓存的时机
 
 **只有**当缓存真正未命中（`cache.CACHE()` 返回 `None`）并走完 resolver 抓取流程后，才会调用 `cache.set()`。
 
@@ -284,9 +282,134 @@ def __call__(self, resolver: str, authority: str):
 
 ---
 
-## 六、HOLD_TIME 超时与缓存真正过期的完整链条
+## 六、cache.set() 中 maintenance 与写入的执行顺序（已修正）
 
-### 6.1 读取路径不做超时检查
+### 6.1 执行顺序：先 maintenance，再写入
+
+在 [cache.py:L338-L373](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L338-L373) 中，代码结构如下：
+
+```python
+def set(self, resolver: str, authority: str, mime: str | None, data: bytes | None) -> bool:
+
+    # Step 1: 先检查并运行 maintenance
+    if self.cfg.MAINTENANCE_MODE == "auto" and int(time.time()) > self.next_maintenance_time:
+        self.maintenance()   # ← 先做 maintenance（可能删除其他过期记录）
+
+    # Step 2: 再做参数校验
+    if data is not None and mime is None:
+        ...
+        return False
+    if bytes_c > self.cfg.BLOB_MAX_BYTES:
+        ...
+        return False
+
+    # Step 3: 最后才写入当前这条记录
+    with self.connect() as conn:
+        if sha256 != FALLBACK_ICON:
+            conn.execute(self.SQL_INSERT_BLOBS, (sha256, bytes_c, mime, data))
+        conn.execute(self.SQL_INSERT_BLOB_MAP, (sha256, resolver, authority))
+    ...
+    return True
+```
+
+**顺序非常关键**：
+
+1. **先跑 maintenance**：如果满足条件，先 DELETE 掉所有 `m_time < now - HOLD_TIME` 的记录，包括本次 set() 所属 `(resolver, authority)` 自己可能存在的旧记录。
+2. **再写当前记录**：新写入的记录 `m_time = now`，当然不会被刚才的 maintenance 删到（因为 maintenance 已经跑完了）。
+
+**重要推论**：如果某次 set() 触发了 maintenance，且当前 `(resolver, authority)` 恰好有一条旧记录已经超过 HOLD_TIME，那么旧记录会先被 maintenance DELETE，然后 UPSERT 写入一条全新的记录（`m_time` 为当前时间）。从效果看，等于刷新了 `m_time`。
+
+### 6.2 首次写入是否立即触发 maintenance
+
+要回答这个问题，需要看 `next_maintenance_time` 的计算方式和 `LAST_MAINTENANCE` 的初始值。
+
+**`next_maintenance_time` 计算**，[cache.py:L376-L379](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L376-L379)：
+
+```python
+@property
+def next_maintenance_time(self) -> int:
+    return self.cfg.MAINTENANCE_PERIOD + self.properties.m_time("LAST_MAINTENANCE")
+```
+
+**`LAST_MAINTENANCE` 初始值**，在数据库建 schema 时由 [sqlitedb.py:L347-L355](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L347-L355) 写入：
+
+```python
+def create_schema(self, conn: sqlite3.Connection):
+    logger.debug("create schema ..")
+    self.properties.set("DB_SCHEMA", self.DB_SCHEMA)
+    self.properties.set("LAST_MAINTENANCE", "")   # ← 初始化时就设了
+    ...
+```
+
+`properties.set()` 在 [sqlitedb.py:L425-L430](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L425-L430) 中：
+
+```sql
+INSERT INTO properties (name, value) VALUES (?, ?)
+    ON CONFLICT(name) DO UPDATE
+   SET value=excluded.value, m_time=strftime('%s', 'now')
+```
+
+**`properties.m_time()`** 在属性不存在时返回默认值 `0`，见 [sqlitedb.py:L450-L456](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L450-L456)。
+
+---
+
+#### 场景 A：全新数据库（第一次运行，schema 刚创建）
+
+| 步骤 | 值 |
+|------|-----|
+| 建 schema 时 | `LAST_MAINTENANCE` 被写入，其 `m_time = 建库时间 T0` |
+| 第一次调用 `set()` 时（T1） | `next_maintenance_time = MAINTENANCE_PERIOD(1h) + T0` |
+| 判断条件 | `T1 > T0 + 1h`？ |
+
+**结论**：如果第一次 set() 发生在建库后 1 小时**以内**（几乎总是如此），则 `T1 < T0 + 1h` → **不触发 maintenance**。只有当第一次 set() 发生在建库 1 小时之后（极端情况）才会触发。
+
+---
+
+#### 场景 B：旧数据库（已存在，LAST_MAINTENANCE 很久没更新）
+
+| 步骤 | 值 |
+|------|-----|
+| `LAST_MAINTENANCE.m_time` | 比如 1 年前的某个时间点 |
+| `next_maintenance_time` | 1年前 + 1h，远小于现在 |
+| 第一次调用 `set()` 时 | `now > 1年前+1h` 必然成立 |
+
+**结论**：**立即触发 maintenance**。
+
+---
+
+#### 场景 C：maintenance 内部再次判断
+
+即使 `set()` 处的条件满足并调用了 `maintenance()`，`maintenance()` 函数入口处还有**第二次同样的判断**，见 [cache.py:L381-L389](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L381-L389)：
+
+```python
+def maintenance(self, force: bool = False):
+    if not force and int(time.time()) < self.next_maintenance_time:
+        logger.debug("no maintenance required yet, next maintenance interval is in the future")
+        return
+    self.properties.set("LAST_MAINTENANCE", "")  # 这里才刷新 LAST_MAINTENANCE.m_time
+    ...
+```
+
+注意 `self.properties.set("LAST_MAINTENANCE", "")` 的位置：**只有在 maintenance 真正决定执行时才会刷新 `LAST_MAINTENANCE.m_time`**。如果因为时间判断提前 return，`LAST_MAINTENANCE.m_time` 保持不变。
+
+同时，maintenance 真正执行时**第一行就把 `LAST_MAINTENANCE.m_time` 刷新为 now**，使得接下来 1 小时内的所有 set() 调用都不会再触发 maintenance。
+
+---
+
+**总结（首次写入是否触发 maintenance）**：
+
+| 数据库状态 | 是否触发 |
+|-----------|---------|
+| 全新库（schema 刚建 < 1h） | ❌ 不触发 |
+| 全新库（schema 刚建 > 1h） | ✅ 触发（极端罕见） |
+| 旧库（LAST_MAINTENANCE 距今 > 1h） | ✅ 触发 |
+| 旧库（LAST_MAINTENANCE 距今 < 1h） | ❌ 不触发 |
+
+---
+
+## 七、HOLD_TIME 超时与失败缓存真正失效并重抓的精确时间点
+
+### 7.1 读取路径不做超时检查
 
 `cache.CACHE()`（`__call__` 方法）的查询 SQL **完全没有 `m_time` 条件**：
 
@@ -296,7 +419,7 @@ SELECT sha256 FROM blob_map WHERE resolver = ? AND authority = ?
 
 即使 `m_time` 已经是十年前的，只要记录还在表中，就会被当作有效缓存返回——包括失败标记。
 
-### 6.2 HOLD_TIME 只在 maintenance 中生效
+### 7.2 HOLD_TIME 只在 maintenance 中生效
 
 `HOLD_TIME`（默认 30 天）只出现在 [cache.py:L396-L400](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L396-L400) 的 maintenance 函数中：
 
@@ -305,7 +428,7 @@ DELETE FROM blob_map
 WHERE cast(m_time as integer) < cast(strftime('%s', 'now') as integer) - {self.cfg.HOLD_TIME}
 ```
 
-### 6.3 maintenance 的触发条件
+### 7.3 maintenance 的触发条件
 
 `maintenance()` 被调用的唯一自动触发点在 `cache.set()` 入口处，[cache.py:L340-L342](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L340-L342)：
 
@@ -321,96 +444,163 @@ if self.cfg.MAINTENANCE_MODE == "auto" and int(time.time()) > self.next_maintena
 
 如果服务器长时间闲置、没有新域名被抓取（即没有 `set()` 调用），即使所有缓存都超过 HOLD_TIME 一万年，也**不会触发 maintenance，不会删除任何记录**。
 
-### 6.4 缓存从"写入"到"真正过期并触发重抓"的完整时间线
+### 7.4 失败缓存从"写入"到"真正失效并重抓"的精确时间线
 
-以下为默认配置（HOLD_TIME=30天，MAINTENANCE_PERIOD=1小时）的典型场景：
+以下为默认配置（HOLD_TIME=30天，MAINTENANCE_PERIOD=1小时）的典型场景，精确标注每个时间点发生了什么：
 
 ```
-Day 0, 09:00
-  事件：用户第一次搜索包含 example.com 的结果
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 0, 09:00:00  [T0]
+  事件：数据库 schema 刚创建
+  状态：properties 表写入 LAST_MAINTENANCE="", 其 m_time = T0
+        blob_map 表为空
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 0, 09:05:00  [T1]
+  事件：用户第一次搜索 example.com（抓取失败）
   流程：
-    - favicon_url() 查缓存 → cache.CACHE() 返回 None（无记录）
-    - 返回 /favicon_proxy URL，浏览器异步请求
-    - search_favicon() 查缓存 → 还是 None
-    - 调用 duckduckgo resolver → 返回 404 → data=None
-    - cache.set(duckduckgo, example.com, None, None)
-      → blob_map 写入：m_time=Day0 09:00, sha256="FALLBACK_ICON"
-      → 同时：检查 maintenance 条件 → 是首次，触发 maintenance
-      → maintenance：无过期记录可删，记录 LAST_MAINTENANCE=Day0 09:00
+    a. 模板渲染调用 favicon_url("example.com")
+       → cache.CACHE("duckduckgo", "example.com") 返回 None（无记录）
+       → 返回 /favicon_proxy?authority=example.com&h=XXXX
+    b. 浏览器异步请求 /favicon_proxy
+       → search_favicon() 再查一次缓存 → 还是 None
+       → 调用 duckduckgo resolver → HTTP 404 → data=None
+       → 进入 cache.set("duckduckgo", "example.com", None, None)
+    c. set() 内部：
+       - 检查 maintenance 条件：
+         next_maintenance_time = MAINTENANCE_PERIOD(1h) + T0
+                              = Day0 10:00:00
+         当前时间 T1(Day0 09:05) < Day0 10:00 → 不触发 maintenance ✓
+       - sha256 = FALLBACK_ICON
+       - UPSERT 写入 blob_map:
+           resolver="duckduckgo"
+           authority="example.com"
+           sha256="FALLBACK_ICON"
+           m_time = T1 (Day0 09:05)
+  状态：blob_map 有 1 条失败记录，m_time=Day0 09:05
+        LAST_MAINTENANCE.m_time 仍为 T0（没动过）
 
-Day 10
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 10, 任意时刻  [T2]
   事件：用户再次搜索 example.com
   流程：
-    - favicon_url() 查缓存 → 返回 (None, None) 失败标记
-    - 直接返回 empty_favicon.svg 的 Data URL
-    - 不调用 /favicon_proxy，不调用 set()
-    - m_time 仍为 Day0 09:00，未续期
+    a. favicon_url("example.com")
+       → cache.CACHE()：SELECT 有记录，sha256="FALLBACK_ICON"
+       → 返回 (None, None) 失败标记
+       → 直接返回 empty_favicon.svg 的 Data URL
+    b. 不请求 /favicon_proxy，不调用 set()，不触发 maintenance
+  状态：blob_map 记录 m_time 仍为 Day0 09:05（未续期）
+        LAST_MAINTENANCE.m_time 仍为 T0
 
-Day 29
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 29, 任意时刻  [T3]
   事件：用户再次搜索 example.com
-  流程：同上，仍命中失败缓存，m_time 不变
+  流程：同 Day 10
+  注意：此时 m_time 距今 29 天，尚未超过 HOLD_TIME(30天)
+        但 cache.CACHE() 根本不查时间，无论是否过期都返回
+  状态：m_time 仍为 Day0 09:05
 
-Day 31, 08:00
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 31, 08:00:00  [T4]
   事件：用户再次搜索 example.com
-  注意：m_time(Day0) 距今已 31 天 > HOLD_TIME(30天)
+  关键事实：m_time(Day0 09:05) 距今已 30天23小时 > HOLD_TIME(30天)
   但：
-    - cache.CACHE() 不检查时间
-    - 记录仍在 blob_map 表中
-    - 所以仍命中失败缓存，返回占位图 Data URL
-    - **不会重新抓取，也不会续期**
+    cache.CACHE() 只查 WHERE resolver=? AND authority=?
+    记录还在表里 → 仍返回 (None, None)
+    → 仍直接返回占位图 Data URL
+    → 不触发重抓
+    → 不触发 maintenance
+  状态：记录已"逻辑过期"30天，但物理存在，仍被当作有效缓存
 
-Day 31, 10:00
-  事件：用户搜索一个全新域名 new-domain-xyz.com（从未抓过）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 31, 09:05:00  [T5]
+  事件：用户搜索全新域名 new-domain-xyz.com（从未抓过）
+  这是本次链条中**唯一会触发 set() 的事件**
   流程：
-    - favicon_url() → None → /favicon_proxy
-    - search_favicon() → None → resolver 抓取
-    - cache.set(duckduckgo, "new-domain-xyz.com", mime, data)
-      → 进入 set() 函数
-      → 检查 maintenance：now(Day31 10:00) > LAST_MAINTENANCE(Day0 09:00) + 1h ? 是
-      → 触发 maintenance()
-         → 执行 DELETE：WHERE m_time < Day31 10:00 - 30天 = Day1 10:00
-         → example.com 的记录 m_time=Day0 09:00 < Day1 10:00 → 被删除！
-         → new-domain-xyz.com 的记录 m_time=Day31 10:00 → 保留
-      → LAST_MAINTENANCE 更新为 Day31 10:00
+    a. favicon_url("new-domain-xyz.com") → None → /favicon_proxy
+    b. search_favicon() → None → resolver 抓取
+    c. 进入 cache.set("duckduckgo", "new-domain-xyz.com", mime, data)
+    d. set() 内部先检查 maintenance 条件：
+         next_maintenance_time = 1h + LAST_MAINTENANCE.m_time(T0)
+                              = Day0 10:00
+         当前时间 T5(Day31 09:05) > Day0 10:00 → ✅ 触发 maintenance()
+    e. 进入 maintenance()：
+         - 二次检查 time < next_maintenance_time？否 → 继续执行
+         - 第一行：self.properties.set("LAST_MAINTENANCE", "")
+           → LAST_MAINTENANCE.m_time 刷新为 T5(Day31 09:05)
+         - 执行 DELETE:
+             WHERE m_time < now(T5) - 30days = Day1 09:05
+         - example.com 记录 m_time=Day0 09:05 < Day1 09:05 → 被 DELETE ✓
+         - new-domain-xyz.com 还没写入，不受影响
+    f. maintenance 结束，回到 set()
+    g. 写入 new-domain-xyz.com 的新记录，m_time=T5
+  状态：
+    - example.com 的失败记录**终于被物理删除**（在 T5 时刻）
+    - LAST_MAINTENANCE.m_time = T5
+    - 新增 new-domain-xyz.com 记录，m_time=T5
 
-Day 31, 11:00
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Day 31, 10:00:00  [T6]
   事件：用户再次搜索 example.com
   流程：
-    - favicon_url() 查缓存
-    - cache.CACHE()：SELECT 无记录 → 返回 None（因为 Day31 10:00 被 maintenance 删了）
-    - 返回 /favicon_proxy URL
-    - 浏览器请求 /favicon_proxy
-    - search_favicon() 查缓存 → None
-    - 调用 duckduckgo resolver → 重新抓取 → 仍失败
-    - cache.set(duckduckgo, example.com, None, None)
-      → 新写入记录，m_time=Day31 11:00
-      → （这次 set() 检查 maintenance：距上次仅 1h，不触发）
+    a. favicon_url("example.com")
+       → cache.CACHE()：SELECT 无记录（因为 T5 时刻被删了）
+       → 返回 None
+       → 返回 /favicon_proxy URL
+    b. 浏览器请求 /favicon_proxy
+       → search_favicon() 查缓存 → None
+       → 调用 duckduckgo resolver → **重新抓取**
+       → 仍失败 → data=None
+       → cache.set("duckduckgo", "example.com", None, None)
+          * 检查 maintenance：
+            next_maintenance_time = 1h + LAST_MAINTENANCE.m_time(T5)
+                                 = Day31 10:05
+            当前 T6(Day31 10:00) < Day31 10:05 → 不触发
+          * UPSERT 写入 blob_map:
+              sha256="FALLBACK_ICON"
+              m_time = T6 (Day31 10:00)
+  结果：example.com 的失败缓存**终于被"刷新"**了，
+        m_time 从 Day0 09:05 续期为 Day31 10:00。
+  距首次写入实际经过了 31 天。
 
-  结果：example.com 的失败缓存终于被"刷新"了，m_time 续期为 Day31 11:00
-  前提：恰好有另一个新域名触发了 maintenance 先删除了旧记录
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-### 6.5 续期的真实含义（修正之前的错误）
+### 7.5 失败缓存真正失效并重抓的精确时间点定义
+
+从上面的时间线可以精确得出：
+
+| 事件 | 精确时间点 | 说明 |
+|------|-----------|------|
+| 失败记录**逻辑过期** | `m_time + HOLD_TIME` | 即 Day0 09:05 + 30天 = Day30 09:05。但这只是一个"隐形"的时间点，代码读取路径完全不感知。 |
+| 失败记录**物理删除** | **某次其他域名触发 `set()` 时**，如果同时满足 `MAINTENANCE_PERIOD` 间隔，maintenance 运行中的 DELETE 语句执行瞬间。本例中为 Day31 09:05（T5 时刻）。 |
+| **真正触发重新抓取** | 物理删除之后的**下一次用户访问该域名**时。本例中为 Day31 10:00（T6 时刻）。 |
+
+**重抓延迟 = 物理删除时刻 − 逻辑过期时刻**，本例中为 `Day31 09:05 − Day30 09:05 = 24小时`。这个延迟完全取决于什么时候恰好有一个"新域名"触发了 `set()` 并且 maintenance 条件满足。极端情况下（没有新域名访问），延迟可以是**无限大**。
+
+### 7.6 "续期"的真实含义（修正之前的错误）
 
 **之前的错误表述**："一个持续失败的域名，只要每隔 30 天内至少有一次访问触发重新抓取并再次失败，失败缓存就会被永久保留。"
 
 **正确表述**：
 
-1. **普通访问不会续期**：命中失败缓存时，`favicon_url()` 和 `search_favicon()` 都只读不写，`m_time` 不会被刷新。
+1. **普通访问（命中失败缓存）绝对不会续期**：`favicon_url()` 和 `search_favicon()` 在缓存命中时都只读不写，`m_time` 不会被刷新。Day 10、Day 29、Day 31 08:00 这些访问都不会改变 `m_time`。
 
-2. **续期只能发生在以下链条之后**：
-   - maintenance 删除了过期的失败记录（因为某**其他域名**的 `set()` 触发了 maintenance）
-   - 下一次访问缓存未命中（返回 None）
-   - 触发 `/favicon_proxy` → `search_favicon` → resolver 重新抓取
-   - 再次失败 → `set()` 写入新的 FALLBACK_ICON → `m_time` 被刷新为当前时间
+2. **续期只能发生在以下完整链条全部满足之后**：
+   - 有某个**其他域名**（或同一域名，但旧记录恰好已被删）触发了 `cache.set()`
+   - 该 `set()` 调用时满足 maintenance 触发条件（距上次 maintenance 已超过 1 小时）
+   - maintenance 执行 DELETE，把当前域名那条已超过 HOLD_TIME 的旧记录物理删除
+   - 当前域名被下一次用户访问
+   - 缓存未命中（返回 None）→ 触发 `/favicon_proxy` → `search_favicon` → resolver 重新抓取
+   - 再次失败 → `set()` 写入新的 FALLBACK_ICON → `m_time` 被刷新为当前时间（UPSERT 的 `m_time=strftime('%s','now')`）
 
 3. **如果长时间没有新域名触发 maintenance**：所有记录（包括失败的）都会长期存在，超过 HOLD_TIME 也不会被删除，读取时仍当作有效缓存。
 
-4. **最极端的不续期场景**：只有一个固定域名反复访问，永远不访问其他新域名。每次访问都命中失败缓存，不触发 `set()` → 永远不会触发 maintenance（因为没有新 `set()`）→ 记录永远不会被删 → 永远不会重新抓取 → `m_time` 永远保持 Day 0 的值。
+4. **最极端的不续期场景**：服务器上只有一个固定域名反复被访问，且第一次抓取失败。之后每次访问都命中失败缓存 → 不触发 `set()` → 永远不会触发 maintenance（因为没有新的 `set()`）→ 记录永远不会被删 → 永远不会重新抓取 → `m_time` **永远保持 Day 0 的值**。
 
 ---
 
-## 七、四个时间参数的完整对照
+## 八、四个时间参数的完整对照
 
 | 参数 | 默认值 | 位置 | 作用与触发时机 |
 |------|--------|------|--------------|
@@ -421,7 +611,7 @@ Day 31, 11:00
 
 ---
 
-## 八、边界情况汇总
+## 九、边界情况汇总
 
 | 场景 | 行为 |
 |------|------|
@@ -430,10 +620,12 @@ Day 31, 11:00
 | BLOB > `BLOB_MAX_BYTES`（20KB） | `set()` 直接返回 False，不写入缓存。下次访问仍未命中 → 每次都重新抓取。 |
 | 用户切换 resolver | 缓存键包含 resolver，所以新 resolver 下是全新记录 → 立即触发重新抓取，不受旧 resolver 下失败缓存影响。 |
 | 多进程环境 | maintenance 通过 SQLite 行锁 + `LAST_MAINTENANCE` 属性时间判断避免重复运行，但并发时可能有轻微竞争。 |
+| 全新库首次写入 | 若 schema 建立 < 1h，不触发 maintenance；若 > 1h（极端罕见），触发 maintenance。见第七章分析。 |
+| set() 时先 maintenance 后写入 | 旧记录（含本次 set() 的同域名旧记录）可能先被 maintenance DELETE，再被 UPSERT 为新记录（m_time 刷新）。 |
 
 ---
 
-## 九、关键源码索引
+## 十、关键源码索引
 
 | 功能 | 位置 |
 |------|------|
@@ -444,11 +636,16 @@ Day 31, 11:00
 | /favicon_proxy 端点 | [proxy.py:L112-L156](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/proxy.py#L112-L156) |
 | search_favicon：**唯一可能触发 set() 的地方** | [proxy.py:L159-L192](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/proxy.py#L159-L192) |
 | cache 读取：不检查 m_time，三种返回值 | [cache.py:L320-L336](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L320-L336) |
-| cache 写入：唯一会触发 maintenance 的入口 | [cache.py:L338-L373](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L338-L373) |
+| cache.set()：**先 maintenance，再校验，最后写入** | [cache.py:L338-L373](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L338-L373) |
 | 写入时 UPSERT 刷新 m_time | [cache.py:L306-L310](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L306-L310) |
 | FALLBACK_ICON 标记写入 | [cache.py:L359-L360](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L359-L360) |
 | blob_map 主键 = (resolver, authority) | [cache.py:L270-L275](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L270-L275) |
-| maintenance 触发检查 | [cache.py:L340-L342](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L340-L342) |
+| maintenance 触发检查（set() 入口处） | [cache.py:L340-L342](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L340-L342) |
+| maintenance 函数（含二次时间检查 + 刷新 LAST_MAINTENANCE） | [cache.py:L381-L427](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L381-L427) |
 | HOLD_TIME 清理 SQL | [cache.py:L396-L400](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L396-L400) |
+| next_maintenance_time 计算 | [cache.py:L376-L379](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/favicons/cache.py#L376-L379) |
+| LAST_MAINTENANCE 初始化（schema 创建时） | [sqlitedb.py:L347-L355](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L347-L355) |
+| SQLiteProperties.m_time() 不存在时返回 0 | [sqlitedb.py:L450-L456](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L450-L456) |
+| SQLiteProperties.set() 写入时刷新 m_time | [sqlitedb.py:L425-L430](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/searx/sqlitedb.py#L425-L430) |
 | CSS 灰方块兜底样式 | [search.less:L375-L382](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/client/simple/src/less/search.less#L375-L382) |
 | empty_favicon.svg 占位图文件 | [empty_favicon.svg](file:///d:/fz/0601-1/solo-dogfeeding/code/13-searxng/client/simple/src/svg/empty_favicon.svg) |
