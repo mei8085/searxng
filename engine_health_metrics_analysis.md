@@ -361,7 +361,7 @@ if sent_count == 0:
 
 ## 七、异常情况下的降级显示机制
 
-### 6.1 指标系统禁用时的空对象模式
+### 7.1 指标系统禁用时的空对象模式
 
 当 `enable_metrics=False` 时，初始化使用空实现（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L76-L81)）：
 
@@ -385,52 +385,86 @@ def count_exception(engine_name, exc, secondary=False):
         return  # 直接返回，跳过所有错误记录逻辑
 ```
 
-### 6.2 无数据时的降级展示
+### 7.2 无请求数据时两页面的降级差异
 
-**（1）stats.html 页面**（[stats.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/stats.html#L19-L21)）：
+无请求数据（`sent_count == 0`）时，两个页面采用完全不同的降级策略：
+
+#### 7.2.1 /stats 独立统计页：整行过滤 + 页面级提示
+
+**第一层（后端过滤）**：在 `get_engines_stats()`（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L175-L177)）中无请求引擎被直接跳过，不出现在数据列表中：
+```python
+sent_count = counter('engine', engine_name, 'search', 'count', 'sent')
+if sent_count == 0:
+    continue
+```
+
+**第二层（模板提示）**：当全部引擎都被过滤后，`engine_stats['time']` 为空列表，[stats.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/stats.html#L19-L21) 显示页面级提示：
 ```html
 {% if not engine_stats.get('time') %}
 {{ _('There is currently no data available. ') }}
 {% else %}
-...
+... 渲染表格 ...
 {% endif %}
 ```
 
-**（2）/stats 路由中 sent_count==0 的引擎会被过滤**（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L175-L177)）：
-```python
-sent_count = counter('engine', engine_name, 'search', 'count', 'sent')
-if sent_count == 0:
-    continue  # 跳过无请求的引擎
-```
+**可靠性的特殊处理**：即便引擎有数据，`get_reliabilities()` 中无请求引擎的 `reliability` 也被设为 `None`（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L151-L153)），该值在排序时会让无数据引擎排到末尾。
 
-**（3）可靠性为 None 时的处理**（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L151-L153)）：
-```python
-if sent_count == 0:
-    reliability = None  # 标记为无数据
-```
+#### 7.2.2 /preferences 偏好设置页：单元格级留白 + 空值降级
 
-**（4）偏好设置页 engine_time 宏**（[preferences.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences.html#L91-L106)）：
+偏好设置页后端**不过滤无请求引擎**，所有引擎都会出现在列表中，降级完全由模板宏处理。
+
+**响应时间降级**（[preferences.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences.html#L89-L108)）：
 ```html
-{%- if stats[engine_name].time != None -%}
-    {# 渲染时间条形图 #}
-{%- endif -%}
-{# 否则输出空 <td> #}
+{%- macro engine_time(engine_name) -%}
+  <td class="{{ label }}">{{- '' -}}
+    {%- if stats[engine_name].time != None -%}
+      <span class="stacked-bar-chart-value">{{- stats[engine_name].time -}}</span>
+      <span class="stacked-bar-chart">...条形图...</span>
+      <div class="engine-tooltip">...P50/P80/P95详情...</div>
+    {%- endif -%}
+  </td>
+{%- endmacro -%}
 ```
+- 当 `time == None` 时，宏不输出数值、条形图和 tooltip，仅输出一个空白 `<td>`，保留表格布局对齐。
 
-**（5）偏好设置页 engine_reliability 宏**（[preferences.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences.html#L110-L145)）：
+**可靠性降级**（[preferences.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences.html#L110-L145)）：
 ```html
-{%- if r != None -%}
-    {# 显示可靠性数值 + 按阈值着色 #}
-{% else %}
-    {%- set r = '' -%}  {# 降级为空字符串 #}
-{%- endif -%}
+{%- macro engine_reliability(engine_name) -%}
+  {%- set r = reliabilities.get(engine_name, {}).get('reliability', None) -%}
+  {%- if r != None -%}
+    {%- if r <= 50 -%}{% set label = 'danger' -%}
+    {%- elif r < 80 -%}{%- set label = 'warning' -%}
+    ...
+    {%- endif -%}
+  {% else %}
+    {%- set r = '' -%}       {# 关键：可靠性为 None 时降级为空字符串 #}
+  {%- endif -%}
+  {%- if errors -%}
+    <td class="{{ label }} column-reliability"><a href="...">告警图标 + {{ r }}</a></td>
+  {%- else -%}
+    <td class="{{ label }}">{% if r %}<span>{{ r }}</span>{%- endif -%}</td>
+  {%- endif -%}
+{%- endmacro -%}
 ```
+- 当 `reliability == None` 时，`r` 被降级为空字符串 `''`，同时 `label` 不被赋值（无颜色样式），最终 `<td>` 内什么都不渲染。
+- 当存在错误但无可靠性数值时，仍显示告警图标并可跳转到 `/stats?engine=xxx`。
 
-### 6.3 异常类名到用户友好文本的映射
+### 7.3 完整错误展示路径：偏好设置页 vs 统计页
 
-位置：[webutils.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webutils.py#L36-L67)
+#### 7.3.1 错误数据的两种来源
 
-`exception_classname_to_text` 字典将技术异常类名翻译为用户可理解的文本：
+错误记录分为两类，由不同的 API 产生，数据字段有本质区别：
+
+| 来源 API | 触发场景 | `exception_classname` | `log_message` |
+|---------|---------|----------------------|---------------|
+| `count_exception()`（[error_recorder.py#L174-L184](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/error_recorder.py#L174-L184)） | 捕获到 Python 异常对象时 | **有值**（如 `httpx.ConnectTimeout`） | `None` |
+| `count_error()`（[error_recorder.py#L187-L200](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/error_recorder.py#L187-L200)） | 手动记录错误消息时（如"不支持的返回格式"） | `None` | **有值**（自定义消息字符串） |
+
+两类错误都通过 `get_error_context()`（[error_recorder.py#L160-L171](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/error_recorder.py#L160-L171)）收集调用栈信息（文件名、行号、函数、代码行），最终以 `ErrorContext` 为 key 存储到 `errors_per_engines[engine_name]` 字典中计数。
+
+#### 7.3.2 异常友好文本映射字典
+
+技术异常类名到用户友好文本的映射由 `exception_classname_to_text` 字典（[webutils.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webutils.py#L36-L67)）统一维护：
 
 | 异常类 | 用户可见文本 |
 |--------|-------------|
@@ -441,13 +475,311 @@ if sent_count == 0:
 | `SearxEngineCaptchaException` | CAPTCHA |
 | `SearxEngineTooManyRequestsException` | too many requests |
 | `SearxEngineAccessDeniedException` | access denied |
-| `SearxEngineXPathException` / `JSONDecodeError` | parsing error |
+| `SearxEngineXPathException` / `JSONDecodeError` / `KeyError` | parsing error |
 | `ssl.SSLCertVerificationError` | SSL error: certificate validation has failed |
 | **None（未知异常）** | unexpected crash |
 
-降级策略：未知异常统一映射为 `exception_classname_to_text[None]` = "unexpected crash"。
+降级策略：字典中不存在的异常类名统一映射为 `exception_classname_to_text[None]` = "unexpected crash"。
 
-### 6.4 可靠性阈值分级着色
+---
+
+#### 7.3.3 /preferences 偏好设置页：完整展示路径
+
+**数据流动路径：**
+```
+errors_per_engines（原始存储）
+    │
+    ▼
+get_engine_errors() → 计算 percentage，返回原始字典列表
+    │
+    ▼
+webapp.py 内联代码（L944-L954）→ 三重过滤 + 翻译 + 去重
+    │
+    ▼
+reliabilities[e.name]['errors'] = 友好文本字符串列表
+    │
+    ▼
+模板 engine_reliability 宏 → tooltip 展示
+```
+
+**第一步：后端三重过滤与翻译**（[webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L944-L954)）
+
+```python
+reliabilities[e.name] = {'reliability': reliability, 'errors': []}
+reliabilities_errors = []
+for error in errors:
+    # 过滤条件1：跳过 secondary 异常 或 无 exception_classname 的错误
+    # 即：count_error() 产生的消息类错误在这里被完全过滤掉！
+    if error.get('secondary') or 'exception_classname' not in error:
+        continue
+    # 过滤条件2：异常类名必须在 error 字典中（且非空）
+    # 翻译：查字典获取友好文本
+    error_user_text = exception_classname_to_text.get(error.get('exception_classname'))
+    # 降级：字典查不到 → "unexpected crash"
+    if not error_user_text:  # 注意：原代码写的是 if not error，疑似 bug，实际应为 if not error_user_text
+        error_user_text = exception_classname_to_text[None]
+    # 去重：同类错误合并，只保留一个
+    if error_user_text not in reliabilities_errors:
+        reliabilities_errors.append(error_user_text)
+reliabilities[e.name]['errors'] = reliabilities_errors
+```
+
+**关键过滤逻辑：**
+- `secondary=True` → **跳过**（如软重定向超限等警告类错误）
+- 无 `exception_classname` → **跳过**（`count_error()` 产生的消息类错误完全不展示）
+- 字典查不到 → **降级**为 "unexpected crash"
+- 同类重复 → **去重**
+
+**最终传给模板的数据结构：**
+```python
+reliabilities['google'] = {
+    'reliability': 85,
+    'errors': ['timeout', 'CAPTCHA']   # 注意：是字符串列表，不是原始字典！
+}
+```
+
+**第二步：模板 tooltip 展示**（[preferences.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences.html#L110-L145)）
+
+```jinja2
+{%- macro engine_reliability(engine_name) -%}
+  {%- set r = reliabilities.get(engine_name, {}).get('reliability', None) -%}
+  {%- set errors = reliabilities.get(engine_name, {}).get('errors', []) -%}
+
+  {%- if r != None -%}
+    {%- if r <= 50 -%}{% set label = 'danger' -%}
+    {%- elif r < 80 -%}{%- set label = 'warning' -%}
+    ...
+    {%- endif -%}
+  {% else %}
+    {%- set r = '' -%}       {# 无数据 → 空字符串 #}
+  {%- endif -%}
+
+  {%- if errors -%}  {# 有错误才显示告警图标和超链接 #}
+    <td class="{{ label }} column-reliability">
+      <a href="{{ url_for('stats', engine=engine_name|e) }}">
+        <span>{{ icon_big('alert', '...') }} {{ r }}</span>
+      </a>
+      <div class="engine-tooltip" role="tooltip">
+        {%- if errors -%}<p>{{ _('Errors:') }}</p>{%- endif -%}
+        {%- for error in errors -%}
+          <p>{{ error }}</p>  {# 直接输出友好文本字符串 #}
+        {%- endfor -%}
+      </div>
+    </td>
+  {%- else -%}
+    <td class="{{ label }}">
+      {% if r %}<span>{{ r }}</span>{%- endif -%}
+    </td>
+  {%- endif -%}
+{%- endmacro -%}
+```
+
+**展示逻辑：**
+- `errors` 非空 → 单元格渲染为超链接（跳转到 `/stats?engine=xxx`），显示告警图标 + 可靠性数值
+- hover 时 tooltip 逐行显示翻译后的错误类型（如 "timeout"、"CAPTCHA"）
+- `errors` 为空 → 普通单元格，仅显示可靠性数值（无超链接、无告警图标）
+
+---
+
+#### 7.3.4 /stats 统计页：完整展示路径 + 单引擎展开逻辑
+
+**数据流动路径：**
+```
+errors_per_engines（原始存储）
+    │
+    ▼
+get_engine_errors() → 计算 percentage，返回原始字典列表
+    │
+    ▼
+get_reliabilities() → 不做过滤和翻译，直接赋值给 errors
+    │
+    ▼
+reliabilities[engine_name]['errors'] = 原始字典列表（含完整技术信息）
+    │
+    ├─► 列表视图：仅显示可靠性数值（[stats.html#L84](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/stats.html#L84)）
+    │
+    └─► 单引擎展开视图（URL带?engine=xxx）：完整错误详情
+```
+
+**第一步：后端不做任何过滤**（[metrics/__init__.py#L142-L163](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L142-L163)）
+
+```python
+def get_reliabilities(engline_name_list):
+    reliabilities = {}
+    engine_errors = get_engine_errors(engline_name_list)  # 原始错误数据
+
+    for engine_name in engline_name_list:
+        errors = engine_errors.get(engine_name) or []
+        # ... 计算 reliability ...
+
+        reliabilities[engine_name] = {
+            'reliability': reliability,
+            'sent_count': sent_count,
+            'errors': errors,  # 直接赋值，不做任何过滤或翻译！
+        }
+    return reliabilities
+```
+
+**传给模板的数据结构：**
+```python
+reliabilities['google'] = {
+    'reliability': 85,
+    'sent_count': 100,
+    'errors': [
+        {
+            'filename': 'searx/engines/google.py',
+            'function': 'parse_html',
+            'line_no': 128,
+            'code': 'results = root.xpath(xpath_str)',
+            'exception_classname': 'httpx.ConnectTimeout',
+            'log_message': None,
+            'log_parameters': ('google.com', 443),
+            'secondary': False,
+            'percentage': 15,
+        },
+        ...  # 更多原始错误记录
+    ]
+}
+```
+
+**第二步：列表视图 — 仅显示可靠性数值**（[stats.html#L84](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/stats.html#L84)）
+
+```jinja2
+<td class="engine-reliability">
+    {{ engine_reliabilities.get(engine_stat.name, {}).get('reliability') }}
+</td>
+```
+列表视图非常简洁，仅显示可靠性百分比数值，不展示任何错误详情。
+
+**第三步：单引擎展开 — URL 参数触发**
+
+当 URL 包含 `?engine=google` 时，后端（[webapp.py#L1103-L1111](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L1103-L1111)）：
+```python
+selected_engine_name = sxng_request.args.get('engine', default=None, type=str)
+filtered_engines = dict(...)  # 所有引擎
+if selected_engine_name:
+    if selected_engine_name not in filtered_engines:
+        selected_engine_name = None
+    else:
+        filtered_engines = [selected_engine_name]  # 仅查询该引擎
+```
+
+同时，后端还会拼接 `technical_report` 字符串（[webapp.py#L1133-L1146](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L1133-L1146)），便于复制提交 bug：
+```python
+technical_report = []
+for error in engine_reliabilities.get(selected_engine_name, {}).get('errors', []):
+    technical_report.append(
+        f"Error: {error['exception_classname'] or error['log_message']} "
+        f"Parameters: {error['log_parameters']} "
+        f"File name: {error['filename']}:{error['line_no']} "
+        f"Error Function: {error['function']} "
+        f"Code: {error['code']}"
+    )
+technical_report = ' '.join(technical_report)
+```
+
+**第四步：模板渲染完整错误详情**（[stats.html#L90-L127](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/stats.html#L90-L127)）
+
+```jinja2
+{% if selected_engine_name %}
+    <div class="engine-errors">
+        {# 外层按 secondary 分组遍历：先 primary，后 secondary #}
+        {% for secondary in [False, True] %}
+            {% set ns = namespace(first=true) %}
+            {% for error in engine_reliabilities[selected_engine_name].errors %}
+                {% if secondary == error.secondary %}
+                    {# 每组第一个错误前显示标题 #}
+                    {% if ns.first %}
+                        {% set ns.first = false %}
+                        <h2>
+                            {% if secondary %}
+                                {{ _('Warnings') }}
+                            {% else %}
+                                {{ _('Errors and exceptions') }}
+                            {% endif %}
+                        </h2>
+                    {% endif %}
+
+                    <table class="engine-error">
+                        <tbody>
+                            <tr>
+                                {# 有 exception_classname → 显示原始异常类名 #}
+                                {%- if error.exception_classname -%}
+                                    <th scope="row">{{ _('Exception') }}</th>
+                                    <td>{{ error.exception_classname }}</td>
+                                {# 有 log_message → 显示原始消息文本 #}
+                                {%- elif error.log_message -%}
+                                    <th scope="row">{{ _('Message') }}</th>
+                                    <td>{{ error.log_message }}</td>
+                                {%- endif -%}
+                                <th scope="row">{{ _('Percentage') }}</th>
+                                <td>{{ error.percentage }}</td>
+                            </tr>
+                            {# 有参数且不是 (None, None, None) → 显示参数行 #}
+                            {% if error.log_parameters and error.log_parameters != (None, None, None) %}
+                            <tr>
+                                <th scope="row">{{ _('Parameter') }}</th>
+                                <td colspan="3">
+                                    {%- for param in error.log_parameters -%}
+                                        <span class="log_parameters">{{ param }}</span>
+                                    {%- endfor -%}
+                                </td>
+                            </tr>
+                            {% endif %}
+                            <tr><th scope="row">{{ _('Filename') }}</th>
+                                <td colspan="3">{{ error.filename }}:{{ error.line_no }}</td></tr>
+                            <tr><th scope="row">{{ _('Function') }}</th>
+                                <td colspan="3">{{ error.function }}</td></tr>
+                            <tr><th scope="row">{{ _('Code') }}</th>
+                                <td colspan="3">{{ error.code }}</td></tr>
+                        </tbody>
+                    </table>
+                {% endif %}
+            {% endfor %}
+        {% endfor %}
+    </div>
+{% endif %}
+```
+
+**单引擎展开逻辑：**
+- **触发条件**：URL 带 `?engine=xxx` 参数（来自 preferences 页的告警图标超链接，或 stats 页引擎名称的超链接）
+- **标题显示**：按 secondary 分组，先显示 "Errors and exceptions"（primary 错误），后显示 "Warnings"（secondary 错误），每组为空则不显示标题
+- **异常名称显示**：
+  - 有 `exception_classname` → 直接显示原始类名（如 `httpx.ConnectTimeout`），**不做友好翻译**
+  - 有 `log_message` → 直接显示原始消息文本（如 "unsupported response format"）
+- **完整上下文**：每个错误都显示百分比、参数、文件名:行号、函数名、出错代码行
+- **特殊处理**：`log_parameters == (None, None, None)` 时不显示参数行
+
+---
+
+#### 7.3.5 友好文案 vs 原始详情：切换条件总览
+
+| 场景 | /preferences 行为 | /stats 行为 |
+|------|------------------|------------|
+| **count_exception() 产生的异常（有 exception_classname）** | 查 `exception_classname_to_text` 字典 → 友好文本 | 直接显示 `exception_classname` 原始字符串 |
+| **字典中不存在的未知异常** | 降级为 `"unexpected crash"` | 直接显示原始类名（如 `requests.exceptions.SSLError`） |
+| **count_error() 产生的消息（有 log_message，无 exception_classname）** | **被过滤，完全不显示** | 直接显示 `log_message` 原始文本 |
+| **secondary=True 的次要错误** | **被过滤，完全不显示** | 归入 "Warnings" 分组，显示完整技术详情 |
+| **同类错误多次出现** | 去重，tooltip 中只显示一次 | 按 `ErrorContext` 分组，不同上下文（不同行号/参数）分开显示 |
+| **无任何错误** | 无告警图标，无超链接，无 tooltip | 列表视图正常显示可靠性，单引擎展开无错误区块 |
+
+---
+
+#### 7.3.6 两页面对比总结表
+
+| 维度 | /preferences | /stats |
+|------|-------------|--------|
+| **后端处理** | 三重过滤 + 翻译 + 去重 | 不做任何处理，原始透传 |
+| **传给模板的 errors** | 友好文本字符串列表（如 `['timeout']`） | 原始字典列表（含完整技术字段） |
+| **错误范围** | 仅 primary 且含 exception_classname | primary + secondary，全量展示 |
+| **消息类错误（count_error）** | 完全过滤不显示 | 归入 Message 行展示 |
+| **异常名称** | 友好翻译（"timeout"、"CAPTCHA"…） | 原始类名（"httpx.ConnectTimeout"…） |
+| **未知异常降级** | 翻译为 "unexpected crash" | 直接显示原始类名 |
+| **展示形式** | 单元格超链接 + hover tooltip | 列表缩略（仅数值）+ 单引擎展开（完整详情） |
+| **单引擎展开入口** | 可靠性单元格的超链接 | 引擎名称的超链接 |
+| **面向用户** | 普通用户，快速判断引擎状态 | 管理员/开发者，问题定位与 bug 报告 |
+
+### 7.4 可靠性阈值分级着色
 
 在 `engine_reliability()` 宏中按阈值为单元格添加 CSS class：
 
@@ -460,7 +792,7 @@ if sent_count == 0:
 
 同时，若引擎存在错误记录，会显示告警图标并提供指向 `/stats?engine=xxx` 的错误详情链接。
 
-### 6.5 排序中的空值保护
+### 7.5 排序中的空值保护
 
 在 `/stats` 路由的排序逻辑中（[webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L1121-L1131)），对可靠性为 None 的引擎进行特殊处理：
 
@@ -476,7 +808,7 @@ def get_key(engine_stat):
 
 ---
 
-## 七、数据流转总结图
+## 八、数据流转总结图
 
 ```
 用户搜索请求
