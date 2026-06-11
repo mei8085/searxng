@@ -449,37 +449,51 @@ def filter_urls(self, filter_func):
 **源码位置**：[favicons/proxy.py:195-237](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L195-L237)
 
 ```python
-def favicon_url(authority):
-    theme = sxng_request.preferences.get_value("theme")
-    favicon = db_session.get(theme, authority)  # 查缓存
+def favicon_url(authority: str) -> str:
+    resolver = sxng_request.preferences.get_value('favicon_resolver')
+    if not resolver or resolver not in CFG.resolver_map.keys():
+        return ""                            # ① resolver 未配置 → 空字符串
 
-    if favicon is not None:
-        if not favicon:
-            # 缓存标记：无 favicon → 返回默认 SVG data URL
-            _, fav = CFG.resolver_map['']
-            return fav(theme)
-        # 缓存命中 → 返回 data URL（base64 内嵌，不走代理）
-        return favicon
+    data_mime = cache.CACHE(resolver, authority)  # 调用 FaviconCache.__call__()
 
-    # 缓存未命中 → 生成带 HMAC 的代理 URL
-    h = webutils.new_hmac(CFG.secret_key, authority.encode())
-    return '{0}?{1}'.format(
-        url_for('favicon_proxy'),
-        urlencode({
-            'authority': authority,
-            'h': h
-        }))
+    if data_mime == (None, None):
+        # 缓存命中：已确认为 FALLBACK_ICON（无 favicon）
+        return CFG.favicon_data_url(theme=theme)  # ② → data:image/svg+xml;utf8,...
+
+    if data_mime is not None:
+        # 缓存命中：有实际 favicon 数据
+        data, mime = data_mime
+        return f"data:{mime};base64,{base64}"    # ③ → data:image/xxx;base64,...
+
+    # 缓存未命中 → 生成代理 URL
+    h = new_hmac(CFG.secret_key, authority.encode())
+    proxy_url = flask.url_for('favicon_proxy')
+    query = urllib.parse.urlencode({"authority": authority, "h": h})
+    return f"{proxy_url}?{query}"                  # ④ → 代理 URL
 ```
 
-**三种分支**：
+**缓存查询**：`cache.CACHE(resolver, authority)` 调用的是 [FaviconCacheSQLite.__call__()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L320-L336)，其返回值语义：
+
+| 返回值 | 含义 |
+|---|---|
+| `None` | 缓存未命中（无此 resolver+authority 记录） |
+| `(None, None)` | 缓存命中，但标记为 `FALLBACK_ICON`（已确认无 favicon） |
+| `(bytes_data, mime_str)` | 缓存命中，有实际 favicon 数据 |
+
+`FALLBACK_ICON` 是 [cache.py](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py) 中的常量，表示"已查询但该域名无 favicon"。`cache.set()` 在 `data is None` 时将 `sha256` 设为 `FALLBACK_ICON`，查询时匹配到 `FALLBACK_ICON` 则返回 `(None, None)`。
+
+**四种分支**：
 
 | # | 条件 | 输出 | 举例 |
 |---|---|---|---|
-| ① | 缓存命中且有内容 | `data:image/png;base64,....`（直出 data URL） | 内嵌图片，无额外请求 |
-| ② | 缓存命中但标记为空 | 默认主题 SVG data URL | `data:image/svg+xml,...` |
-| ③ | 缓存未命中 | `/favicon_proxy?authority=<host>&h=<HMAC>` | 走代理路由 |
+| ① | `resolver` 未配置或不在白名单 | `""`（空字符串，不渲染 favicon） | 偏好 `favicon_resolver=""` 时 |
+| ② | 缓存命中 `(None, None)`（FALLBACK_ICON） | `data:image/svg+xml;utf8,...`（默认空 favicon SVG） | 主题对应的 `empty_favicon.svg` |
+| ③ | 缓存命中 `(data, mime)` | `data:{mime};base64,{base64}` | `data:image/x-icon;base64,AAABAA...` |
+| ④ | 缓存未命中 `None` | `/favicon_proxy?authority={host}&h={HMAC}` | 带签名的代理 URL |
 
-这是一个**缓存优先策略**：首次加载走代理，代理成功后将 favicon 存入缓存（转为 data URL），后续请求直接从缓存返回 data URL，不再产生额外网络请求。
+**注意**：分支 ② 中 `CFG.favicon_data_url()` 返回的是 `data:image/svg+xml;utf8,{url_encoded_svg}` 格式（[proxy.py:107](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L107)），编码方式为 `utf8` 而非 `base64`。分支 ③ 中缓存命中的 favicon 数据则使用 `base64` 编码。
+
+这是一个**缓存优先策略**：首次加载走代理（④），代理成功后将 favicon 存入 SQLite 缓存（[cache.py:338-373](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/cache.py#L338-L373)），后续请求直接从缓存返回 data URL（③），不再产生额外网络请求。
 
 #### F.3 服务端代理校验
 
@@ -496,13 +510,25 @@ def favicon_proxy():
     if not resolver or resolver not in CFG.resolver_map:
         return "", 400                          # 3. 解析器必须在白名单
 
-    # 请求 favicon，成功后写入缓存（转为 data URL）
-    ...
-    # 降级路径：失败时返回默认 SVG favicon
+    data, mime = search_favicon(resolver, authority)  # 查询 + 缓存
+
+    if data is not None and mime is not None:
+        resp = flask.Response(data, mimetype=mime)    # 4. 成功 → 直接返回图片数据
+        resp.headers['Cache-Control'] = f"max-age={CFG.max_age}"
+        return resp
+
+    # 5. 降级：返回默认 SVG favicon 文件
     theme = sxng_request.preferences.get_value("theme")
-    fav, mimetype = CFG.favicon(theme=theme)
+    fav, mimetype = CFG.favicon(theme=theme)  # → (pathlib.Path, "image/svg+xml")
     return flask.send_from_directory(fav.parent, fav.name, mimetype=mimetype)
 ```
+
+**降级路径说明**：`favicon_proxy()` 的降级是通过 `CFG.favicon()` 返回 `(pathlib.Path, str)` 元组（[proxy.py:86-91](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/favicons/proxy.py#L86-L91)），指向主题目录下的 `empty_favicon.svg` 文件，然后由 `send_from_directory()` 以 `image/svg+xml` 类型发送文件响应。**注意**：这是文件响应（`Content-Type: image/svg+xml`），不是 data URL——与 `favicon_url()` 中 `CFG.favicon_data_url()` 返回的 `data:image/svg+xml;utf8,...` 格式不同。
+
+`favicon_url()` 在模板层有自己的降级链：
+- resolver 未配置 → `""`（空字符串，不渲染 `<img>`）
+- 缓存命中 FALLBACK_ICON → `CFG.favicon_data_url()` → `data:image/svg+xml;utf8,{svg}` （data URL 内嵌）
+- 缓存未命中 → 代理 URL（由 `favicon_proxy()` 处理后续降级）
 
 ---
 
@@ -536,7 +562,22 @@ def _normalize_url_fields(result):
 2. Infobox 的 `urls[]` 列表（第 68-70 行）
 3. Infobox 的 `id` 字段（第 77-79 行）
 
-### 4.2 urllib.parse.urlparse() 对无 scheme URL 的行为
+### 4.2 urllib.parse.urlunparse() 的拼接逻辑（关键）
+
+`_normalize_url_fields()` 最终通过 `parsed_url.geturl()` 回写 `result.url`，而 `geturl()` 内部调用的是 `urllib.parse.urlunparse()`。其拼接逻辑如下（CPython 源码）：
+
+```python
+def urlunparse(components):
+    scheme, netloc, url, params, query, fragment = components
+    if params:    url = "%s;%s" % (url, params)
+    if query:     url = "%s?%s" % (url, query)
+    if fragment:  url = "%s#%s" % (url, fragment)
+    if netloc:    url = '//' + netloc + url     # ← 仅当 netloc 非空时加 //
+    if scheme:    url = scheme + ':' + url
+    return url
+```
+
+**关键**：`//` 前缀仅在 `netloc` 非空时才添加。当 `urlparse()` 因输入无 `//` 前缀而将域名放入 `path` 时，`netloc` 为空，`urlunparse()` 不会加 `//`。
 
 `urllib.parse.urlparse("example.com/path?q=1")` 的解析结果：
 ```
@@ -550,18 +591,23 @@ ParseResult(
 )
 ```
 
-### 4.3 四类典型输入的最终形态
+### 4.3 七类典型输入的最终形态（已通过 CPython urlunparse 源码验证）
 
-| 输入（原始 URL） | `urlparse()` 解析后各字段 | `_replace(scheme=scheme or "http")` 后 | `.geturl()` 最终输出 |
-|---|---|---|---|
-| `"example.com"` | `scheme=""`, `netloc=""`, `path="example.com"` | `scheme="http"`, `path="example.com"` | `**http://example.com**` |
-| `"example.com/path?q=1"` | `scheme=""`, `netloc=""`, `path="example.com/path"`, `query="q=1"` | `scheme="http"` | `**http://example.com/path?q=1**` |
-| `"//example.com/path"` | `scheme=""`, `**netloc="example.com"**`, `path="/path"` | `scheme="http"` | `**http://example.com/path**` |
-| `"ftp://example.com/file"` | `scheme="ftp"`, `netloc="example.com"` | `scheme="ftp"`（保持不变） | `ftp://example.com/file` |
+| 输入（原始 URL） | `urlparse()` 关键字段 | `_replace(scheme or "http")` 后 | `geturl()` 最终输出 | 是否正常 |
+|---|---|---|---|---|
+| `"example.com"` | `scheme=""`, `netloc=""`, `path="example.com"` | `scheme="http"`, **`netloc=""`** | **`http:example.com`** | ❌ 畸形 URL |
+| `"example.com/path?q=1"` | `scheme=""`, `netloc=""`, `path="example.com/path"`, `query="q=1"` | `scheme="http"`, **`netloc=""`** | **`http:example.com/path?q=1`** | ❌ 畸形 URL |
+| `"//example.com/path"` | `scheme=""`, **`netloc="example.com"`**, `path="/path"` | `scheme="http"` | `http://example.com/path` | ✅ |
+| `"ftp://example.com/file"` | `scheme="ftp"`, `netloc="example.com"` | `scheme="ftp"`（不变） | `ftp://example.com/file` | ✅ |
+| `"magnet:?xt=urn:btih:abc"` | `scheme="magnet"`, `netloc=""`, `path=""`, `query="xt=urn:btih:abc"` | `scheme="magnet"`（不变） | `magnet:?xt=urn:btih:abc` | ✅ |
+| `"javascript:alert(1)"` | `scheme="javascript"`, `netloc=""`, `path="alert(1)"` | `scheme="javascript"`（不变） | `javascript:alert(1)` | ⚠️ 危险协议保留 |
+| `"data:image/png;base64,abc"` | `scheme="data"`, `netloc=""`, `path="image/png;base64,abc"` | `scheme="data"`（不变） | `data:image/png;base64,abc` | ✅ |
 
-**关键发现**：
-- 形如 `example.com`（无 `//` 前缀）的 URL，`urllib.parse` 会将其完全放入 `path` 字段，`netloc` 为空。但 `geturl()` 在输出时会正确地把 `http://` 加上，并将路径起始的域名部分识别为 netloc——最终输出是符合直觉的 `http://example.com`。
-- 形如 `//example.com`（协议相对 URL），`netloc` 被正确识别，scheme 为空 → 补为 `http`。
+**关键纠正**：
+- `example.com` 经过 `_normalize_url_fields()` 后变为 **`http:example.com`** 而非 `http://example.com`。因为 `urlparse("example.com")` 将其放入 `path` 字段，`netloc` 为空，`urlunparse()` 不加 `//`。结果是 **畸形 URL**。
+- 同理，`example.com/path?q=1` 变为 **`http:example.com/path?q=1`**。
+- 只有带 `//` 前缀的输入（如 `//example.com`）才能使 `netloc` 非空，从而生成正确的 `http://example.com`。
+- `magnet:` 和 `javascript:` 等 scheme 非空的 URL 不受 `scheme or "http"` 影响，原样保留。
 
 ### 4.4 其他位置的无 scheme 处理
 
@@ -591,19 +637,24 @@ if origin.parsed_url and not origin.parsed_url.scheme.endswith("s"):
 
 这意味着：**即使在规范化阶段降级为 `http`，如果同一结果的另一引擎返回了 `https` URL，最终结果仍会被升级为 `https`**。
 
-最终的降级-升级路径：
+最终的降级-升级路径（以 `example.com` 为例）：
 ```
 example.com
-   │ urlparse
+   │ urlparse("example.com")
    ▼
-scheme="", netloc=""
-   │ _normalize_url_fields: scheme or "http"
+scheme="", netloc="", path="example.com"
+   │ _replace(scheme=scheme or "http")
    ▼
-http://example.com
+scheme="http", netloc="", path="example.com"
+   │ geturl() → urlunparse
+   ▼
+http:example.com                  ← 畸形 URL！（缺少 //）
    │ （如有另一引擎返回 https://example.com）
    ▼ merge_two_main_results: endswith("s") 升级
-https://example.com
+https:example.com                 ← 仍然畸形！
 ```
+
+**注意**：`merge_two_main_results()` 只替换 `scheme`，不修复 `netloc` 为空的畸形结构。因此即使升级到 `https`，URL 仍然是 `https:example.com` 而非 `https://example.com`。
 
 ---
 
@@ -628,9 +679,32 @@ https://example.com
 
 ### 5.3 `magnet:` 协议
 
-- 来自 torrent 结果，通过 `result_link()` 宏渲染为 `<a href="magnet:...">`，带 `rel="noreferrer"`
-- 不经过代理、不经过规范化（`magnet:` 不是 `http/https`，`_normalize_url_fields()` 的 `scheme or "http"` 不会改写它）
-- Tracker URL Remover 和 Hostnames 插件可能会对 `magnet:` URL 的查询参数执行清理/重写
+**关键事实**：`magnetlink` 和 `torrentfile` **不经过任何规范化或 URL 过滤**。
+
+理由如下：
+
+1. **`_normalize_url_fields()`** 仅处理 `result.url` 字段（以及 infobox 的 `urls` 和 `id`）。`magnetlink` 和 `torrentfile` 是与 `url` 平行的独立字段，不在处理范围内。
+
+2. **`_filter_urls()`** 仅处理以下字段列表（[result_types/_base.py:119](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/result_types/_base.py#L119)）：
+   ```python
+   url_fields = ["url", "iframe_src", "audio_src", "img_src", "thumbnail_src", "thumbnail"]
+   ```
+   `magnetlink` 和 `torrentfile` **不在该列表中**，因此 Tracker URL Remover 和 Hostnames 插件 **不会** 对其执行去追踪或主机重写。
+
+3. 在模板中（[torrent.html:6-9](file:///d:/fz/0601-1/solo-dogfeeding/code/15-searxng/searx/templates/simple/result_templates/torrent.html#L6-L9)），它们通过 `result_link()` 宏直接渲染：
+   ```html
+   {% if result.magnetlink %}
+     {{ result_link(result.magnetlink, ...) }}
+   {% endif %}
+   {% if result.torrentfile %}
+     {{ result_link(result.torrentfile, ...) }}
+   {% endif %}
+   ```
+   带有 `rel="noreferrer"` 保护，但 URL 本身是原始值。
+
+4. `magnet:` scheme 在 `_normalize_url_fields()` 中不受影响，因为 `urlparse("magnet:?xt=...")` 的 `scheme="magnet"` 非空，`scheme or "http"` 不会改写它。
+
+**结论**：magnet 和 torrent 链接从引擎返回到用户点击，中间 **不经过任何 URL 规范化、去追踪或主机重写处理**，是"直通"渲染。
 
 ### 5.4 `javascript:` / `vbscript:` / `data:`（非图片）等危险协议
 
@@ -662,14 +736,18 @@ https://example.com
 
 ## 7. 潜在改进建议
 
-1. **scheme 显式白名单**：在 `_normalize_url_fields()` 中增加 scheme 白名单校验（仅允许 `http`、`https`、`ftp`、`ftps`、`magnet`），其他 scheme（`javascript:`、`vbscript:`、`data:` 等）直接清空 URL，杜绝间接防护的盲区。
+1. **修复无 scheme URL 生成畸形 URL 的问题**：`_normalize_url_fields()` 对 `example.com` 这类无 `//` 前缀的 URL 生成 `http:example.com`（缺少 `//`），这是一个 bug。应在 `scheme or "http"` 补全后检查 `netloc` 是否为空，若为空则尝试用 `urllib.parse.urlparse("http://" + original_url)` 重新解析，确保生成合法的 `http://example.com`。
 
-2. **统一 `//` 协议处理**：当前三处 `//` 处理逻辑不一致（两处补 `https`，一处补 `http`）。建议统一为 `https`，与现代 Web 实际情况一致。
+2. **scheme 显式白名单**：在 `_normalize_url_fields()` 中增加 scheme 白名单校验（仅允许 `http`、`https`、`ftp`、`ftps`、`magnet`），其他 scheme（`javascript:`、`vbscript:`、`data:` 等）直接清空 URL，杜绝间接防护的盲区。
 
-3. **规范化阶段默认 HTTPS**：无 scheme URL 当前降级为 `http`，可考虑改为 `https` 或通过 `settings.yml` 配置项控制。
+3. **magnet/torrent 链接纳入 filter_urls**：当前 `magnetlink` 和 `torrentfile` 不在 `_filter_urls()` 的 `url_fields` 列表中，完全绕过了去追踪和主机重写。建议将它们加入 `url_fields` 或单独处理。
 
-4. **图片代理重定向限制**：`image_proxy()` 使用 `allow_redirects=True` 但未限制重定向次数和内网目标，建议增加最大重定向次数（如 3 次）并限制目标为公网 IP。
+4. **统一 `//` 协议处理**：当前三处 `//` 处理逻辑不一致（两处补 `https`，一处补 `http`）。建议统一为 `https`，与现代 Web 实际情况一致。
 
-5. **代理 HMAC 有效期**：当前 HMAC 无时间戳，签名永久有效。建议在 HMAC 输入中加入时间戳，服务端校验时限制有效期（如 24 小时）。
+5. **规范化阶段默认 HTTPS**：无 scheme URL 当前降级为 `http`，可考虑改为 `https` 或通过 `settings.yml` 配置项控制。
 
-6. **Content-Security-Policy 头**：建议在渲染结果页时设置严格的 CSP（如 `default-src 'self'`、`img-src 'self' data:`、`frame-src *`），从浏览器层面进一步约束外链行为。
+6. **图片代理重定向限制**：`image_proxy()` 使用 `allow_redirects=True` 但未限制重定向次数和内网目标，建议增加最大重定向次数（如 3 次）并限制目标为公网 IP。
+
+7. **代理 HMAC 有效期**：当前 HMAC 无时间戳，签名永久有效。建议在 HMAC 输入中加入时间戳，服务端校验时限制有效期（如 24 小时）。
+
+8. **Content-Security-Policy 头**：建议在渲染结果页时设置严格的 CSP（如 `default-src 'self'`、`img-src 'self' data:`、`frame-src *`），从浏览器层面进一步约束外链行为。
