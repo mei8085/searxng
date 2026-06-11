@@ -233,9 +233,133 @@ STATS_SORT_PARAMETERS = {
 
 以 JSON 格式返回每个引擎的完整错误分类统计。
 
+### 5.5 指标关闭时的列隐藏逻辑（enable_metrics）
+
+`enable_metrics` 是全局模板上下文变量，在每次渲染模板时注入。注入入口位于 [webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L424)：
+
+```python
+kwargs['enable_metrics'] = get_setting('general.enable_metrics')
+```
+
+#### 5.5.1 偏好设置页的列隐藏
+
+偏好设置的引擎表格通过 **双重条件判断** 实现整列（表头 + 单元格）的隐藏。
+
+**表头隐藏**（[engines.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences/engines.html#L22-L37)）：
+```html
+<tr>
+  <th class="checkbox-col">{{- _("Allow") -}}</th>
+  <th class="name">{{- _("Engine name") -}}</th>
+  ...
+  <th>{{- _("Weight") }}</th>
+  {%- if enable_metrics -%}
+    <th>{{- _("Response time") -}}</th>       {# 指标启用时才渲染表头 #}
+  {%- endif -%}
+  <th>{{- _("Max time") -}}</th>
+  {%- if enable_metrics -%}
+    <th>{{- _("Reliability") }}</th>          {# 指标启用时才渲染表头 #}
+  {%- endif -%}
+</tr>
+```
+
+**单元格隐藏**（[engines.html](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/templates/simple/preferences/engines.html#L83-L91)）：
+```html
+<td>{{- search_engine.weight or '1.0' -}}</td>
+{%- if enable_metrics -%}
+  {{- engine_time(search_engine.name) -}}      {# 指标启用时才调用宏渲染时间 #}
+{%- endif -%}
+<td class="{{ 'danger' if stats[search_engine.name]['warn_timeout'] else '' }}">
+  {{- search_engine.timeout -}}
+</td>
+{%- if enable_metrics -%}
+  {{- engine_reliability(search_engine.name) -}}  {# 指标启用时才调用宏渲染可靠性 #}
+{%- endif -%}
+```
+
+当 `enable_metrics=False` 时，"Response time" 和 "Reliability" 两列的 `<th>` 与对应的 `<td>` 完全不输出 HTML，表格列数自动减少。
+
+#### 5.5.2 独立统计页的隐藏
+
+`/stats` 页面本身是一个专门的统计展示页，**不通过 `enable_metrics` 条件隐藏内容**，始终调用 `get_engines_stats()` 和 `get_reliabilities()`。即便指标系统关闭，采样虽不发生，但页面仍可访问（只是表格中没有数据行，显示 "There is currently no data available."）。
+
+#### 5.5.3 OpenMetrics 端点的隐藏
+
+`/metrics` 端点在 [webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L1172-L1173) 中做硬拦截：
+
+```python
+if not (settings['general'].get("enable_metrics") and password):
+    return Response('open metrics is disabled', status=404, mimetype='text/plain')
+```
+
+当 `enable_metrics=False` 或未配置密码时，直接返回 HTTP 404。
+
 ---
 
-## 六、异常情况下的降级显示机制
+## 六、两个管理页面的统计聚合口径对比
+
+`/preferences` 与 `/stats` 虽然都展示引擎指标，但聚合逻辑存在显著差异：
+
+| 对比维度 | /preferences（偏好设置页） | /stats（独立统计页） |
+|---------|---------------------------|---------------------|
+| **聚合入口** | webapp.py 内联代码（L902-L954） | metrics 模块 `get_engines_stats()` + `get_reliabilities()` |
+| **引擎过滤** | 所有引擎始终展示（含无数据） | `sent_count==0` 的引擎被 `continue` 跳过 |
+| **响应时间维度** | 仅 `time.total` 的 P50/P80/P95 | `total`、`http`、`processing` 三个维度，各含 P50/P80/P95 |
+| **结果数量算法** | 算术平均值：`result_count_sum / successful_count` | 中位数：`histogram.percentage(50)` |
+| **得分展示** | 不展示 | 展示累计 `score` 和 `score_per_result` |
+| **错误信息展示** | 仅 primary 异常且含 `exception_classname`，经友好翻译 | 全部错误（含 secondary），原始异常类名/日志消息 |
+| **排序能力** | 按字母顺序固定排序 | 支持按 name/score/result_count/time/reliability 排序 |
+
+### 6.1 结果数量的算法差异
+
+**/preferences**（[webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L912-L914)）：
+```python
+result_count_sum = histogram('engine', e.name, 'result', 'count').sum   # 所有请求的结果数总和
+successful_count = counter('engine', e.name, 'search', 'count', 'successful')  # 成功请求数
+result_count = int(result_count_sum / float(successful_count)) if successful_count else 0
+```
+使用算术平均：总结果数 ÷ 成功请求数。当某些请求返回结果数极高时，平均值容易被拉高。
+
+**/stats**（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L179)）：
+```python
+result_count = histogram('engine', e.name, 'result', 'count').percentage(50)  # P50 中位数
+```
+使用中位数（P50）：结果分布的中间值，不受极端值影响，更能代表典型单次请求的结果数量。
+
+### 6.2 响应时间维度差异
+
+**/preferences**（[webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/webapp.py#L905-L908)）：
+```python
+h = histogram('engine', e.name, 'time', 'total')
+median = round(h.percentage(50), 1) if h.count > 0 else None   # 仅 total 的 P50
+rate80 = round(h.percentage(80), 1) if h.count > 0 else None   # 仅 total 的 P80
+rate95 = round(h.percentage(95), 1) if h.count > 0 else None   # 仅 total 的 P95
+```
+只聚合 `time.total`，以堆叠条形图展示 median/P80/P95 三层，不区分 HTTP 耗时和结果解析耗时。
+
+**/stats**（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L209-L232)）：
+```python
+time_http = histogram('engine', engine_name, 'time', 'http').percentage(50)
+time_total = histogram('engine', engine_name, 'time', 'total').percentage(50)
+# ... P80/P95 同样处理
+stats['processing'] = round(time_total - (time_http or 0), 1)  # 解析时间 = 总时间 - HTTP 时间
+```
+同时展示 `total`（总耗时）、`http`（网络耗时）、`processing`（结果解析耗时 = total - http）三个维度，每个维度都有 P50/P80/P95，以 tooltip 表格形式详细展示。
+
+### 6.3 引擎过滤差异
+
+**/preferences**：遍历 `filtered_engines` 中的全部引擎，即便 `sent_count == 0` 也保留行记录，只是对应指标值为 `None`，由模板决定不渲染条形图。用户总能看到所有引擎的配置行。
+
+**/stats**：在 `get_engines_stats()`（[metrics/__init__.py](file:///d:/fz/0601-1/solo-dogfeeding/code/14-searxng/searx/metrics/__init__.py#L175-L177)）中直接跳过无请求引擎：
+```python
+sent_count = counter('engine', engine_name, 'search', 'count', 'sent')
+if sent_count == 0:
+    continue  # 无请求数据的引擎完全不出现在结果列表中
+```
+导致当所有引擎都无数据时，`engine_stats['time']` 为空列表，模板显示 "There is currently no data available."。
+
+---
+
+## 七、异常情况下的降级显示机制
 
 ### 6.1 指标系统禁用时的空对象模式
 
