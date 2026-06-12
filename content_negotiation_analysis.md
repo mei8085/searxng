@@ -1,271 +1,186 @@
-# SearXNG 搜索结果内容协商与序列化机制分析
+# SearXNG 输出格式切换机制分析
 
-## 一、概述
+## 一、机制总览
 
-SearXNG 支持多种搜索结果输出格式（HTML、JSON、CSV、RSS），实现了"同一份搜索数据，多种序列化方式"的内容协商机制。与传统基于 HTTP `Accept` 头的内容协商不同，SearXNG 采用了**查询参数驱动**的简洁实现方式。
+SearXNG 支持四种搜索结果输出格式：HTML 页面、JSON 数据、CSV 表格和 RSS 订阅。同一份搜索结果可以在这四种格式之间切换，其核心是一套"格式决策-入口联动-序列化分发"的三层协作机制。
 
----
-
-## 二、输出格式定义与配置
-
-### 2.1 支持的输出格式
-
-输出格式在 [settings_defaults.py](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/settings_defaults.py#L22-L22) 中硬编码定义：
-
-```python
-OUTPUT_FORMATS = ['html', 'csv', 'json', 'rss']
-```
-
-### 2.2 配置层验证
-
-在 [settings_defaults.py](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/settings_defaults.py#L207-L207) 的 SCHEMA 中，`search.formats` 配置项的默认值即为 `OUTPUT_FORMATS`：
-
-```python
-'search': {
-    'formats': SettingsValue(list, OUTPUT_FORMATS),
-    ...
-}
-```
-
-这意味着：
-- 默认启用所有 4 种格式
-- 管理员可以在 `settings.yml` 中限制可用格式
-- 配置值为 `list` 类型，不做子项校验（不同于 `SettingSublistValue`），完全信任管理员输入
+格式决策层决定"这份请求该用什么格式响应"，入口联动层决定"用户界面上该展示哪些格式入口"，序列化分发层决定"选中的格式该如何把数据转成最终响应"。三层各司其职，又通过共享的格式白名单配置紧密联动。
 
 ---
 
-## 三、格式决策的三道关卡
+## 二、格式决策的三道关口
 
-内容协商的核心逻辑位于 [webapp.py](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L619-L785) 的 `search()` 视图函数。格式决策经历三道关卡，每道关卡的语义截然不同：
+每个携带格式参数的搜索请求，都会依次经过三道决策关口，每道关口的设计意图和处理逻辑完全不同。
 
-### 关卡一：参数提取与默认值
+### 第一道：参数提取与默认值
 
-```python
-output_format = sxng_request.form.get('format', 'html')
-```
+用户的格式声明通过查询参数传递。如果请求没有携带格式参数，系统默认按 HTML 处理——这对应了最常见的场景：用户在浏览器地址栏直接搜索，没有任何格式意图。
 
-未携带 `format` 参数的请求统一视为 HTML。这是最常见的用户浏览场景——浏览器地址栏直接搜索，无显式格式声明。
+> **设计意图**：面向无声明场景的合理默认，保证绝大多数用户无需关心格式概念。
+>
+> **代码出处**：[webapp.py#L629](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L629-L629)
 
-### 关卡二：非法格式回落
+### 第二道：非法格式回落
 
-```python
-if output_format not in OUTPUT_FORMATS:
-    output_format = 'html'
-```
+当用户声明的格式名不在系统支持的四种格式之列时，系统不会报错，而是**静默地将格式重置为 HTML**。
 
-当 `format` 参数值不在代码硬编码的 `OUTPUT_FORMATS` 列表中时，**静默回落**为 HTML，而非报错。这是一种容错设计：无论是用户手误（`?format=xlsx`）、爬虫探测还是遗留参数，都不会被打断，而是以最通用的 HTML 形式返回结果。
+这是一种容错设计。无论是用户手误拼错了格式名、爬虫探测不存在的格式、还是旧版本客户端遗留的参数，都不会导致请求失败，而是以最通用的 HTML 形式返回结果。用户甚至可能察觉不到自己的格式参数被修正了。
 
-**关键语义**：回落仅发生在"代码不认识这个格式名"时，回落的结果是"给你能看的东西"。
+> **设计意图**：面向未知输入的容错降级，"给用户一个能看的东西"比"告诉用户写错了"更友好。
+>
+> **代码出处**：[webapp.py#L630-L631](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L630-L631)
 
-### 关卡三：配置禁用拦截
+### 第三道：配置禁用拦截
 
-```python
-if output_format not in settings['search']['formats']:
-    flask.abort(403)
-```
+当用户声明的格式名合法，但实例管理员在配置中禁用了该格式时，系统会**直接拒绝请求**，返回 HTTP 403 Forbidden 错误。
 
-当格式名合法但被管理员在 `settings.yml` 中排除时，**直接拒绝**，返回 HTTP 403 Forbidden。这不是容错，而是访问控制。
+这不是容错，而是访问控制。管理员通过配置白名单控制哪些格式可以对外提供服务。例如，仅开放 HTML 页面而禁止 JSON/CSV/RSS，可以有效防止批量数据抓取。
 
-**关键语义**：拦截发生在"代码认识这个格式名，但实例策略不允许使用"时，拒绝的结果是"你无权以这种方式获取数据"。
+> **设计意图**：面向运维策略的访问控制，"你无权以这种方式获取数据"就应该明明白白地拒绝。
+>
+> **代码出处**：[webapp.py#L633-L634](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L633-L634)
 
-### 两道关卡的语义差异
+### 两道关口的本质区别
 
-| 维度 | 关卡二（非法格式回落） | 关卡三（配置禁用拦截） |
-|------|----------------------|----------------------|
-| 触发条件 | 格式名不在硬编码列表中 | 格式名合法但不在配置白名单中 |
-| 设计意图 | 容错：给用户一个可用的响应 | 控制：禁止该格式的访问 |
-| 响应行为 | 静默回落为 HTML | 返回 403 中断请求 |
-| 安全含义 | 无——格式本身不存在，无法利用 | 有——格式存在但被策略禁用，必须阻止绕过 |
-| 典型场景 | `?format=yaml`、`?format=undefined` | 管理员仅开放 HTML，禁止 API 式批量抓取 |
+非法格式回落和配置禁用拦截虽然都是"格式不符合要求"，但处理逻辑截然相反：
 
-**一个微妙之处**：关卡二的回落发生在关卡三之前。这意味着如果管理员配置了 `formats: [html]`，请求 `?format=yaml` 会先被关卡二回落为 `html`，然后通过关卡三（`html` 在白名单中），最终正常返回 HTML 页面——而非 403。只有合法但被禁用的格式（如 `?format=json`）才会触发 403。换言之，**"写错了"得到宽容，"写对了但没权限"被严格拦截**。
+| 维度 | 非法格式回落 | 配置禁用拦截 |
+|------|-------------|-------------|
+| 触发条件 | 格式名系统不认识 | 格式名系统认识但管理员不让用 |
+| 处理方式 | 静默修正为 HTML | 直接返回 403 中断请求 |
+| 设计目标 | 容错降级 | 访问控制 |
+| 用户感知 | 无感知，以为自己搜出了 HTML 页面 | 明确感知，看到错误页面 |
 
----
+**一个关键的顺序问题**：非法格式回落发生在配置禁用拦截之前。这意味着如果管理员只开放了 HTML，用户请求一个不存在的格式（如 `yaml`）会先被修正为 `html`，然后顺利通过拦截——用户看到正常的搜索结果页。只有当用户请求一个合法但被禁用的格式（如 `json`）时，才会触发 403。
 
-## 四、结果页面的格式下载入口
+换言之：**写错了格式名得到宽容，写对了但没权限被严格拦截**。这是一个刻意的设计选择，将"手误"和"越权"区别对待。
 
-### 4.1 入口的数据来源
-
-HTML 结果页面侧栏中的"Download results"区域，其可用格式按钮不是硬编码的，而是由配置白名单动态生成。数据源在 [render()](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L420-L420) 函数中注入模板上下文：
-
-```python
-kwargs['search_formats'] = [x for x in settings['search']['formats'] if x != 'html']
-```
-
-`search_formats` 列表是配置白名单减去 `html` 后的结果——因为用户已经在 HTML 页面上了，无需再提供"下载为 HTML"的入口。
-
-### 4.2 入口的渲染逻辑
-
-在 [results.html](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html#L54-L56) 中，仅当 `search_formats` 非空时才渲染下载入口：
-
-```jinja2
-{%- if search_formats -%}
-  {%- include 'simple/elements/apis.html' -%}
-{%- endif -%}
-```
-
-[apis.html](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/elements/apis.html) 模板为每个可用格式生成一个表单提交按钮，表单中携带完整的搜索上下文（查询词、分类、页码、语言、时间范围、安全搜索等），并通过隐藏字段 `format` 指定目标格式：
-
-```jinja2
-{%- for output_type in search_formats -%}
-  <form method="{{ method or 'POST' }}" action="{{ url_for('search') }}">
-    <input type="hidden" name="q" value="{{ q|e }}">
-    ...
-    <input type="hidden" name="format" value="{{ output_type }}">
-    <input type="submit" role="link" value="{{ output_type }}">
-  </form>
-{%- endfor -%}
-```
-
-### 4.3 RSS 的双重入口
-
-除了"Download results"侧栏，RSS 格式还有一个额外入口：HTML 页面 `<head>` 中的 `<link rel="alternate">` 标签，供浏览器和 RSS 阅读器自动发现订阅源（[results.html#L11](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html#L11)）：
-
-```jinja2
-<link rel="alternate" type="application/rss+xml" title="Searx search: {{ q|e }}"
-  href="{{ url_for('search', _external=True) }}?q={{ q|urlencode }}&amp;format=rss&amp;...">
-```
-
-**注意**：这个 RSS 自动发现链接是硬编码在模板中的，不受 `search_formats` 变量控制。即使用户无法通过侧栏按钮点击到 RSS（如管理员禁用了 RSS），浏览器仍可能通过 `<link>` 标签发现该端点——但此时直接访问会被关卡三拦截返回 403。
+> **代码出处**：[settings_defaults.py#L22](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/settings_defaults.py#L22-L22)（硬编码格式列表）、[settings_defaults.py#L207](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/settings_defaults.py#L207-L207)（格式白名单配置项）
 
 ---
 
-## 五、完整链路：从请求到格式输出
+## 三、格式入口的联动机制
 
-### 5.1 请求级链路
+格式入口是指用户界面上可以点击切换格式的地方。SearXNG 有两种格式入口，它们与格式决策层的联动方式不同。
 
-```
-用户请求 /search?q=test&format=json
-    │
-    ├─ ① 参数提取：format='json'，缺省='html'
-    │
-    ├─ ② 关卡二：'json' ∈ OUTPUT_FORMATS → 通过，无回落
-    │
-    ├─ ③ 关卡三：'json' ∈ settings['search']['formats']?
-    │    ├─ 是 → 继续搜索
-    │    └─ 否 → abort(403)，链路终止
-    │
-    ├─ ④ 执行搜索，得到 ResultContainer
-    │
-    └─ ⑤ 按 output_format 分发到对应序列化器
-         └─ JSON → webutils.get_json_response() → Response(mimetype='application/json')
-```
+### 侧栏下载入口：与配置完全同步
 
-### 5.2 页面级链路（下载入口与关卡的联动）
+HTML 搜索结果页面的侧栏有一个"Download results"区域，列出了可以下载的格式按钮。这个列表不是写死的，而是**由管理员的格式白名单动态生成**。
 
-```
-管理员配置 settings.yml: search.formats = [html]
-    │
-    ├─ 启动时：SCHEMA 验证，settings['search']['formats'] = ['html']
-    │
-    ├─ 渲染 HTML 结果页时：
-    │    render() 计算 search_formats = ['html'] - ['html'] = []
-    │    results.html: {% if search_formats %} → False → 不渲染 apis.html
-    │    侧栏无"Download results"入口
-    │
-    └─ 直接请求 /search?q=test&format=json：
-         关卡三：'json' ∉ ['html'] → abort(403)
-```
+生成规则很简单：白名单中除了 HTML 之外的所有格式，都会出现在下载入口中。之所以排除 HTML，是因为用户已经在浏览 HTML 页面了，不需要再提供一个"下载为 HTML"的按钮。
 
-```
-管理员配置 settings.yml: search.formats = [html, csv, json, rss]
-    │
-    ├─ 启动时：settings['search']['formats'] = ['html', 'csv', 'json', 'rss']
-    │
-    ├─ 渲染 HTML 结果页时：
-    │    render() 计算 search_formats = ['csv', 'json', 'rss']
-    │    results.html: {% if search_formats %} → True → 渲染 apis.html
-    │    侧栏显示三个按钮：csv | json | rss
-    │
-    └─ 点击 json 按钮 → POST /search, format=json
-         关卡三：'json' ∈ ['html','csv','json','rss'] → 通过 → 正常返回 JSON
-```
+这种设计保证了一个重要的一致性：**用户能看到的下载按钮，一定是当前实例允许访问的格式**。不可能出现"按钮指向被禁用格式"的矛盾——如果管理员禁用了 JSON，侧栏根本不会出现 JSON 按钮。
 
-### 5.3 非法格式与配置禁用的差异化处理链路
+每个下载按钮本质上是一个自动填充的搜索表单，包含了当前搜索的全部上下文（查询词、分类、页码、语言、时间范围、安全搜索级别等），并通过隐藏字段指定了目标格式。用户点击按钮时，相当于用相同的搜索条件重新发起一次请求，只是格式参数不同。
 
-```
-请求 /search?q=test&format=yaml
-    │
-    ├─ ② 关卡二：'yaml' ∉ OUTPUT_FORMATS → output_format 回落为 'html'
-    │
-    ├─ ③ 关卡三：'html' ∈ settings['search']['formats'] → 通过
-    │    （即使配置只允许 html，也能通过）
-    │
-    └─ ⑤ 序列化：按 HTML 输出，用户看到正常搜索结果页
+> **代码出处**：[webapp.py#L420](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L420-L420)（入口数据源计算）、[results.html#L54-L56](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html#L54-L56)（入口渲染条件）、[apis.html](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/elements/apis.html)（入口模板）
 
-请求 /search?q=test&format=json（管理员禁用了 json）
-    │
-    ├─ ② 关卡二：'json' ∈ OUTPUT_FORMATS → 通过，不回落
-    │
-    ├─ ③ 关卡三：'json' ∉ settings['search']['formats'] → abort(403)
-    │
-    └─ 链路终止，用户看到 403 错误页
-```
+### RSS 订阅入口：硬编码的特殊通道
+
+RSS 格式有一个额外的入口：HTML 页面头部的 RSS 自动发现链接。这是一个标准的 `<link rel="alternate">` 标签，供浏览器和 RSS 阅读器自动发现当前搜索对应的订阅源。
+
+与侧栏下载入口不同，这个 RSS 链接是**硬编码在模板中的**，不受格式白名单控制。即使用户无法通过侧栏点击到 RSS（比如管理员禁用了 RSS），浏览器仍可能通过这个标签发现该端点。
+
+当然，这个链接指向的端点仍然会经过第三道关口的校验。如果管理员禁用了 RSS，用户点击这个链接会收到 403 错误。这是一个设计上的小瑕疵：自动发现机制宣告了一个实际上不可用的端点。
+
+> **代码出处**：[results.html#L11](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html#L11-L11)（RSS 自动发现链接）
 
 ---
 
-## 六、序列化器实现
+## 四、全链路协作场景
 
-SearXNG 为每种格式实现了独立的序列化逻辑，分为两类：
+为了更清晰地展示各部分如何协作，下面通过几个典型场景走完整条链路。
 
-### 6.1 无模板序列化（JSON、CSV）
+### 场景一：管理员开放全部格式
 
-#### JSON 序列化器
+管理员配置白名单包含全部四种格式。
 
-[webutils.py#get_json_response](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L162-L175) 将 `ResultContainer` 中的各类结果组装为字典，再通过自定义 [JSONEncoder](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L149-L159) 序列化。`JSONEncoder` 处理 `msgspec.Struct` → 内置类型、`datetime` → ISO 字符串、`timedelta` → 秒数、`set` → 列表等特殊转换。
+1.  用户搜索后看到 HTML 结果页，侧栏"Download results"区域显示 JSON、CSV、RSS 三个按钮
+2.  页面头部包含 RSS 自动发现链接
+3.  用户点击 JSON 按钮 → 携带 `format=json` 重新请求 → 通过三道关口 → 返回 JSON 数据
+4.  用户直接请求 `format=yaml` → 关口二将格式修正为 `html` → 通过关口三 → 返回 HTML 页面（用户无感知）
 
-#### CSV 序列化器
+### 场景二：管理员仅开放 HTML
 
-[webutils.py#write_csv_response](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L113-L146) 将结果按行写入 CSV，固定列模式为 `(title, url, content, host, engine, score, type)`，通过 `type` 列区分 `result`、`answer`、`suggestion`、`correction` 四种行类型。[CSVWriter](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L85-L110) 封装了增量编码，确保 UTF-8 兼容。
+管理员配置白名单只包含 HTML。
 
-### 6.2 模板驱动序列化（RSS、HTML）
+1.  用户搜索后看到 HTML 结果页，侧栏"Download results"区域**完全不显示**（因为白名单减去 HTML 后为空）
+2.  页面头部**仍然包含** RSS 自动发现链接（硬编码）
+3.  用户直接请求 `format=json` → 关口二通过（JSON 是合法格式名）→ 关口三拦截（不在白名单中）→ 返回 403
+4.  用户点击 RSS 自动发现链接 → 同样被关口三拦截 → 返回 403
 
-#### RSS 序列化器
+### 场景三：管理员开放 HTML 和 JSON
 
-使用 Jinja2 模板 [opensearch_response_rss.xml](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/opensearch_response_rss.xml) 渲染，遵循 OpenSearch RSS 规范，输出 `text/xml`。
+管理员配置白名单包含 HTML 和 JSON。
 
-#### HTML 序列化器
+1.  用户搜索后看到 HTML 结果页，侧栏"Download results"区域只显示 JSON 按钮
+2.  页面头部仍然包含 RSS 自动发现链接
+3.  用户点击 JSON 按钮 → 正常返回 JSON
+4.  用户直接请求 `format=csv` → 关口二通过（CSV 是合法格式名）→ 关口三拦截 → 返回 403
+5.  用户请求 `format=yaml` → 关口二回落为 `html` → 通过关口三 → 返回 HTML 页面
 
-使用 Jinja2 模板 [results.html](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html)，是最复杂的序列化路径。HTML 路径独有关键词高亮预处理（[webapp.py#L702-L706](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L702-L706)），以及按模板分组的 open/close_group 标记逻辑。
+### 场景四：搜索出错时的格式协商
 
----
+搜索过程中可能发生各种错误（无查询词、参数非法、引擎异常等）。错误响应也遵循相同的格式决策流程。
 
-## 七、错误处理的内容协商
+需要注意的是：由于关口二的存在，错误处理函数收到的格式参数永远是四种合法格式之一——非法值已经被回落为 HTML 了。因此错误处理逻辑只需要为四种合法格式分别准备错误表现形态即可。
 
-错误响应也遵循相同的格式协商机制，在 [index_error](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L553-L579) 函数中实现。但需注意：由于关卡二的存在，`index_error` 收到的 `output_format` 参数永远不会是非法值——非法值已被回落为 `html`。因此 `index_error` 只需处理四种合法格式各自的错误表现形态。
-
----
-
-## 八、Result 类型系统与序列化桥梁
-
-所有结果都继承自 [Result](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/result_types/_base.py#L228-L337) 基类（基于 `msgspec.Struct`）。`as_dict()` 方法是序列化的关键桥梁——所有格式的序列化最终都依赖这个方法将强类型对象转换为字典，JSON 序列化器的 `_.as_dict()` 和 CSV 序列化器的 `res.as_dict()` 均出自此处。
-
----
-
-## 九、架构设计分析
-
-### 9.1 设计优点
-
-1. **关注点分离**：搜索执行与序列化完全解耦，`ResultContainer` 是中间契约
-2. **单一数据源**：所有格式共享同一份 `ResultContainer` 数据，保证一致性
-3. **可扩展性**：新增格式只需添加新的序列化分支和可选模板
-4. **防御式编程**：双重验证（硬编码列表 + 配置白名单）确保安全
-5. **入口与关卡联动**：页面下载入口由配置白名单动态生成，不可能出现"按钮指向被禁格式"的矛盾
-
-### 9.2 可改进点
-
-1. **RSS 自动发现链接不受配置控制**：`<link rel="alternate">` 硬编码在模板中，不受 `search_formats` 约束，可能导致用户发现一个 403 端点
-2. **分支式扩展**：当前使用 `if-elif` 分支选择序列化器，可改为注册表模式
-3. **MIME 类型响应头**：部分响应的 `Content-Type` 可以更精确（CSV 应为 `text/csv`，RSS 应为 `application/rss+xml`）
+> **代码出处**：[webapp.py#L553-L579](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L553-L579)（错误响应的格式分发）
 
 ---
 
-## 十、总结
+## 五、序列化分发层
 
-SearXNG 的内容协商与序列化机制采用了**简单直接**的设计哲学，其核心链路由三个环节构成：
+经过三道关口确定最终格式后，系统将同一份搜索结果数据分发到对应的序列化器。
 
-- **格式决策**：参数提取（默认 HTML）→ 非法格式回落（容错，静默回 HTML）→ 配置禁用拦截（访问控制，403 中断）
-- **入口联动**：页面下载入口由配置白名单动态生成（`search_formats = 配置白名单 - html`），确保可见入口与可用端点始终一致
-- **序列化分发**：无模板序列化（JSON/CSV）+ 模板驱动序列化（RSS/HTML），共享 `ResultContainer` 数据源
+搜索结果以统一的数据结构存在，包含主结果列表、信息框、搜索建议、拼写纠错、直接答案、无响应引擎等多个部分。四种格式共享这份数据，只是"翻译"方式不同。
 
-这套机制虽然不符合严格的 RESTful 内容协商规范，但在搜索引擎场景下具有实现简单、调试方便、用户可控等优点，是一个务实的工程选择。
+### 无模板序列化
+
+JSON 和 CSV 属于无模板序列化，直接在代码中将数据结构转换为目标格式。
+
+JSON 序列化器将数据结构整体转换为 JSON 字符串，包含完整的字段信息。CSV 序列化器则将结果按行展开，用固定的列模式输出，每行用 `type` 字段区分是搜索结果、直接答案、搜索建议还是拼写纠错。
+
+> **代码出处**：[webutils.py#L162-L175](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L162-L175)（JSON 序列化）、[webutils.py#L113-L146](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webutils.py#L113-L146)（CSV 序列化）
+
+### 模板驱动序列化
+
+RSS 和 HTML 属于模板驱动序列化，通过模板引擎将数据结构渲染为目标格式。
+
+RSS 序列化遵循 OpenSearch 规范，输出标准的 RSS 2.0 XML 文档。HTML 序列化最为复杂，除了模板渲染外，还需要对结果做 HTML 特有的预处理：搜索关键词高亮、按结果模板分组等。
+
+> **代码出处**：[opensearch_response_rss.xml](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/opensearch_response_rss.xml)（RSS 模板）、[results.html](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/templates/simple/results.html)（HTML 模板）、[webapp.py#L702-L706](file:///d:/fz/0601-1/solo-dogfeeding/code/40-searxng/searx/webapp.py#L702-L706)（HTML 特有预处理）
+
+---
+
+## 六、设计评价
+
+### 设计优点
+
+1.  **关注点分离**：搜索执行与序列化完全解耦，搜索结果容器是两层之间的稳定契约。无论新增多少种格式，搜索执行逻辑无需变动。
+
+2.  **单一数据源**：所有格式共享同一份搜索结果数据，从根本上保证了不同格式输出的一致性。不会出现"JSON 有结果但 HTML 没结果"这类诡异问题。
+
+3.  **入口与决策一致**：侧栏下载入口由格式白名单动态生成，用户能看到的按钮一定是可用的，避免了"点进去才发现被禁"的糟糕体验。
+
+4.  **容错与控制分明**：非法格式回落与配置禁用拦截两道关口语义清晰，将"手误"与"越权"区别对待，既保证了友好性又守住了安全性。
+
+### 可改进点
+
+1.  **RSS 自动发现链接的一致性问题**：该链接硬编码在模板中，不受格式白名单控制，可能宣告一个实际上不可用的端点。应当与侧栏入口保持一致，仅在 RSS 开放时才渲染。
+
+2.  **序列化器的分支式扩展**：当前使用多层 `if-elif` 分支选择序列化器，新增格式需要修改核心路由函数。可改为注册表模式，将序列化器与格式名的映射关系外置。
+
+3.  **MIME 类型精确度**：部分响应的 Content-Type 可以更标准——CSV 应为 `text/csv` 而非 `application/csv`，RSS 应为 `application/rss+xml` 而非 `text/xml`。
+
+---
+
+## 七、总结
+
+SearXNG 的格式切换机制可以概括为"三道关口 + 两类入口 + 四种序列化器"的协作体系：
+
+-   **格式决策**经过三道关口：参数默认（缺省为 HTML）→ 非法格式回落（容错降级）→ 配置禁用拦截（访问控制）。三道关口顺序执行，语义各异，共同确定最终响应格式。
+-   **入口联动**表现为：侧栏下载入口与格式白名单完全同步，RSS 自动发现入口独立硬编码。前者保证了界面与权限的一致性，后者存在改进空间。
+-   **序列化分发**采用两种模式：JSON/CSV 为无模板直接转换，RSS/HTML 为模板驱动渲染。四种序列化器共享同一份搜索结果数据。
+
+这套机制虽然不遵循 RESTful 风格的 HTTP Accept 头内容协商规范，但在搜索引擎场景下，以查询参数驱动的显式格式声明具有实现简单、调试方便、用户可控等优点，是一个务实的工程选择。
