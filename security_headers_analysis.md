@@ -63,6 +63,113 @@ app.wsgi_app = WhiteNoise(
 
 **适用范围**：所有 `/static/` 前缀下的静态资源，包括 JS、CSS、图片、字体文件等。
 
+### 1.3 WSGI 前置层：自实现 `ProxyFix` —— 真实客户端 IP 决策
+
+**中间件位置**：[trusted_proxies.py#L23-L176](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/trusted_proxies.py#L23-L176)
+
+**挂载点**：[webapp.py#L1394](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/webapp.py#L1394)
+
+```python
+# 中间件嵌套顺序（洋葱模型，从外到内执行）
+app.wsgi_app = ProxyFix(app.wsgi_app)     # 最外层：先于 WhiteNoise 执行
+app.wsgi_app = WhiteNoise(app.wsgi_app, ...)
+```
+
+这不是 Werkzeug 自带的简单 ProxyFix（按固定 hop 数挑 IP），而是 **SearXNG 自实现的可信代理网段感知版**。整个限流、IP 黑白名单、link_token 的安全决策全部建立在它输出的 `REMOTE_ADDR` 之上，是所有请求安全决策的根基。
+
+#### 1.3.1 核心算法：从右向左反向扫描 X-Forwarded-For
+
+**关键方法**：`trusted_remote_addr` — [trusted_proxies.py#L66-L86](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/trusted_proxies.py#L66-L86)
+
+```python
+def trusted_remote_addr(
+    self,
+    x_forwarded_for: list[IPv4Address | IPv6Address],
+    trusted_proxies: list[IPv4Network | IPv6Network],
+) -> str:
+    # always rtl
+    for addr in reversed(x_forwarded_for):
+        trust: bool = False
+        for net in trusted_proxies:
+            if addr.version == net.version and addr in net:
+                trust = True
+                break
+        # client address
+        if not trust:
+            return addr.compressed
+    # fallback to first address
+    return x_forwarded_for[0].compressed
+```
+
+**逐段解析**：
+
+- **`# always rtl`（从右向左扫描）**：`X-Forwarded-For` 的格式是 `client_ip, proxy1_ip, proxy2_ip, ...`，每个代理追加自己的前一跳 IP 到右侧。最右侧是**直接连接 SearXNG 的那一跳**（即离服务器最近的代理）。从右向左扫描可以按信任边界逐级剥离。
+- **双层循环验证归属**：外层遍历 X-Forwarded-For 列表（从右向左），内层遍历 `botdetection.trusted_proxies` 配置的所有可信网段，判断当前 IP 是否属于任一可信代理网络。
+- **第一个不可信 IP 即真实客户端**：找到第一个不在可信网段内的 IP，就认定它是真实客户端地址并返回。这是反 IP 伪造的关键 —— 攻击者可以随意在 X-Forwarded-For 左侧追加伪造 IP，但伪造 IP 后面一定会跟着某个可信代理的 IP（因为流量确实经过了反向代理），所以从右向左扫时，伪造 IP 永远出现在第一个不可信 IP 之后（左侧），不会被选中。
+- **fallback 兜底**：如果所有 IP 都在可信网段内（极端情况），回退到列表最左侧（理论上的最原始客户端）。
+
+#### 1.3.2 IP 验证与回退优先级链
+
+**`__call__` 方法完整处理流程**：[trusted_proxies.py#L88-L176](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/trusted_proxies.py#L88-L176)
+
+```
+步骤 1：environ.pop("REMOTE_ADDR")  → 先清空 WSGI 原始 REMOTE_ADDR，不信任上游
+步骤 2：验证原始 REMOTE_ADDR         → 用 ip_address() 校验合法性，非合法值丢弃
+步骤 3：验证 X-Real-IP                → 同上，非法值从 environ 中彻底删除
+步骤 4：验证 X-Forwarded-For 列表    → 每个 IP 逐一校验，一个非法则整条头丢弃
+步骤 5：完整性检查
+   ├─ 无 X-Forwarded-For 且无 X-Real-IP → 打告警（但不拦截，继续用 REMOTE_ADDR）
+   └─ 有 X-Forwarded-For 但 trusted_proxies 为空 → 打告警 + 丢弃 X-Forwarded-For
+步骤 6：按优先级确定最终 REMOTE_ADDR
+   ├─ 有 X-Forwarded-For + 有 trusted_proxies → 调用 trusted_remote_addr() 反向扫描
+   ├─ 否则有 X-Real-IP                      → 直接用 X-Real-IP
+   ├─ 否则原始 REMOTE_ADDR 合法              → 用原始 REMOTE_ADDR
+   └─ 否则                                   → 用黑洞地址 "100::" (RFC6666)
+步骤 7：最终再做一次 ip_address() 校验，失败则再回退到 100::
+```
+
+**关键安全语义**：
+
+- **"不信任"原则**：第一步直接 `environ.pop("REMOTE_ADDR")`，意味着完全不信任 WSGI 层传入的原始连接 IP（可能来自负载均衡或容器网络的 SNAT），必须通过可信代理链路重新推导。
+- **IP 格式硬校验**：所有输入（`REMOTE_ADDR`、`X-Real-IP`、`X-Forwarded-For` 中的每个值）都经过 `ip_address()` 解析，IPv4 映射的 IPv6 地址（如 `::ffff:192.168.1.1`）会被归一化到 IPv4。非法值被就地丢弃，**避免 IP 格式伪造绕过黑名单**。
+- **X-Forwarded-For 依赖 trusted_proxies**：如果管理员忘了配 `botdetection.trusted_proxies`，即使收到 X-Forwarded-For 也直接清空（`x_forwarded_for = []`），防止攻击者直接伪造 `X-Forwarded-For: <合法白名单IP>` 绕过限流。
+- **黑洞地址兜底**：`100::` 是 RFC 6666 规定的 Discard-Only 地址段，保证即使所有推导路径失败，`request.remote_addr` 也不会是 `None` 或空字符串，避免下游 `ip_address(None)` 崩溃。
+
+#### 1.3.3 所有安全决策都消费 ProxyFix 输出的 `request.remote_addr`
+
+ProxyFix 作为最外层 WSGI 中间件最先执行，重写后的 `REMOTE_ADDR` 对整个 Flask 应用透明。以下模块的安全决策全部基于它：
+
+| 消费模块 | 代码位置 | 如何使用 `request.remote_addr` |
+|----------|----------|-------------------------------|
+| **限流核心 filter_request** | [limiter.py#L147-L209](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/limiter.py#L147-L209) | `real_ip = ip_address(request.remote_addr)` → 计算 network → 过 pass-list/block-list → 传参给 http_user_agent、ip_limit 等过滤器 |
+| **IP 白名单** | [ip_lists.py#L49-L59](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/ip_lists.py#L49-L59) | `pass_ip(real_ip, cfg)` → 逐一比对 `botdetection.ip_lists.pass_ip` 中的网段 |
+| **IP 黑名单** | [ip_lists.py#L62-L69](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/ip_lists.py#L62-L69) | `block_ip(real_ip, cfg)` → 逐一比对 `botdetection.ip_lists.block_ip` 中的网段，命中直接 429 |
+| **IP 请求速率限制** | [ip_limit.py#L124-L127](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/ip_limit.py#L124-L127) | 基于 `network`（由 real_ip 换算）统计 SUSPICIOUS_IP_WINDOW 内的请求数，超阈值则 302 跳转 |
+| **客户端 link_token** | [link_token.py#L105-L110](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/botdetection/link_token.py#L105-L110) | `real_ip = ip_address(request.remote_addr)` → 计算 network → 以此为维度记录和校验客户端 token |
+| **Tor 出口节点检查** | [tor_check.py#L68-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/77-searxng/searx/plugins/tor_check.py#L68-L76) | 用 remote_addr 比对 Tor 出口节点列表，在结果页提示用户 |
+
+**因果链总结**：
+
+```
+botdetection.trusted_proxies 配置
+        │
+        ▼
+ProxyFix.__call__()  ─── 验证 + 清洗 + 反向扫描 X-Forwarded-For
+        │
+        ▼
+environ["REMOTE_ADDR"] (重写)
+        │
+        ├─► flask.request.remote_addr (全局透明)
+        │
+        ├─► limiter.filter_request() ─┐
+        ├─► ip_lists.pass_ip()        │
+        ├─► ip_lists.block_ip()       ├── 所有限流/黑白名单决策
+        ├─► ip_limit (速率计数)       │
+        └─► link_token (浏览器验证)   ┘
+```
+
+> **风险提示**：如果 `botdetection.trusted_proxies` 配置错误（例如漏了外层 CDN 的 IP 段），ProxyFix 会把 CDN 节点 IP 误认为客户端 IP。后果是：所有来自该 CDN 的用户共享同一个限流计数，且 CDN 节点的一次误封会阻断所有真实用户的访问。
+
 ---
 
 ## 二、配置来源：`default_http_headers`
