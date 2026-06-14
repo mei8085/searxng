@@ -564,10 +564,34 @@ SearXNG 的双向白名单就是为了**在双向通道上同时切断这两条�
 响应侧白名单只放行 `Content-Type`、`Content-Encoding`、`Content-Length`、`Length`，这 4 个**纯内容传输类**头与 `default_http_headers` 中的**安全策略类**头（`X-Content-Type-Options`、`Referrer-Policy` 等）**完全不重叠**，因此：
 
 1. **不会触发"不覆盖原则"**：白名单里没设的头，`after_request` 钩子会正常逐个注入。
-2. **Content-Type 与 X-Content-Type-Options 的纵深防御组合**：
-   - 图片代理先保证 Content-Type 来自上游的合法图片响应（代码里有 `startswith('image/')` 校验，非法直接 400）
-   - 统一注入再追加 `X-Content-Type-Options: nosniff`
-   - 双保险：即使上游被攻陷返回了 `Content-Type: image/png` 但实际是脚本的响应，浏览器也会被 nosniff 禁止嗅探，不会把图片当脚本执行。
+2. **Content-Type 校验的实际强度与 nosniff 的配合**：
+
+   图片代理对上游响应的 Content-Type 做了两条分支放行：
+
+   ```python
+   # webapp.py#L1035-L1039
+   if not resp.headers.get('Content-Type', '').startswith('image/') and not resp.headers.get(
+       'Content-Type', ''
+   ).startswith('binary/octet-stream'):
+       return '', 400
+   ```
+
+   - **`image/*` 分支**：这是主通道，覆盖绝大多数正常图片响应。
+   - **`binary/octet-stream` 分支**：这是一个**弱放行口**。部分上游服务器（尤其是老旧系统或 CDN 的默认回退行为）对图片资源返回 `Content-Type: binary/octet-stream` 而非具体的 `image/png`。SearXNG 为了兼容这些上游而放行了此类型。
+
+   **`binary/octet-stream` 放行口带来的风险**：`binary/octet-stream` 是一个"万能二进制"类型，任何二进制数据都可以声明为此类型——包括可执行文件、PDF、甚至是精心构造的 HTML/JS。如果上游被攻陷，返回 `Content-Type: binary/octet-stream` + 恶意载荷，图片代理不会拦截。此时唯一的防线就是 `X-Content-Type-Options: nosniff`：浏览器在 nosniff 约束下，遇到 `binary/octet-stream` 不会尝试嗅探为可执行脚本，只会按二进制下载或交给注册的处理程序。**但要注意**：nosniff 对 `binary/octet-stream` 的保护力度不如对 `text/html` 的保护——部分浏览器对 `binary/octet-stream` 仍可能触发"另存为"对话框，而不会静默丢弃。
+
+   因此，纵深防御链路的实际强度是：
+
+   ```
+   上游返回恶意 Content-Type →
+     ├─ image/* → 图片代理校验通过 → nosniff 禁止嗅探 → 安全
+     ├─ binary/octet-stream → 图片代理校验通过 → nosniff 限制执行但非绝对 → 有残余风险
+     └─ 其他类型 → 图片代理直接 400 拦截 → 安全
+   ```
+
+   换句话说，**纵深防御不是"双保险"，而是"image/* 侧双保险 + binary/octet-stream 侧单保险"**。`binary/octet-stream` 分支是安全边界上的一个已知的弱口，是兼容性对安全性的让步。
+
 3. **CSP 一致性**：上游可能携带的污染 CSP 被白名单剥离后，SearXNG 自己配置的 CSP（如果管理员在 `default_http_headers` 里加了）会被正常注入。不会出现"两个 CSP 冲突"的情况。
 
 ---
