@@ -140,9 +140,56 @@ def locales_initialize():
     RTL_LOCALES.update(data.LOCALES["RTL_LOCALES"])
 ```
 
-### 2.5 特殊语言的翻译加载（猴子补丁）
+### 2.5 特殊语言的翻译加载（猴子补丁 + 双轨制兜底）
 
-babel 本身不支持某些小语种（Dhivehi、Occitan、Silesian、Papiamento），通过自定义 [get_translations()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L110-L117) 绕过：
+python-babel 的 `Locale.parse()` 基于 CLDR 数据库识别语言代码，对于 Dhivehi (`dv`)、Occitan (`oc`)、Silesian (`szl`)、Papiamento (`pap`) 这 4 种小语种，babel 的 locale 数据库中没有完整的元数据（缺少月份名称、日期格式、数字格式等），直接使用会抛出 `babel.core.UnknownLocaleError`。
+
+SearXNG 采用"**翻译真实加载 + 格式近似兜底**"的双轨制方案完整绕过：
+
+```
+用户选择 locale = "dv" (Dhivehi 迪维希语)
+  │
+  ├── ① localeselector() 阶段
+  │     ├── 标记 sxng_request.form['use-translation'] = 'dv'   ← 真实翻译目标
+  │     └── LOCALE_BEST_MATCH['dv'] = 'si'                      ← babel 近似格式用
+  │         返回给 babel 的 locale = 'si' (Sinhala 僧伽罗语)
+  │
+  ├── ② babel 内部初始化阶段
+  │     └── 用 'si' 构建 babel.Locale → 成功获取日期/数字格式化器
+  │         （月份、星期、千位分隔符等均走僧伽罗语格式，近似可用）
+  │
+  └── ③ 首次调用 gettext() 时，猴子补丁 get_translations() 触发
+        └── Translations.load(..., 'dv')
+              └── 直接读取 translations/dv/LC_MESSAGES/messages.mo
+                  界面文案显示真实的迪维希语翻译
+```
+
+**核心代码拆解**：
+
+[locales.py:ADDITIONAL_TRANSLATIONS](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L64-L71) 定义了这 4 种特殊语言：
+
+```python
+ADDITIONAL_TRANSLATIONS = {
+    "dv": "ދިވެހި (Dhivehi)",
+    "oc": "Occitan",
+    "szl": "Ślōnski (Silesian)",
+    "pap": "Papiamento",
+}
+```
+
+[locales.py:LOCALE_BEST_MATCH](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L73-L80) 为每种特殊语言分配一个 babel 能识别的近似语言，只负责日期/数字格式化：
+
+```python
+LOCALE_BEST_MATCH = {
+    "dv":  "si",     # Dhivehi  → Sinhala（书写系统接近）
+    "oc":  "fr-FR",  # Occitan  → 法国法语（地理邻近）
+    "szl": "pl",     # Silesian → 波兰语（西斯拉夫语支）
+    "pap": "pt-BR",  # Papiamento → 巴西葡萄牙语（受葡语影响深）
+    ...
+}
+```
+
+猴子补丁的实现 [get_translations()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L110-L117)：
 
 ```python
 def get_translations():
@@ -150,11 +197,16 @@ def get_translations():
     if has_request_context():
         use_translation = sxng_request.form.get('use-translation')
         if use_translation in ADDITIONAL_TRANSLATIONS:
-            # 直接从磁盘加载 babel 不识别的语言 MO 文件
+            # 用 Translations.load() 绕过 babel 的 Locale.parse 校验，
+            # 直接按 GNU gettext 标准目录结构读取 .mo 文件
             babel_ext = flask_babel.current_app.extensions['babel']
             return Translations.load(babel_ext.translation_directories[0], use_translation)
-    return _flask_babel_get_translations()  # 其余情况走默认逻辑
+    return _flask_babel_get_translations()  # 其余 80+ 种语言走 babel 默认逻辑
 ```
+
+**为什么不用 locale 别名或 fork babel**：修改 babel 上游的 CLDR 数据维护成本极高，且这些小语种的翻译志愿者人数很少。SearXNG 的方案把复杂度隔离在应用层——`Translations.load()` 本身只关心目录结构和 .mo 文件格式，不校验 locale 是否在 babel 数据库中，因此可以无缝工作。
+
+这些特殊语言也会被纳入 [locales.json](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/data/locales.json) 的预生成流程——在 [searxng_extra/update/update_locales.py](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searxng_extra/update/update_locales.py#L35-L47) 中，先用近似语言的 `babel.Locale` 判断 RTL 方向，然后把真实的翻译名称写入 `LOCALE_NAMES`。
 
 ---
 
@@ -181,6 +233,45 @@ SearXNG 将"语言"分为两个独立维度，存储在 `Preferences` 中：
     choices=list(LOCALE_NAMES.keys()) + [""],
 ),
 ```
+
+#### 为什么界面语言和搜索语言要分开成两个独立维度？
+
+这两个维度的分离是 SearXNG 作为元搜索引擎的**核心设计抉择**，而非技术巧合，原因有三：
+
+**1. 语义目标不同**
+
+- **界面语言 (`locale`)** 是 UI/UX 概念：按钮、菜单、错误提示、偏好设置页的文案显示。它的选择集合由"是否有社区志愿者完成了 PO 翻译"决定，目前约 65 种（见 [LOCALE_NAMES](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/data/locales.json) 的 key 数）。
+- **搜索语言 (`language`)** 是信息检索概念：作为参数传给 Google、DuckDuckGo、Wikipedia 等几十种后端引擎，限定返回结果的语言。它的选择集合由"各搜索引擎在其 traits 中声明了哪些 locale tag"决定，覆盖约 100+ 种语言/地区组合（见 [sxng_locales.py](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/sxng_locales.py)）。
+
+两个集合既不相等也不互相包含——例如搜索语言支持 `is`（冰岛语）但界面没有冰岛语翻译；反过来界面有 `oc`（奥克语）翻译，但大多数搜索引擎根本不支持奥克语检索。
+
+**2. 典型使用场景要求独立控制**
+
+真实世界大量用户需要两者不同：
+- 旅居德国的中国开发者：界面用英文（`locale=en`）避免德语不熟练，但搜索结果限定中文（`language=zh-CN`）
+- 研究北欧历史的法国学者：界面用法语（`locale=fr`），搜索语言设为瑞典语、丹麦语、挪威语多语言
+- 不丹本地人：界面用英语（唯一有翻译的选项），但搜索语言指定 `dz`（宗喀语）
+
+如果把两个维度合并成一个 "language" 设置，就会强制用户在"看得懂界面"和"搜得到结果"之间二选一。
+
+**3. 底层处理链路完全不同**
+
+两者在代码中走完全独立的管道：
+
+```
+locale (界面语言)                          language (搜索语言)
+  │                                            │
+  ├─ LOCALE_NAMES 校验                         ├─ sxng_locales / 引擎 traits 校验
+  ├─ babel Locale.parse()                      ├─ SearchLanguageSetting 正则匹配
+  ├─ gettext() 查 .mo 文件翻译                 ├─ parse_lang() → query_lang
+  ├─ Jinja2 模板 {{ _('...') }} 渲染           ├─ 各 engine.fetch_traits() 映射为引擎私有格式
+  ├─ 影响 <html lang>、RTL 布局                └─ 影响搜索请求 HTTP 参数 (hl=、lang= 等)
+  └─ 写入 Cookie 'preferences'                 └─ 每次搜索可通过 ":lang-xx" Bang 临时覆盖
+```
+
+在 [webadapter.py:parse_lang()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webadapter.py#L55-L72) 中可以看到搜索语言甚至支持通过查询语法临时覆盖（`:lang-de` Bang），而界面语言必须通过偏好设置页修改并写入 Cookie。
+
+### 3.2 语言来源优先级（协商链路）
 
 ### 3.2 语言来源优先级（协商链路）
 
