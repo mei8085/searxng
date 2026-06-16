@@ -875,3 +875,500 @@ make data.all
 | 所有数据都想更新 | `./manage data.all` |
 | 仅需验证提取是否正常 | `make test.pybabel`（不修改正式文件） |
 | 部署前确保 .mo 最新 | `pybabel compile -d searx/translations` |
+
+---
+
+## 六、Weblate 双向同步：代码走向与冲突处理详解
+
+SearXNG 使用 [Weblate](https://translate.codeberg.org) 作为翻译协作平台，通过两条函数链路完成**本地代码仓库 ↔ Weblate** 的双向同步。本章对照代码，逐段拆解 `weblate.push.translations`（推送到 Weblate）和 `weblate.translations.commit`（从 Weblate 拉取合并）的完整执行步骤。
+
+### 6.1 参与同步的三条 Git 分支与两个工作区
+
+在理解函数代码之前，需要先建立"三分支 + 两工作区"的心智模型：
+
+| 名称 | Git 引用 | 位置 | 作用 |
+|------|----------|------|------|
+| **master 分支** | `origin/master` | 主工作区（当前目录） | 主开发分支，包含所有代码和最终合并的翻译（`.po` + `.mo` + `locales.json`） |
+| **translations 分支** | `origin/translations` | TRANSLATIONS_WORKTREE（`cache/translations/`） | 专门用于同步 Weblate 的中间分支，仅包含 `.pot` 和 `.po` 的变更 |
+| **Weblate 仓库** | `weblate/translations` （remote） | 不在本地，由 Weblate 服务托管 | 译者实际操作的仓库，包含未提交的翻译草稿 |
+
+```
+┌──────────────────────┐         push/pull         ┌──────────────────────┐
+│  master (主工作区)    │ ────────────────────────▶ │  origin (GitHub)      │
+│  源码 + .po + .mo    │                           │  master / translations│
+└──────────────────────┘                           └───────────┬──────────┘
+         │                                                   │
+         │ git worktree add                                  │
+         ▼                                                   │
+┌──────────────────────┐                                     │
+│  TRANSLATIONS_WORKTREE│                                     │
+│  cache/translations/  │                                     │
+│  (translations 分支)  │                                     │
+└──────────────────────┘                                     │
+         │                                                   │
+         │ git remote add weblate                            │ git push/pull
+         ▼                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────┐
+│  weblate remote: translate.codeberg.org/...       │ │ Weblate 服务器       │
+│  weblate/translations (译者未提交的草稿在此 commit)│ │  wlc lock/commit/pull│
+└──────────────────────────────────────────────────┘ └──────────────────────┘
+```
+
+### 6.2 共享基础函数
+
+#### 6.2.1 `weblate.translations.worktree()`：准备 translations 工作区
+
+[lib_sxng_weblate.sh:14-37](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L14-L37)
+
+```bash
+weblate.translations.worktree() {
+    (
+        set -e
+        if ! git remote get-url weblate 2>/dev/null; then
+            git remote add weblate https://translate.codeberg.org/git/searxng/searxng/
+        fi
+        if [ -d "${TRANSLATIONS_WORKTREE}" ]; then
+            pushd "${TRANSLATIONS_WORKTREE}"
+            git reset --hard HEAD       # 丢弃工作区所有未提交变更
+            git pull origin translations # 拉取 origin 的 translations 分支
+            popd
+        else
+            mkdir -p "${TRANSLATIONS_WORKTREE}"
+            git worktree add "${TRANSLATIONS_WORKTREE}" translations  # 首次创建工作树
+        fi
+    )
+}
+```
+
+**执行逻辑**：
+1. 确保本地注册了 `weblate` 远程仓库（指向 Codeberg 上的 Weblate 克隆）
+2. 如果 `cache/translations/` 工作区已存在：`git reset --hard` 强制回滚 + `git pull origin translations` 从 origin 拉取最新
+3. 如果不存在：用 `git worktree add` 绑定 translations 分支到该目录
+
+**关键设计**：每次调用都先 `reset --hard`，意味着这个工作区**从不保留本地未提交的变更**。如果调用方需要保留临时修改（如 `weblate.push.translations` 中新提取的 messages.pot），必须使用 `git stash` 手动保护。
+
+#### 6.2.2 `weblate.to.translations()`：从 Weblate 拉取 → origin 的 translations 分支
+
+[lib_sxng_weblate.sh:39-72](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L39-L72)
+
+```bash
+weblate.to.translations() {
+    (
+        set -e
+        pyenv.activate
+        if [ "$(wlc lock-status)" != "locked: True" ]; then
+            die 1 "weblate must be locked, currently: $(wlc lock-status)"
+        fi
+        wlc pull       # 让 Weblate 先从 origin 拉取 master/translations
+        wlc commit     # 让 Weblate 将译者未提交的草稿 commit 到 weblate/translations
+
+        weblate.translations.worktree   # 重置/拉取本地 TRANSLATIONS_WORKTREE
+
+        pushd "${TRANSLATIONS_WORKTREE}"
+        git remote update weblate       # 从 weblate remote 拉取所有引用
+        git merge weblate/translations  # 将 Weblate 的翻译提交合并进本地 translations
+        git push                        # 推送到 origin/translations
+        popd
+    )
+    dump_return $?
+}
+```
+
+**执行逻辑**（在 Weblate 已被锁定的前提下）：
+1. **前置断言**：`wlc lock-status` 必须是 locked，否则直接 `die` 退出，防止译者在同步过程中操作
+2. **`wlc pull`**：通知 Weblate 服务端先从 SearXNG 的 origin 仓库拉取 `master` 和 `translations` 分支（让 Weblate 自己先同步 GitHub 上的最新）
+3. **`wlc commit`**：通知 Weblate 将译者在 Web 界面上保存的所有**未提交草稿** commit 到 `weblate/translations` 分支（译者保存翻译时是草稿状态，不会立即 commit）
+4. **重置工作区**：调用 `weblate.translations.worktree()` 拉取 origin/translations 最新
+5. **合并并推送**：`git remote update weblate` 从 Codeberg 的 Weblate 远程拉取 → `git merge weblate/translations` 将译者的新提交合并到本地 translations 分支 → `git push` 同步到 origin/translations
+
+**调用者必须先 `wlc lock`**：此函数自己不加锁，只校验锁状态，将加锁/解锁的责任交给调用方（见下方两个主函数）。
+
+### 6.3 `weblate.push.translations()`：从 master 提取 → 推送到 Weblate
+
+[lib_sxng_weblate.sh:126-227](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L126-L227)
+
+这是 **方向 A：SearXNG → Weblate** 的链路，负责把 master 分支源码中新增/修改的翻译字符串同步给 Weblate。
+
+#### 6.3.1 函数全貌与代码分段解读
+
+整个函数分成**两个子 shell** + **收尾 unlock**，共 5 个逻辑阶段：
+
+```
+weblate.push.translations()
+  │
+  ├─ [子 shell #1，set -e]：提取 pot + 有变更检查  ──→ 无变更 return 42（早退出）
+  │     │
+  │     ├─ weblate.translations.worktree()  初始化工作区
+  │     ├─ pybabel extract  生成 messages.pot 到 TRANSLATIONS_WORKTREE
+  │     └─ git diff messages.pot  grep [+-](msgid|msgstr)  ──→ 无实质变化 return 42
+  │
+  ├─ 捕获 exitcode：
+  │     exitcode == 42  → return 0（正常早退出）
+  │     exitcode > 0    → return exitcode（异常失败）
+  │     exitcode == 0   → 继续执行
+  │
+  ├─ [子 shell #2，set -e]：加锁 → 合并 weblate → update → commit → push → 通知 weblate pull
+  │     │
+  │     ├─ wlc lock                     锁 Weblate，禁止译者操作
+  │     ├─ git stash push                暂存子 shell#1 提取的 messages.pot
+  │     ├─ weblate.to.translations()     拉取 Weblate 上译者的新提交 → 合并到 origin/translations
+  │     ├─ git stash pop                 恢复 messages.pot 到工作区
+  │     ├─ pybabel update -N             用新 pot 更新各语言 .po（新增条目标记 fuzzy）
+  │     ├─ git add searx/translations    暂存所有变更
+  │     ├─ git commit + git push         提交并推送到 origin/translations
+  │     └─ wlc pull                      通知 Weblate 拉取更新
+  │
+  ├─ 捕获 exitcode
+  │
+  └─ [独立子 shell，set -e，不捕获失败]：wlc unlock   无论成功失败都解锁
+```
+
+#### 6.3.2 阶段 1：提取 pot 与有变更检查（子 shell #1，L146-L168）
+
+```bash
+messages_pot="${TRANSLATIONS_WORKTREE}/searx/translations/messages.pot"
+(
+    set -e
+    pyenv.activate
+    weblate.translations.worktree                    # ① 初始化工作区
+
+    build_msg BABEL 'extract messages from source files and generate POT file'
+    pybabel extract -F babel.cfg --project="SearXNG" --version="-" \
+        -o "${messages_pot}" "searx/"               # ② 在工作区生成 messages.pot
+
+    diff_messages_pot=$(
+        cd "${TRANSLATIONS_WORKTREE}"
+        git diff -- "searx/translations/messages.pot"
+    )
+    if ! echo "$diff_messages_pot" | grep -qE "[\+\-](msgid|msgstr)"; then
+        build_msg BABEL 'no changes detected, exiting'
+        return 42                                    # ③ 无实质变化，早退出
+    fi
+    return 0
+)
+exitcode=$?
+if [ "$exitcode" -eq 42 ]; then
+    return 0   # 无变化，返回"成功"
+fi
+if [ "$exitcode" -gt 0 ]; then
+    return $exitcode  # 其他错误，冒泡失败
+fi
+```
+
+**关键点**：
+- 提取是在 `TRANSLATIONS_WORKTREE`（translations 分支工作区）里进行的，**不是**在 master 工作区
+- 变更检查不仅比较文件大小，而是 `grep -qE "[\+\-](msgid|msgstr)"`——只有 `msgid` 或 `msgstr` 行有增删才认为是"有意义的变化"。POT-Creation-Date、POT-Revision-Date 等元数据变化被忽略
+- 返回码 `42` 是特殊的"正常早退出"信号，外层 shell 会转译为成功（return 0）
+
+#### 6.3.3 阶段 2：暂存 messages.pot 与合并 Weblate 新提交（子 shell #2，L176-L197）
+
+```bash
+(
+    set -e
+    pyenv.activate
+    wlc lock                                       # ① 锁定 Weblate，此时开始译者不能操作
+
+    # 保存 messages.pot 在 translations 分支
+    pushd "${TRANSLATIONS_WORKTREE}"
+    git stash push                                  # ② 暂存子 shell#1 中新生成的 messages.pot
+    popd
+
+    weblate.to.translations                         # ③ 合并 weblate/translations 到本地
+    # 注意：此函数内部会再次调用 weblate.translations.worktree()
+    #       该函数会执行 git reset --hard HEAD + git pull origin translations
+    #       这就是为什么必须先 git stash！否则刚提取的 messages.pot 会被 wipe
+
+    pushd "${TRANSLATIONS_WORKTREE}"
+    git stash pop                                   # ④ 恢复 messages.pot 到工作区
+    popd
+    ...
+```
+
+**为什么需要 `git stash push` + `git stash pop`？**
+
+这是整个函数中最精巧的设计。时序如下：
+
+1. 子 shell #1 中，`pybabel extract` 生成了包含新翻译字符串的 `messages.pot`（在 `TRANSLATIONS_WORKTREE`，未 commit）
+2. 接下来要调用 `weblate.to.translations()`，它内部会执行 `git reset --hard HEAD` + `git pull`——这会把未提交的 `messages.pot` 擦掉
+3. 所以在调用之前用 `git stash push` 暂存，待 `weblate.to.translations()` 完成后再 `git stash pop` 恢复
+
+**冲突条件**：如果此时 Weblate 上译者对某个 `.po` 文件的同一行也做了修改，那么：
+- `git merge weblate/translations` 会因为双方改动了同一行而冲突
+- `set -e` 触发后子 shell #2 以非 0 退出
+- 外层捕获 exitcode，执行解锁 shell，函数整体失败返回
+
+没有自动重试——冲突需要人工解决。
+
+#### 6.3.4 阶段 3：pybabel update 更新 .po 文件（L199-L203）
+
+```bash
+    build_msg BABEL 'update existing message catalogs from POT file'
+    pybabel update -N \
+        -i "${messages_pot}" \
+        -d "${TRANSLATIONS_WORKTREE}/searx/translations"
+```
+
+- **`-N` 选项**：不更新 `.po` 文件头的 `POT-Creation-Date`（只更新 `PO-Revision-Date`），减少不必要的 diff
+- 新增的 `msgid` 会被添加到各 `.po`，`msgstr` 为空，标记为 `#, fuzzy`
+- 已从源码中删除的 `msgid` 会被标记为 `#~ msgid`（obsolete，保留历史，不参与编译）
+- Weblate 之后会把 fuzzy 条目展示给译者，提示需要翻译或审阅
+
+#### 6.3.5 阶段 4：commit + push + 通知 Weblate（L205-L218）
+
+```bash
+    last_commit_hash=$(git log -n1 --pretty=format:'%h')  # master 的最新 commit
+    last_commit_detail=$(git log -n1 --pretty=format:'%h - %as - %aN <%ae>' "${last_commit_hash}")
+
+    pushd "${TRANSLATIONS_WORKTREE}"
+    git add searx/translations                            # 暂存 pot + 所有 .po 变更
+    git commit \
+        -m "[translations] update messages.pot and messages.po files" \
+        -m "From ${last_commit_detail}"                   # commit 消息引用 master 的触发提交
+    git push                                              # 推送到 origin/translations
+    popd
+
+    wlc pull                                              # 通知 Weblate 从 origin 拉取最新 translations
+)
+```
+
+- commit 消息格式：`[translations] update messages.pot and messages.po files`，第二行注明从 master 的哪个 commit 提取而来
+- `git push` 推送到 **origin/translations**，不是 master（翻译不会直接进 master）
+- 最后的 `wlc pull` 让 Weblate 从 origin 拉取刚推送的 translations 分支，译者即可看到新条目出现在 Weblate 上
+
+#### 6.3.6 阶段 5：无论成败都解锁（L220-L226）
+
+```bash
+exitcode=$?
+( # make sure to always unlock weblate
+    set -e
+    pyenv.activate
+    wlc unlock
+)
+dump_return $exitcode
+```
+
+- **关键安全设计**：解锁操作在**独立的子 shell**中执行，**不捕获返回值**，即使前面的子 shell #1 或 #2 以非 0 退出，解锁仍然会执行
+- 即使 `wlc lock` 之后任何一步失败（pybabel extract 报错、git merge 冲突、git push 失败等），Weblate 都会被解锁，译者可以继续工作
+- 但是：如果 `wlc unlock` 本身失败（网络问题），解锁子 shell 会静默失败（因为它的 exitcode 没有被检查），此时 Weblate 可能处于永久锁定状态——这是一个需要运维关注的边界条件
+
+### 6.4 `weblate.translations.commit()`：从 Weblate 拉取 → 合并到 master
+
+[lib_sxng_weblate.sh:74-124](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L74-L124)
+
+这是 **方向 B：Weblate → SearXNG** 的链路，负责把 Weblate 上译者翻译好的内容拉取、编译、commit 到 master 分支（供 PR 创建）。
+
+#### 6.4.1 函数全貌与执行步骤
+
+```
+weblate.translations.commit()
+  │
+  ├─ [子 shell #1，set -e]：加锁 → 拉取 → cp → 编译 → 重建 locales → commit
+  │     │
+  │     ├─ wlc lock                            锁 Weblate
+  │     ├─ weblate.translations.worktree       初始化工作区（重置 + 拉取）
+  │     ├─ git log 取 existing_commit_hash     记录合并前 translations 分支 HEAD
+  │     ├─ weblate.to.translations             同步 weblate → origin/translations
+  │     ├─ cp -rv TRANSLATIONS_WORKTREE/searx/translations → searx/  把 .po 拷到 master
+  │     ├─ pybabel compile --statistics        编译所有 .po → .mo
+  │     ├─ data.locales                        重建 locales.json
+  │     ├─ 构造 commit_message（包含本次所有新翻译 commit 的摘要）
+  │     ├─ git add searx/translations + searx/data/locales.json
+  │     └─ git commit -m "[l10n] update translations from Weblate"
+  │
+  ├─ 捕获 exitcode
+  │
+  └─ [独立子 shell]：wlc unlock   无论成功失败都解锁
+```
+
+#### 6.4.2 关键步骤逐行解读
+
+**L85：`wlc lock`**
+
+在所有操作之前加锁。注意与 `push.translations` 不同——`commit` 是一开始就锁，因为中间没有"检查是否有变更"的阶段。
+
+**L88-L92：记录合并前 HEAD**
+
+```bash
+weblate.translations.worktree
+pushd "${TRANSLATIONS_WORKTREE}"
+existing_commit_hash=$(git log -n1 --pretty=format:'%h')
+popd
+```
+
+在调用 `weblate.to.translations()` 之前记录 translations 分支的当前 HEAD hash。后面会用这个 hash 生成 commit 区间日志。
+
+**L95：`weblate.to.translations`**
+
+执行标准同步：`wlc pull` → `wlc commit` → `git remote update weblate` → `git merge weblate/translations` → `git push`。同步完成后，TRANSLATIONS_WORKTREE 里包含了译者的所有新翻译 commit。
+
+**L98：cp -rv 把翻译文件从工作区拷回 master**
+
+```bash
+cp -rv --preserve=mode,timestamps "${TRANSLATIONS_WORKTREE}/searx/translations" "searx"
+```
+
+- `--preserve=mode,timestamps`：保留文件权限和时间戳，减少后续 diff 噪音
+- 这是**全量覆盖拷贝**——translations 分支的整个 `searx/translations/` 目录（包括所有 `.po` 文件）覆盖到 master 工作区
+- **不拷贝 `.pot` 文件**：.pot 在 master 上由 `push.translations` 负责维护，commit 流程不碰它
+- **可能的冲突点**：如果在同步周期内有人直接在 master 上修改了某个 `.po` 文件（这是不推荐的操作），cp -rv 会直接**覆盖**这些变更，而不是合并。正确做法应该是：所有翻译修改只在 Weblate 上进行
+
+**L102-L103：pybabel 编译**
+
+```bash
+pybabel compile --statistics -d "searx/translations"
+```
+
+- 编译所有 `.po` → `.mo`
+- `--statistics` 输出统计：每个语言的已翻译数、fuzzy 数、未翻译数。这些会显示在 CI 日志里
+- **对 fuzzy 条目的处理**：`pybabel compile` 默认**会跳过**带 `#, fuzzy` 标记的条目——这些条目不参与编译，运行时仍回退到 msgid（原文）。译者必须在 Weblate 上把 fuzzy 标记"审阅通过"去掉，翻译才会生效
+
+**L106：重建 locales.json**
+
+```bash
+data.locales   # 调用 data.locales() → python update_locales.py
+```
+
+这一步确保：
+- 新增的语言目录会被扫描到，出现在 LOCALE_NAMES 中
+- RTL_LOCALES 会根据翻译目录重新计算
+- 如果 Weblate 新增了一种语言的翻译，这一步是必须的，否则偏好设置里看不到该语言选项
+
+**L109-L116：生成 commit 消息并提交**
+
+```bash
+commit_body=$(
+    cd "${TRANSLATIONS_WORKTREE}"
+    git log --pretty=format:'%h - %as - %aN <%ae>' "${existing_commit_hash}..HEAD"
+)
+commit_message=$(echo -e "[l10n] update translations from Weblate\n\n${commit_body}")
+git add searx/translations
+git add searx/data/locales.json
+git commit -m "${commit_message}"
+```
+
+- commit 标题：`[l10n] update translations from Weblate`
+- commit body：列出本次同步包含的所有翻译 commit（从 `existing_commit_hash` 到同步后的 HEAD），格式：`短hash - 日期 - 作者名 <邮箱>`
+- `git add` 的范围：
+  - `searx/translations`：包含 `.po`（被 cp 覆盖）和 `.mo`（新编译）
+  - `searx/data/locales.json`：元数据重建
+  - **不包含 messages.pot**：由 push.translations 负责，不在此流程提交
+
+#### 6.4.3 与 push.translations 的关键差异
+
+| 维度 | `weblate.push.translations` | `weblate.translations.commit` |
+|------|-----------------------------|--------------------------------|
+| 方向 | SearXNG → Weblate | Weblate → SearXNG master |
+| 产物 | 推送到 **origin/translations** | commit 到本地 **master** 分支（不 push，由后续 PR action 处理） |
+| 修改的文件 | messages.pot + 各语言 .po（update 后） | .po（全量覆盖）+ .mo（新编译） + locales.json |
+| 加锁时机 | 确认有变更后才加锁 | 操作一开始就加锁 |
+| fuzzy 处理 | `pybabel update` 会**生成** fuzzy 条目（标记新增条目待审阅） | `pybabel compile` 会**跳过** fuzzy 条目（未审阅的不生效） |
+| 是否 push | 是（推送到 origin/translations） | 否（只 commit 到本地，交给 create-pull-request action） |
+
+### 6.5 CI 中的调用时序与触发条件
+
+参考 [l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml)：
+
+#### 6.5.1 update job（push.translations）
+
+**触发条件**：
+- `workflow_run`：Integration 工作流在 master 分支上成功（即 master 上有代码合入且 CI 通过）
+- `workflow_dispatch`：手动触发
+- `schedule`：每周五 07:05 UTC（兜底，防止 Integration 触发漏网）
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}   # 全局互斥：l10n workflow 同一时间只跑一个
+  cancel-in-progress: false       # 不取消正在进行中的（避免半截同步）
+```
+
+**并发控制**：整个 l10n workflow 使用全局 concurrency group，且 `cancel-in-progress: false`。如果一个 push.translations 正在跑，下一个 workflow run 会排队等待，**不取消**当前的。这保证了同一时刻不会有两个同步过程同时操作 Weblate。
+
+#### 6.5.2 pr job（translations.commit）
+
+**触发条件**（两者满足其一即可）：
+- `workflow_dispatch`：手动触发
+- `schedule`：每周五 07:05 UTC
+
+**注意**：update job 的 Integration 成功触发**不会触发 pr job**——两种触发方式是独立配置的。翻译是每周批量合并一次（周五），而不是每次有新代码合入就立即合并。
+
+pr job 执行 `make weblate.translations.commit` 后，使用 `peter-evans/create-pull-request` action：
+- 从 commit 后的本地 master 创建分支 `translations_update`
+- 创建标题为 `[l10n] update translations from Weblate` 的 PR
+- 等待维护者审核并 merge PR（翻译入库的最后一道人工门控）
+
+### 6.6 冲突与失败场景汇总
+
+以下是两条同步链路中可能触发失败或人工介入的全部场景：
+
+| 场景 | 发生环节 | 触发条件 | 代码处理 | 后果 | 解决方式 |
+|------|----------|----------|----------|------|----------|
+| **A1** | push.translations | 译者在 `worktree()` 后到 `wlc lock` 之间提交了翻译（存在极小时间窗竞态） | 无特殊处理，后续 `weblate.to.translations()` 会用 merge 解决 | 通常正常合并 | 自动解决 |
+| **A2** | push.translations 的 `git merge weblate/translations` | Weblate 译者和本地提取同时修改了 `.po` 同一 msgstr 行 | `set -e` → 子 shell 失败 | 函数整体失败，weblate 被解锁，下次 workflow 重试 | 人工检查冲突：为何同时修改 |
+| **A3** | push.translations 的 `git stash pop` | stash 之前 worktree 被 `weblate.to.translations()` 里的 merge 改了，pot 上下文变了 | stash pop 应用成功（pot 是全新生成的，上下文通常兼容） | 正常 | 自动 |
+| **A4** | push.translations 的 `git push` | origin/translations 在合并期间被其他流程改了（理论上不会，因为 concurrency group 互斥） | push 失败 → set -e 退出 | 函数失败，weblate 被解锁 | 下次重试 |
+| **B1** | translations.commit 的 `cp -rv` | 有人直接在 master 上修改了某 `.po` 文件 | cp 全量覆盖，**静默丢失** master 上的修改 | 未走 Weblate 的 .po 修改被擦除 | 流程规范：只在 Weblate 上改翻译 |
+| **B2** | translations.commit 的 `git merge weblate/translations` | 同 A2（译者与 translations 分支同时改） | set -e 失败 | 函数失败，weblate 解锁 | 人工解决冲突 |
+| **B3** | translations.commit 的 `pybabel compile` | 某 `.po` 文件语法错误（格式乱） | compile 失败，set -e 退出 | 函数失败，weblate 解锁 | 修复 .po 后重试 |
+| **B4** | translations.commit 的 `git commit` | 没有任何需要 commit 的变更（`git add` 后 worktree 干净） | `git commit` 返回非 0，set -e 失败 | 函数失败，weblate 解锁 | 下次再跑即可（这是正常情况，应考虑 `git commit --allow-empty`） |
+| **L1** | 两种函数的 `wlc lock` | Weblate 已被其他操作锁定 | `push.translations` 中是 lock，不检查状态（幂等）；`translations.commit` 中也是直接 lock（`wlc lock` 通常幂等或报错） | lock 报错则 set -e 失败 | 等待锁释放后重试 |
+| **L2** | 两种函数的收尾 `wlc unlock` | 网络中断或 Weblate 服务不可达 | unlock 子 shell 独立执行且不捕获失败 | **Weblate 保持锁定** | 运维手动 `wlc unlock` |
+| **L3** | `weblate.to.translations` 被单独调用 | 调用方未先加锁 | `wlc lock-status != locked` → `die 1` | 直接报错退出 | 先加锁再调用 |
+
+### 6.7 fuzzy 与 obsolete 条目的完整生命周期
+
+```
+源码中新增了翻译字符串 msgid="New feature"
+          │
+          ▼
+pybabel extract（push.translations 子 shell#1）
+          │ messages.pot 中新增 msgid
+          ▼
+pybabel update -N（push.translations 子 shell#2）
+          │ 各语言 .po 中新增：
+          │   #, fuzzy
+          │   msgid "New feature"
+          │   msgstr ""
+          ▼
+push to origin/translations → wlc pull → Weblate 展示给译者
+          │ 译者在 Weblate 上翻译并"保存并审阅"（通过 fuzzy 审阅）
+          ▼
+wlc commit（weblate.to.translations）→ 译者的翻译 commit 到 weblate/translations
+          │
+          ▼
+git merge weblate/translations（weblate.to.translations）
+          │ .po 中变为：
+          │   msgid "New feature"
+          │   msgstr "Nouvelle fonctionnalité"    （fuzzy 标记已被译者移除）
+          ▼
+cp -rv（translations.commit）→ 拷到 master
+          │
+          ▼
+pybabel compile（translations.commit）
+          │ 该条目正常编译进入 .mo，运行时生效
+          ▼
+用户看到翻译后的界面
+
+────────────────────────────────────────────
+
+源码中删除了翻译字符串 msgid="Old feature"
+          │
+          ▼
+pybabel extract → messages.pot 中删除该条目
+          │
+          ▼
+pybabel update -N
+          │ 各语言 .po 中变为 obsolete：
+          │   #~ msgid "Old feature"
+          │   #~ msgstr "Ancienne fonctionnalité"
+          │ （保留历史，不参与编译，也不在 Weblate 上展示）
+```
+
+### 6.8 重试与失败恢复策略总结
+
+1. **CI 层面**：l10n workflow 使用 `concurrency.group + cancel-in-progress: false` 避免并发，靠每周 schedule + Integration 触发实现自动重试
+2. **函数层面**：没有循环重试机制（没有 `for i in 1..3; do ... done`）。每次失败就整体失败，等下一次 workflow 触发时从头再来
+3. **锁的安全**：`wlc unlock` 在独立子 shell 中执行，几乎保证能解锁（但不保证 100%——网络分区时仍有风险）
+4. **人工介入点**：git merge 冲突、.po 语法错误、worktree 无变更导致 `git commit` 失败——这些不会自动恢复，需要运维/维护者处理
+5. **最脆弱的环节**：`translations.commit` 中 `git commit` 在没有变更时会失败——当一周内译者没有任何提交时，pr job 会因这个原因失败。维护者需要在查看 CI 时识别这种"伪失败"
+
+---
