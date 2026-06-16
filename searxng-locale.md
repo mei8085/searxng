@@ -541,3 +541,337 @@ SearXNG 中有两套独立的语言设置，容易混淆：
 | [searx/data/locales.json](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/searx/data/locales.json) | LOCALE_NAMES 和 RTL_LOCALES 数据（自动生成） |
 | [searx/translations/](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/searx/translations) | 翻译资源根目录 |
 | [tests/unit/test_locales.py](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/tests/unit/test_locales.py) | 语言匹配算法测试用例 |
+| [utils/lib_sxng_test.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_test.sh) | test.pybabel 等测试入口的 shell 实现 |
+| [utils/lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh) | Weblate 翻译同步的 shell 实现 |
+| [searxng_extra/update/update_engine_traits.py](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/searxng_extra/update/update_engine_traits.py) | 生成 sxng_locales.py 与 engine_traits.json 的脚本 |
+| [.github/workflows/l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml) | CI：翻译提取与 Weblate 同步工作流 |
+| [.github/workflows/data-update.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/data-update.yml) | CI：数据更新工作流（含 update_engine_traits.py） |
+
+---
+
+## 五、翻译编译管线：从源码字符串到 .mo 文件的完整命令链
+
+本节逐级梳理 manage 脚本、Makefile 与 lib_sxng_*.sh 中 babel 相关入口的调用顺序，讲清字符串提取、po 编译、locales.json 数据重建与搜索语言元组重建之间的依赖关系。
+
+### 5.1 管线总览
+
+翻译从源码到运行时可用，经历 **4 道工序**，对应 **4 类产物**：
+
+```
+源码字符串            ──①提取──→  messages.pot
+messages.pot + .po   ──②更新──→  各语言的 messages.po（同步新/旧条目）
+messages.po          ──③编译──→  messages.mo（二进制，运行时加载）
+翻译目录 + babel数据  ──④重建──→  locales.json / sxng_locales.py（元数据）
+```
+
+这 4 道工序的触发场景不同，不一定按顺序全部执行：
+
+| 工序 | 命令 | 触发场景 | 产物 |
+|------|------|----------|------|
+| ① 提取 | `pybabel extract` | 开发者新增/修改了翻译字符串；CI 自动 | `searx/translations/messages.pot` |
+| ② 更新 | `pybabel update` | CI：Weblate 推送翻译时 | 各语言 `messages.po`（新增条目标记 fuzzy） |
+| ③ 编译 | `pybabel compile` | Weblate 提交翻译后；手动；部署前 | 各语言 `messages.mo` |
+| ④a 重建 locales | `update_locales.py` | 新增/删除翻译目录后；Weblate 提交后 | `searx/data/locales.json` |
+| ④b 重建 traits | `update_engine_traits.py` | 引擎语言支持变化后；CI 定期 | `searx/data/engine_traits.json` + `searx/sxng_locales.py` |
+
+### 5.2 入口脚本与调用链详解
+
+#### 5.2.1 Makefile → manage 的委托关系
+
+[Makefile](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/Makefile) 本身**不直接执行任何 babel 命令**，它将所有操作委托给 `./manage` 脚本：
+
+```makefile
+# Makefile 第 84-85 行：所有 MANAGE 列表中的目标都转发到 ./manage
+$(MANAGE):
+	$(Q)$(MTOOLS) $@
+```
+
+与翻译相关的 Makefile 目标与 manage 函数映射：
+
+| Makefile 目标 | 转发到的 manage 函数 | 所在 shell 文件 |
+|---------------|---------------------|----------------|
+| `test.pybabel` | `test.pybabel()` | [lib_sxng_test.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_test.sh#L136-L141) |
+| `data.locales` | `data.locales()` | [lib_sxng_data.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_data.sh#L64-L72) |
+| `data.traits` | `data.traits()` | [lib_sxng_data.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_data.sh#L41-L50) |
+| `data.all` | `data.all()` | [lib_sxng_data.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_data.sh#L16-L39) |
+| `weblate.push.translations` | `weblate.push.translations()` | [lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L126-L227) |
+| `weblate.translations.commit` | `weblate.translations.commit()` | [lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L74-L124) |
+
+**调用方式**：`make test.pybabel` 等价于 `./manage test.pybabel`。
+
+#### 5.2.2 工序①：字符串提取（pybabel extract）
+
+**入口**：`make test.pybabel` 或 `make weblate.push.translations`
+
+**CI 自动触发**：[l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml#L69-L70) 工作流在 Integration 工作流成功后、或每周五自动运行 `make V=1 weblate.push.translations`。
+
+**test.pybabel()**（[lib_sxng_test.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_test.sh#L136-L141)）——仅提取用于 CI 验证：
+
+```bash
+test.pybabel() {
+    TEST_BABEL_FOLDER="build/test/pybabel"
+    mkdir -p "${TEST_BABEL_FOLDER}"
+    pyenv.cmd pybabel extract -F babel.cfg -o "${TEST_BABEL_FOLDER}/messages.pot" searx
+}
+```
+
+- **命令**：`pybabel extract -F babel.cfg -o build/test/pybabel/messages.pot searx`
+- **输入**：[babel.cfg](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/babel.cfg) 中声明的三种来源（`**.py`、`**/templates/**.html`、`**/searxng.msg`）
+- **产物**：`build/test/pybabel/messages.pot`（**临时文件**，不提交，仅 CI 检查提取是否报错）
+- **触发时机**：`make ci.test`（即 CI 流水线），是 `test` 之外额外加的检查
+
+**weblate.push.translations()**（[lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L146-L168)）——提取并推送至 Weblate：
+
+```bash
+build_msg BABEL 'extract messages from source files and generate POT file'
+pybabel extract -F babel.cfg --project="SearXNG" --version="-" \
+    -o "${messages_pot}" \
+    "searx/"
+```
+
+- **命令**：`pybabel extract -F babel.cfg --project="SearXNG" --version="-" -o searx/translations/messages.pot searx/`
+- **输入**：同上三种来源
+- **产物**：`searx/translations/messages.pot`（**正式文件**，提交到仓库）
+- **触发时机**：CI l10n 工作流、手动 `make weblate.push.translations`
+- **后续**：如果 `messages.pot` 中 `msgid`/`msgstr` 没有实质变化，流程终止；否则继续工序②
+
+#### 5.2.3 工序②：po 文件更新（pybabel update）
+
+**入口**：仅 `weblate.push.translations()` 的后半段（[lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L198-L203)）
+
+```bash
+build_msg BABEL 'update existing message catalogs from POT file'
+pybabel update -N \
+    -i "${messages_pot}" \
+    -d "${TRANSLATIONS_WORKTREE}/searx/translations"
+```
+
+- **命令**：`pybabel update -N -i searx/translations/messages.pot -d searx/translations/`
+- **`-N` 标志**：不更新 `.po` 文件的 POT-Creation-Date 头（减少无意义的 diff）
+- **输入**：`messages.pot`（新提取的模板） + 各语言现有的 `messages.po`
+- **产物**：更新后的各语言 `messages.po`（新增条目标记为 fuzzy，已删除条目标记为 obsolete）
+- **触发时机**：仅 CI l10n 工作流中，当 `messages.pot` 有实质变化时
+- **后续**：更新的 `.po` 文件提交到 Weblate 的 `translations` 分支，由译者在 Weblate 上翻译
+
+#### 5.2.4 工序③：po → mo 编译（pybabel compile）
+
+**入口**：`weblate.translations.commit()`（[lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L100-L103)）
+
+```bash
+build_msg BABEL 'compile translation catalogs into binary MO files'
+pybabel compile --statistics \
+    -d "searx/translations"
+```
+
+- **命令**：`pybabel compile --statistics -d searx/translations`
+- **输入**：各语言 `LC_MESSAGES/messages.po`
+- **产物**：各语言 `LC_MESSAGES/messages.mo`（二进制翻译目录，运行时由 babel 加载）
+- **`--statistics`**：输出每个语言的翻译/模糊/未翻译条目数
+- **触发时机**：
+  - CI l10n 工作流中 `weblate.translations.commit` 阶段（[l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml#L117-L118)）
+  - 手动部署前
+- **重要**：`.mo` 文件必须与 `.po` 文件同步更新，否则运行时看到的翻译是旧的
+
+#### 5.2.5 工序④a：locales.json 重建
+
+**入口**：`data.locales()`（[lib_sxng_data.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_data.sh#L64-L72)）
+
+```bash
+data.locales() {
+    pyenv.activate
+    build_msg DATA "update searx/data/locales.json"
+    python searxng_extra/update/update_locales.py
+}
+```
+
+- **命令**：`python searxng_extra/update/update_locales.py`
+- **输入**：
+  - [locales.py](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/searx/locales.py) 中的 `ADDITIONAL_TRANSLATIONS` 和 `LOCALE_BEST_MATCH`
+  - `searx/translations/` 目录下的语言子目录（通过 `get_translation_locales()` 扫描）
+  - babel 数据库（语言名、地域名、文字方向）
+- **产物**：`searx/data/locales.json`（包含 `LOCALE_NAMES` 和 `RTL_LOCALES`）
+- **触发时机**：
+  - `make data.locales`
+  - `make data.all`（内部调用 `data.locales`）
+  - `weblate.translations.commit()` 内部自动调用 `data.locales`（[lib_sxng_weblate.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_weblate.sh#L106)）
+  - CI data-update 工作流中 `update_engine_traits.py` 并不直接触发此步骤
+- **依赖**：必须在翻译目录存在之后执行（工序③之后或至少翻译目录已创建）
+
+#### 5.2.6 工序④b：sxng_locales.py 重建（搜索语言元组）
+
+**入口**：`data.traits()`（[lib_sxng_data.sh](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/utils/lib_sxng_data.sh#L41-L50)）
+
+```bash
+data.traits() {
+    pyenv.activate
+    build_msg DATA "update searx/data/engine_traits.json"
+    python searxng_extra/update/update_engine_traits.py
+    build_msg ENGINES "update searx/sxng_locales.py"
+}
+```
+
+- **命令**：`python searxng_extra/update/update_engine_traits.py`
+- **输入**：
+  - `settings.yml` 中的引擎配置
+  - 各引擎通过 `fetch_traits()` 从远程获取的支持语言/区域列表
+  - babel 数据库（语言名、地域名、国旗 emoji）
+- **产物**：
+  - `searx/data/engine_traits.json`（各引擎支持的语言/区域映射）
+  - `searx/sxng_locales.py`（搜索语言/区域元组，由引擎交集 + 阈值过滤生成）
+- **触发时机**：
+  - `make data.traits`
+  - `make data.all`（内部先调用 `data.traits`）
+  - CI data-update 工作流每月 28 日自动运行
+- **与翻译管线的关系**：此工序**独立于翻译管线**。它关心的是搜索引擎支持哪些语言，而非 UI 翻译是否可用。但 `sxng_locales.py` 的内容会用于 `settings_defaults.py` 中的 `search.languages` 列表，影响偏好设置页面的搜索语言下拉框。
+
+### 5.3 两条自动化管线的完整调用时序
+
+#### 管线 A：开发者修改了源码中的翻译字符串（推送到 Weblate）
+
+由 CI [l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml) 的 `update` job 触发：
+
+```
+make weblate.push.translations
+  └─ weblate.push.translations()          [lib_sxng_weblate.sh]
+       │
+       ├─ ① pybabel extract               → searx/translations/messages.pot
+       │     -F babel.cfg -o messages.pot searx/
+       │
+       ├─ （检查 messages.pot 是否有实质变化）
+       │
+       ├─ ② pybabel update                 → 各语言 messages.po（更新到 translations 分支）
+       │     -N -i messages.pot -d searx/translations/
+       │
+       └─ git push（推送 .po 更新到 Weblate 的 translations 分支）
+```
+
+#### 管线 B：Weblate 上有新翻译提交（拉取并编译回 SearXNG）
+
+由 CI [l10n.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/l10n.yml) 的 `pr` job 触发（每周五定时或手动）：
+
+```
+make weblate.translations.commit
+  └─ weblate.translations.commit()        [lib_sxng_weblate.sh]
+       │
+       ├─ weblate.to.translations()        从 Weblate 拉取翻译 .po 文件
+       │
+       ├─ cp -rv .../searx/translations    复制 .po 文件到 master 分支
+       │
+       ├─ ③ pybabel compile                → 各语言 messages.mo
+       │     --statistics -d searx/translations
+       │
+       ├─ ④a data.locales()               → searx/data/locales.json
+       │     python update_locales.py
+       │
+       └─ git add/commit（提交 .mo + locales.json 到 master）
+```
+
+#### 管线 C：引擎语言支持变化（搜索语言元组更新）
+
+由 CI [data-update.yml](file:///d:/fz/0601-1/solo-dogfeeding/code/100-searxng/.github/workflows/data-update.yml) 每月 28 日触发，或手动：
+
+```
+make data.traits
+  └─ data.traits()                         [lib_sxng_data.sh]
+       │
+       └─ python update_engine_traits.py    → engine_traits.json + sxng_locales.py
+```
+
+#### 管线 D：全量数据更新
+
+手动运行 `make data.all`，按顺序执行所有数据更新：
+
+```
+make data.all
+  └─ data.all()                            [lib_sxng_data.sh]
+       │
+       ├─ data.traits()                    → engine_traits.json + sxng_locales.py
+       ├─ data.useragents()                → useragents.json
+       ├─ data.gsa_useragents()            → gsa_useragents.txt
+       ├─ data.locales()                   → locales.json
+       ├─ update_osm_keys_tags.py          → osm_keys_tags.json
+       ├─ update_ahmia_blacklist.py        → ahmia_blacklist.txt
+       ├─ update_wikidata_units.py         → wikidata_units.json
+       ├─ update_currencies.py             → currencies.json
+       ├─ update_external_bangs.py         → external_bangs.json
+       └─ update_engine_descriptions.py    → engine_descriptions.json
+```
+
+### 5.4 四道工序之间的依赖关系图
+
+```
+                    源码中的 gettext() / _('...')
+                    searxng.msg 常量定义
+                    Jinja2 模板 {{ _() }}
+                              │
+                    ┌─────────▼─────────┐
+                    │  ① pybabel extract │
+                    │  (提取到 .pot)     │
+                    └─────────┬─────────┘
+                              │ messages.pot
+                    ┌─────────▼─────────┐
+                    │  ② pybabel update  │
+                    │  (同步到 .po)      │  ←── Weblate 译者在此翻译
+                    └─────────┬─────────┘
+                              │ 翻译后的 .po
+                    ┌─────────▼─────────┐
+                    │  ③ pybabel compile │
+                    │  (.po → .mo)       │
+                    └────┬─────────┬────┘
+                         │         │
+              .mo 文件   │         │  翻译目录列表
+                         │         │
+                         │    ┌────▼────────────────┐
+                         │    │ ④a update_locales.py │
+                         │    │ → locales.json       │
+                         │    │   (LOCALE_NAMES,     │
+                         │    │    RTL_LOCALES)       │
+                         │    └──────────────────────┘
+                         │
+                    ┌────▼──────────────────────────────┐
+                    │  运行时加载（locales_initialize）    │
+                    │  - monkey patch get_translations    │
+                    │  - 加载 LOCALE_NAMES / RTL_LOCALES │
+                    │  - Flask-Babel 加载 .mo 文件       │
+                    └────────────────────────────────────┘
+
+    ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+
+    ④b 独立管线（与翻译无直接依赖）：
+
+    引擎 fetch_traits() ──→ update_engine_traits.py
+                                │
+                                ├─→ engine_traits.json
+                                └─→ sxng_locales.py（搜索语言元组）
+```
+
+**关键依赖关系说明**：
+
+1. **① → ②**：`pybabel update` 必须在 `pybabel extract` 之后，因为需要最新生成的 `.pot` 文件作为输入
+2. **② → ③**：`pybabel compile` 依赖 `.po` 文件存在且已翻译。但 `.po` 不必是最新的（可以只编译现有内容）
+3. **③ → ④a**：`update_locales.py` 通过 `get_translation_locales()` 扫描翻译目录来发现可用语言，因此依赖翻译目录存在（但**不依赖 .mo 文件**——它只检查目录结构）
+4. **④b 完全独立**：`update_engine_traits.py` 不依赖任何翻译文件，它从引擎的远程 API 获取语言支持信息
+5. **③ → 运行时**：`.mo` 文件是运行时唯一需要的翻译产物，`.po` 文件只在编译和翻译阶段使用
+
+### 5.5 各命令的触发时机与产物落点汇总表
+
+| 命令 | 触发方式 | 输入 | 产物落点 | 是否提交到仓库 |
+|------|----------|------|----------|:---:|
+| `pybabel extract -F babel.cfg -o messages.pot searx/` | CI l10n / `make weblate.push.translations` | Python + Jinja2 + searxng.msg 源码 | `searx/translations/messages.pot` | ✅ |
+| `pybabel extract -F babel.cfg -o build/test/.../messages.pot searx` | CI test / `make test.pybabel` | 同上 | `build/test/pybabel/messages.pot` | ❌ 临时 |
+| `pybabel update -N -i messages.pot -d searx/translations/` | CI l10n / `make weblate.push.translations` | `.pot` + 各语言 `.po` | `searx/translations/<lang>/LC_MESSAGES/messages.po` | ✅ (到 translations 分支) |
+| `pybabel compile --statistics -d searx/translations` | CI l10n / `make weblate.translations.commit` | 各语言 `.po` | `searx/translations/<lang>/LC_MESSAGES/messages.mo` | ✅ |
+| `python searxng_extra/update/update_locales.py` | `make data.locales` / `make data.all` / Weblate commit | 翻译目录 + babel 数据 + `ADDITIONAL_TRANSLATIONS` + `LOCALE_BEST_MATCH` | `searx/data/locales.json` | ✅ |
+| `python searxng_extra/update/update_engine_traits.py` | `make data.traits` / `make data.all` / CI data-update | 引擎配置 + 远程 API + babel 数据 | `searx/data/engine_traits.json` + `searx/sxng_locales.py` | ✅ |
+
+### 5.6 开发者日常场景与推荐操作
+
+| 场景 | 推荐操作 |
+|------|----------|
+| 新增了一个 `gettext('...')` 字符串 | 运行 `pybabel extract -F babel.cfg -o searx/translations/messages.pot searx/` 更新 pot，再 `pybabel update -N -i searx/translations/messages.pot -d searx/translations` 同步到各 .po |
+| 修改了 searxng.msg 中的常量 | 同上 |
+| 新增了一种语言的翻译文件 | 创建 `searx/translations/<lang>/LC_MESSAGES/messages.po`，然后 `pybabel compile -d searx/translations -l <lang>`，最后 `./manage data.locales` |
+| 引擎新增了语言支持 | `./manage data.traits`（更新搜索语言列表） |
+| 所有数据都想更新 | `./manage data.all` |
+| 仅需验证提取是否正常 | `make test.pybabel`（不修改正式文件） |
+| 部署前确保 .mo 最新 | `pybabel compile -d searx/translations` |
