@@ -1,6 +1,6 @@
 # SearXNG 主题切换与静态资源组装、压缩、分发完整脉络
 
-本文档按代码执行顺序，拆解主题枚举定义 → 资源打包工具链 → 静态文件分发中间件的三层协同关系。文中所有代码引用使用**仓库相对路径**（如 `searx/webutils.py#L177-L179`），可在 IDE 中直接点击跳转。
+本文档按代码执行顺序，拆解主题枚举定义 → 资源打包工具链 → 静态文件分发中间件的三层协同关系。文中所有代码引用使用**仓库根目录相对路径**的 Markdown 链接（如 `[searx/webutils.py#L177-L179](searx/webutils.py#L177-L179)`），链接目标相对于仓库根目录，跨机器迁移不失效；在支持相对路径解析的 IDE 中可直接点击跳转。
 
 ---
 
@@ -157,7 +157,7 @@ rolldownOptions: {
 void import.meta.glob(["./*.ts", "./util/**/.ts"], { eager: true });
 ```
 
-配合 Vite 的 `dynamicImports` 机制，实际功能模块被编译为独立 chunk（参见 `manifest.json`）：
+配合 Vite 的 `dynamicImports` 机制，实际功能模块被编译为独立 chunk：
 
 | 功能模块 | chunk 文件 | 触发加载时机 |
 |---|---|---|
@@ -254,7 +254,7 @@ app.wsgi_app = WhiteNoise(
 )
 ```
 
-**关键点**：WhiteNoise 接管所有 `/static/*` 请求，绕过 Flask 路由层，直接从磁盘高效发送（支持 gzip/brotli 预压缩旁置文件、HTTP 范围请求、长缓存）。
+**关键点**：WhiteNoise 接管所有 `/static/*` 请求，绕过 Flask 路由层，直接从磁盘高效发送。进程启动时一次性扫描 `root` 目录构建旁置压缩文件映射表；请求到达时按浏览器 `Accept-Encoding` 头的 q 值（quality value）优先级匹配磁盘上的 `.br` / `.gz` 旁置预压缩文件并直接发送；若两者都不存在或 Accept-Encoding 不支持 → **直接发送原始未压缩文件**。WhiteNoise 6.x **不做任何 on-the-fly 动态压缩**，也**没有任何运行时参数或配置项可启用动态压缩**——这是其零运行时开销设计哲学的核心，不是功能遗漏。支持 HTTP 范围请求、ETag/304 条件缓存。
 
 ### 3.2 custom_url_for：主题资源路径重写
 
@@ -344,7 +344,7 @@ pre_request() 钩子
   ↓
 路由处理函数
   ↓
-render() [searx/webapp.py#L387-L454](searx/webapp.py#L387-L454)
+render()
   ├─ get_client_settings() → 打包 theme / theme_static_path 等
   ├─ kwargs['url_for'] = custom_url_for   ← 模板内 url_for 被覆盖
   ├─ kwargs['theme'] = prefs.get_value('theme')
@@ -401,8 +401,11 @@ render() [searx/webapp.py#L387-L454](searx/webapp.py#L387-L454)
 │  进程启动 (searx/webapp.py init)                                     │
 │       ├── get_themes(templates/) → ['simple'] (偏好可用选项)         │
 │       ├── WhiteNoise(root=searx/static/, prefix=static/)             │
-│       │   ├─ 若 foo.js.gz / .br 旁置文件存在 → 优先发送预压缩        │
-│       │   └─ 否则 → 内存动态 gzip，brotli 不支持动态                 │
+│       │   ├─ 启动时扫描：为 foo.js 建立 foo.js.br / foo.js.gz 映射   │
+│       │   ├─ Accept-Encoding: br;q=1.0 + .br 存在 → 发 .br (C-E: br)│
+│       │   ├─ Accept-Encoding: gzip;q=0.8 + .gz 存在 → 发 .gz (C-E:gz)│
+│       │   └─ 否则（无旁置文件 / AE 不支持）→ 直接发原始 foo.js       │
+│       │     （WhiteNoise 不做任何动态压缩，也无开关可启用）           │
 │       └── custom_url_for = 覆盖 Jinja 原生 url_for('static')         │
 │                                                                      │
 │  HTTP 请求 → pre_request()                                           │
@@ -505,7 +508,7 @@ f.write(generat_css('default', 'monokai'))
 }
 ```
 
-**注意**：代码中**没有**为 `:root.theme-black` 单独定义 `.code-highlight-dark()`；它继承 [client/simple/src/less/definitions.less#L276-L279](client/simple/src/less/definitions.less#L276-L279) 中 `:root.theme-black { .dark-themes(); .black-themes(); }` 的黑色背景变量，语法高亮实际复用 monokai 暗色配色（这是当前实现的一个隐式简化）。
+**注意**：代码中**没有**为 `:root.theme-black` 单独定义 `.code-highlight-dark()`；它继承 definitions.less 中 `:root.theme-black { .dark-themes(); .black-themes(); }` 的黑色背景变量，语法高亮实际复用 monokai 暗色配色（这是当前实现的一个隐式简化）。
 
 #### 运行时：HTML 产生的高亮代码
 
@@ -556,18 +559,24 @@ RUN set -eux -o pipefail; \
 
 #### 发送链路：WhiteNoise 如何匹配旁置压缩文件
 
-WhiteNoise 的静态文件查找逻辑（由其内部 `WhiteNoiseFileToHeaderAdapter` 实现）：
+WhiteNoise 6.x 的压缩设计哲学是**零运行时开销**——它**完全不做任何 on-the-fly 动态压缩**，也**不提供任何运行时参数或配置项来启用动态压缩**；所有压缩必须在构建/部署阶段预先完成（可使用 WhiteNoise 自带的 `python -m whitenoise.compress <root>` 命令行工具，或如 SearXNG 项目那样使用等价的 `find ... -exec gzip/brotli`）。WhiteNoise 在进程启动时（构造函数内）一次性扫描 `root` 目录，为每个静态文件构建候选压缩版本映射表（`foo.js` → 检测是否存在 `foo.js.br` 和 `foo.js.gz`）。请求到达时仅做内存字典查找，零磁盘额外 IO：
 
 1. 收到请求 `/static/themes/simple/sxng-core.min.js`
-2. 检查请求头 `Accept-Encoding`
-3. **优先级 1（brotil）**：若磁盘上存在 `searx/static/themes/simple/sxng-core.min.js.br` → 发送 `.br` 文件，设置 `Content-Encoding: br`
-4. **优先级 2（gzip）**：若磁盘上存在 `searx/static/themes/simple/sxng-core.min.js.gz` → 发送 `.gz` 文件，设置 `Content-Encoding: gzip`
-5. **回退**：两者都不存在 → 在内存中做动态 gzip 压缩后发送（WhiteNoise 不支持动态 brotli）
+2. 读取请求头 `Accept-Encoding`（按 RFC 7231 的 q 值排序：现代浏览器典型值为 `br;q=1.0, gzip;q=0.8, *;q=0.1`；WhiteNoise 按 q 值从高到低尝试匹配）
+3. **优先级 1（brotli）**：若 Accept-Encoding 包含 `br` 且初始化时检测到磁盘上存在 `searx/static/themes/simple/sxng-core.min.js.br` → 发送 `.br` 文件，设置响应头 `Content-Encoding: br`、`Vary: Accept-Encoding`
+4. **优先级 2（gzip）**：若 Accept-Encoding 包含 `gzip` 且检测到 `searx/static/themes/simple/sxng-core.min.js.gz` → 发送 `.gz` 文件，设置响应头 `Content-Encoding: gzip`、`Vary: Accept-Encoding`
+5. **回退（无压缩）**：**Accept-Encoding 支持的算法对应的旁置文件都不存在，或 Accept-Encoding 不包含 br/gzip → 直接发送原始未压缩文件**。此处 WhiteNoise **绝对不会**临时调用 zlib/brotli 做内存压缩——CPU 零开销是其核心设计目标，也是它区别于 Flask-Compress 等动态压缩中间件的根本特征。
 
-因此：
-- **容器镜像部署（生产）**：旁置文件齐全，WhiteNoise 直接零 CPU 开销发送预压缩产物，同时支持 brotli 和 gzip
-- **本地 / uWSGI 直接部署（无前置 nginx）**：旁置文件缺失，WhiteNoise 走动态 gzip，brotli 请求回退到未压缩原始文件
-- **前置 nginx 部署**：通常由 nginx 的 `gzip on;` / `brotli on;` 在 WSGI 层之外再做一次透明压缩，可能覆盖 WhiteNoise 的选择
+因此四种部署场景的真实行为为：
+
+| 部署方式 | 旁置 .gz/.br 是否存在 | WhiteNoise 实际发送 | 说明 |
+|---|---|---|---|
+| 容器镜像部署（生产） | ✅ 存在（由 `container/builder.dockerfile#L28-L33` 产出） | 按 Accept-Encoding q 值优先 `.br`，回退 `.gz`，再回退原始 | 同时支持 brotli 和 gzip，CPU 零开销 |
+| 本地 `make themes.all` 开发 | ❌ 不存在 | **直接发送原始未压缩文件** | 无任何传输压缩——因 WhiteNoise 不做动态压缩，本地也未执行预压缩命令 |
+| 裸机 uWSGI 部署（未前置 nginx） | ❌ 不存在（除非手动执行了 `find ... -exec gzip` 或 `python -m whitenoise.compress`） | **直接发送原始未压缩文件** | 同上；如需压缩必须在部署时补充预压缩步骤 |
+| 前置 nginx 部署 | 取决于 nginx 配置 | 通常由 nginx 的 `gzip_static` / `gzip on;` / `brotli on;` 在 WhiteNoise 外层接管，nginx 决定是否做动态压缩 | nginx `gzip on` 可做 on-the-fly 压缩，弥补 WhiteNoise 不做动态压缩的缺陷 |
+
+**结论纠正（前几版文档的错误）**：WhiteNoise 6.x **根本不会**在"没有旁置文件时走动态 gzip"——它直接发送原始文件。动态压缩只发生在 nginx / Apache 等前端反向代理层，或 WhiteNoise 官方提供的**预构建期**命令行工具 `python -m whitenoise.compress <root>`（SearXNG 项目没用这个工具，而是用了 Dockerfile 里等价的 `find ... -exec gzip/brotli`）。
 
 #### 容器构建时序（证明压缩一定发生在 Vite 产物之后）
 
@@ -699,7 +708,7 @@ export const svg2png = (items: Src2Dest[], width?: number, height?: number): voi
 - `512.png`：`sharp.resize(512, 512, { fit: "contain" })` → 保证最长边 512px，按比例缩放
 - 不指定 `width`/`height` 的（如 `favicon.png`）：按 SVG 原始视口尺寸输出
 
-**结论纠正**：之前错误地认为 PWA 图标来自 `searxng.svg`。实际源图**统一**是 `searxng-wordmark.svg`（带文字 wordmark 的完整 Logo），尺寸通过 Sharp `resize` 精确控制为 192×192 与 512×512；`searxng.svg` 只用于生成 `searxng.png`（独立于 PWA 图标的另一产物）。
+**结论纠正（前几版文档的错误）**：PWA 图标**不是**来自 `searxng.svg`。实际源图**统一**是 `searxng-wordmark.svg`（带文字 wordmark 的完整 Logo），尺寸通过 Sharp `resize` 精确控制为 192×192 与 512×512；`searxng.svg` 只用于生成独立的 `searxng.png`（与 PWA manifest 无关）。
 
 ---
 
@@ -723,7 +732,7 @@ export const svg2png = (items: Src2Dest[], width?: number, height?: number): voi
 {%- endmacro %}
 ```
 
-三个 macro 的差异仅在于注入不同 CSS class（尺寸由 [client/simple/src/less/style.less#L30-L48](client/simple/src/less/style.less#L30-L48) 定义：`icon_small` 1rem、`icon_big` 1.5rem）。
+三个 macro 的差异仅在于注入不同 CSS class（尺寸由 `style.less#L30-L48` 定义：`icon_small` 1rem、`icon_big` 1.5rem）。
 
 #### 被 include 方式
 
@@ -758,7 +767,7 @@ export const svg2png = (items: Src2Dest[], width?: number, height?: number): voi
 - **挂载方式**：在 WSGI 层包装 Flask 应用 [searx/webapp.py#L1393-L1401](searx/webapp.py#L1393-L1401)
 - **自定义头**：`Cache-Control: public, max-age=30, stale-while-revalidate=60` + 配置里的 HTTP 安全头
 - **不支持多主题前缀**：主题目录层级需要 `custom_url_for` 在应用层拼路径（见 [searx/webapp.py#L256-L294](searx/webapp.py#L256-L294)）
-- **压缩发送策略**：若有旁置 `.gz` / `.br` 则优先直接发送（容器镜像部署时有）；否则动态 gzip；不支持动态 brotli
+- **压缩发送策略**：进程启动时预扫描构建旁置文件映射表，请求时按浏览器 `Accept-Encoding` 的 q 值优先级（通常 `br;q=1.0 > gzip;q=0.8`）匹配磁盘旁置文件并直接 sendfile 发送；无匹配旁置文件时 **直接发送原始未压缩文件**。**WhiteNoise 6.x 完全不做 on-the-fly 动态压缩**，也无任何运行时开关可启用动态压缩。
 
 #### 利（优点）
 
@@ -771,7 +780,7 @@ export const svg2png = (items: Src2Dest[], width?: number, height?: number): voi
 #### 弊（缺点）
 
 1. **仍比纯文件服务器慢**：无论怎么优化，WSGI 中间件相比 nginx 的 sendfile() 零拷贝仍有 2~5 倍延迟差距，大文件（图片、sourcemap）上差距更明显。高并发生产部署通常会前置 nginx 绕过 WhiteNoise。
-2. **预压缩依赖外部构建链**：WhiteNoise 自身不产出旁置压缩文件，必须依赖容器构建阶段的 `find ... -exec gzip/brotli`。本地开发、裸机部署时若没有前置 nginx，就只能走动态 gzip（CPU 开销），brotli 用户根本拿不到压缩。
+2. **预压缩依赖外部构建链（唯一压缩路径）**：WhiteNoise 自身不产出也不动态生成旁置压缩文件，必须依赖容器构建阶段的 `find ... -exec gzip/brotli`（或等价的 `python -m whitenoise.compress` 命令）。本地开发、裸机部署时若**既**没产出旁置文件**又**没前置 nginx，WhiteNoise 会直接发送原始未压缩文件（体积大 2~3 倍），这是 SearXNG 当前部署链路的最大性能隐患。
 3. **多主题目录无原生支持**：WhiteNoise 的 `root` / `prefix` 是扁平一维结构。多主题架构下需要应用层 `custom_url_for` 重写路径；如果未来有独立静态 CDN，CDN 侧也得同步这套路径映射规则。
 4. **max-age=30 过短**：构建产物文件名带 hash（chunk 已带 hash），理论上可设 1 年缓存。当前 30 秒的短缓存是保守选择，错失了内容寻址资源的最佳缓存实践。
 
