@@ -271,94 +271,159 @@ locale (界面语言)                          language (搜索语言)
 
 在 [webadapter.py:parse_lang()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webadapter.py#L55-L72) 中可以看到搜索语言甚至支持通过查询语法临时覆盖（`:lang-de` Bang），而界面语言必须通过偏好设置页修改并写入 Cookie。
 
-### 3.2 语言来源优先级（协商链路）
+### 3.2 默认语言兜底全链路：请求处理 → 语言匹配 → Babel 选择器
 
-### 3.2 语言来源优先级（协商链路）
-
-每个请求到达时，按照以下优先级从高到低确定最终 locale：
+当用户从未设置过偏好（Cookie 为空），且浏览器 `Accept-Language` 请求头中的语言又全部不被支持时，SearXNG 通过三个阶段串联的多级兜底，最终落到英语 `'en'`。整个过程是嵌套保护结构：上一层失败才触发下一层，每层都有独立保险。
 
 ```
-优先级 1:  FORM 参数           (?locale=zh-CN 提交)
-优先级 2:  Cookie 存储         (用户偏好已保存)
-优先级 3:  URL 参数            (?preferences=xxx 编码偏好)
-优先级 4:  Accept-Language 头   (浏览器自动发送)
-优先级 5:  settings 默认值      (ui.default_locale)
-兜底:       'en'
+浏览器 Accept-Language: "xyz-AB, qwe-CD;q=0.9"
+(两种语言 babel 不识别，SearXNG 也没有翻译)
+  │
+  ▼
+━━━━━━━━━━━━━━━━ 阶段 A：pre_request 请求处理（webapp.py）━━━━━━━━━━━━━━━━
+  A1. ClientPref.from_http_request()
+      ├─ 解析 Accept-Language 头
+      ├─ babel.Locale.parse('xyz-AB') → UnknownLocaleError ✗
+      ├─ babel.Locale.parse('qwe-CD') → UnknownLocaleError ✗
+      └─ try/except 兜底: locale = babel.Locale.default → 'en' ← 保险 ①
+  A2. Preferences 初始化
+      └─ 从 settings_defaults.py 取默认值: locale = '' (空字符串)
+  A3. 从 Cookie 加载 preferences.parse_dict(cookies)
+      └─ 首访无 Cookie → locale 仍为 ''
+  A4. 从 GET/POST 合并 → 无 locale 参数 → locale 仍为 ''
+  A5. preferences.parse_dict(form) → 无 locale 值
+  A6. 判断: if not preferences.get_value("locale") → True（空字符串）
+      └─ 触发 _get_browser_language(req, LOCALE_NAMES.keys()) ← 进入阶段 B
+  │
+  ▼
+━━━━━━━━━━━━━━━━ 阶段 B：match_locale 语言匹配（locales.py）━━━━━━━━━━━━━━━━
+  B1. ClientPref.from_http_request(req)
+      └─ 再次解析，但结果已在保险 ① 中设为 'en'
+  B2. match_locale(searxng_locale='en', locale_tag_list, fallback='en')
+      ├─ if not searxng_locale → False（'en' 非空）
+      ├─ locale = get_locale('en') → babel.Locale('en') ✓
+      ├─ build_engine_locales(LOCALE_NAMES.keys)
+      │     包含 'en' → 'en', 'en-US' → 'en-US', ...
+      ├─ get_engine_locale('en', engine_locales, default='en')
+      │     ├─ engine_locales.get('en') → 'en' 直接命中 ✓
+      │     └─ return 'en' ← 匹配成功
+      └─ 返回 'en'
+  B3. 若阶段 B 全部失败（get_locale 返回 None）
+      └─ match_locale 参数 fallback='en' 直接返回 ← 保险 ②
+  A7. preferences.parse_dict({"locale": "en"})
+      └─ 将匹配结果写入 Preferences，供后续使用
+  │
+  ▼
+━━━━━━━━━━━━━━━━ 阶段 C：localeselector Babel 选择器（locales.py）━━━━━━━━━━━━━━━━
+  C1. locale 变量声明：locale: str = 'en' ← 保险 ③（初始值就是 'en'）
+  C2. has_request_context() → True
+  C3. value = preferences.get_value('locale') → 'en'（阶段 B 的结果）
+  C4. if value: locale = value → locale = 'en' ✓
+  C5. if locale in ADDITIONAL_TRANSLATIONS → False（'en' 是 babel 原生语言）
+  C6. LOCALE_BEST_MATCH.get('en', 'en') → 'en'
+  C7. if locale == '' → False，跳过
+      但如果 preferences 加载异常导致值为 ''，会再设为 'en' ← 保险 ④
+  C8. locale.replace('-', '_') → 'en'
+  C9. 返回 'en' 给 Flask-Babel
+  │
+  ▼
+翻译结果：加载 translations/en/LC_MESSAGES/messages.mo，页面显示英语
+若 en 的 .mo 文件也不存在，gettext 返回 msgid 原文（即英文源码文案）
 ```
 
-**协商流程代码路径**:
+#### 阶段 A 代码追踪：pre_request 请求处理
 
-1. **[pre_request() 中间件](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L457-L518)** — Flask `before_request` 钩子，请求进入后第一时间执行：
+正常优先级链路（`FORM → Cookie → URL → Accept-Language → settings → 'en'`）的所有前置合并都在 [pre_request()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L457-L518) 中完成，它是 Flask 的 `before_request` 钩子，每个请求必走：
 
 ```python
 @app.before_request
 def pre_request():
-    # Step A: 从 Accept-Language 解析浏览器偏好
+    # ── A1：从 Accept-Language 解析浏览器偏好 ──
+    # 保险 ①：即使请求头全不支持，from_http_request 也会兜底 'en'
     client_pref = ClientPref.from_http_request(sxng_request)
 
-    # Step B: 构造 Preferences 对象
+    # ── A2：构造 Preferences ──
+    # settings_defaults.py 中 ui.default_locale 默认是空字符串 ''
     preferences = Preferences(themes, categories, engines, plugins, client_pref)
     sxng_request.preferences = preferences
 
-    # Step C: 从 Cookie 加载
-    preferences.parse_dict(sxng_request.cookies)
-
-    # Step D: 从 GET/POST 合并（优先级高于 Cookie）
-    sxng_request.form = dict(sxng_request.form.items())
+    # ── A3-A5：从 Cookie → Form → GET 参数 逐层合并 ──
+    preferences.parse_dict(sxng_request.cookies)          # A3
+    sxng_request.form = dict(sxng_request.form.items())   # A4
     for k, v in sxng_request.args.items():
         if k not in sxng_request.form:
             sxng_request.form[k] = v
-
-    # Step E: 支持通过 URL 参数压缩编码传递偏好
-    if sxng_request.form.get('preferences'):
+    if sxng_request.form.get('preferences'):              # A5
         preferences.parse_encoded_data(sxng_request.form['preferences'])
     else:
         preferences.parse_dict(sxng_request.form)
 
-    # Step F: 若 language 仍为空，匹配浏览器 Accept-Language
+    # ── 搜索语言同名兜底逻辑 ──
     if not preferences.get_value("language"):
         language = _get_browser_language(sxng_request, settings['search']['languages'])
         preferences.parse_dict({"language": language})
 
-    # Step G: 若 locale 仍为空，匹配浏览器 Accept-Language
+    # ── A6：locale 仍为空 → 进入阶段 B ──
     if not preferences.get_value("locale"):
         locale = _get_browser_language(sxng_request, LOCALE_NAMES.keys())
         preferences.parse_dict({"locale": locale})
 ```
 
-2. **[ClientPref.from_http_request()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/preferences.py#L359-L387)** — 解析 HTTP `Accept-Language` 请求头：
+A1 中的 [ClientPref.from_http_request()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/preferences.py#L359-L387) 有最外层异常捕获：
 
 ```python
 @classmethod
 def from_http_request(cls, http_request: SXNG_Request):
-    al_header = http_request.headers.get("Accept-Language")
-    # 例: "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7"
-
-    pairs: list[tuple[babel.Locale, float]] = []
-    for l in al_header.split(','):
-        lang, qvalue = ...  # 解析 q 值
-        locale = babel.Locale.parse(lang, sep='-')
-        pairs.append((locale, qvalue))
-
-    # 按 q 值排序，取最高优先级
-    pairs.sort(reverse=True, key=lambda x: x[1])
-    locale = pairs[0][0]  # 取浏览器最偏好的语言
+    try:
+        al_header = http_request.headers.get("Accept-Language")
+        for l in al_header.split(','):
+            lang, qvalue = ...  # 按 ";" 分离 q 值
+            locale = babel.Locale.parse(lang, sep='-')  # 解析每个语言 tag
+            pairs.append((locale, qvalue))
+        pairs.sort(reverse=True, key=lambda x: x[1])
+        locale = pairs[0][0]          # 取 q 值最高的那个 Locale 对象
+    except Exception:
+        locale = babel.Locale.default  # ← 保险 ①：babel 全局默认 = 'en'
     return cls(locale=locale)
 ```
 
-3. **[match_locale()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L372-L418)** — 将浏览器语言匹配到实际可用列表：
+#### 阶段 B 代码追踪：match_locale 语言匹配
+
+从 `_get_browser_language()` 进入 [locales.py:match_locale()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/locales.py#L372-L418)：
 
 ```python
-# _get_browser_language 内部调用
 def _get_browser_language(req, lang_list):
+    # 再次解析，但阶段 A1 的结果已缓存了兜底逻辑
     client = ClientPref.from_http_request(req)
+    # 保险 ②：fallback='en' 作为 match_locale 的最后参数
     locale = match_locale(client.locale_tag, lang_list, fallback='en')
     return locale
 ```
 
-### 3.3 Babel locale_selector 回调
+`match_locale` 内部两级前置判断，任一命中就直接返回 `fallback`：
 
-在 [webapp.py:L154-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L154-L160) 中，将选择器注册到 Flask-Babel：
+```python
+def match_locale(searxng_locale, locale_tag_list, fallback=None):
+    # 判断 1：如果传入空字符串 → 直接返回 fallback（不往下走任何匹配逻辑）
+    if not searxng_locale:
+        return fallback
+
+    # 判断 2：如果 babel 不认识这个 locale tag → 直接返回 fallback
+    locale = get_locale(searxng_locale)
+    if locale is None:
+        return fallback
+
+    # （正常匹配：构造 engine_locales 字典 → 调用 get_engine_locale）
+    ...
+    # get_engine_locale 内部所有匹配规则都不命中时 → 再返回 default=fallback
+    return get_engine_locale(searxng_locale, engine_locales, default=fallback)
+```
+
+#### 阶段 C 代码追踪：localeselector Babel 选择器
+
+阶段 A+B 的结果已写入 `sxng_request.preferences`。当 Flask-Babel 在首次调用 `gettext()` 前需要确定 locale 时，触发注册的 `locale_selector` 回调：
+
+注册位置：[webapp.py:L154-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L154-L160)
 
 ```python
 def get_locale():
@@ -372,26 +437,28 @@ babel = Babel(app, locale_selector=get_locale)
 
 ```python
 def localeselector():
+    # 保险 ③：变量初始值就是 'en'，即使整个函数体异常中断也不会崩溃
     locale: str = 'en'
+
     if has_request_context():
         value: str = sxng_request.preferences.get_value('locale')
+        # 只有 value 非空字符串时才覆盖初始值 'en'
         if value:
             locale = value
 
-    # 附加语言标记（供 get_translations 猴子补丁使用）
+    # ── 小语种双轨制标记（不影响 'en'）──
     if locale in ADDITIONAL_TRANSLATIONS:
         sxng_request.form['use-translation'] = locale
 
-    # babel 不支持的 locale → 回退到近似语言
+    # ── LOCALE_BEST_MATCH 近似语言回退（'en' 不在表中，直接取原值）──
     locale = LOCALE_BEST_MATCH.get(locale, locale)
-    # 例: "zh-HK" → "zh-Hant-TW", "nl-BE" → "nl"
 
+    # 保险 ④：如果 preferences 加载异常导致值仍为空字符串，再次硬兜底
     if locale == '':
         locale = 'en'
 
-    # 连字符转下划线 (babel 内部格式)
+    # 连字符转下划线（babel 内部格式）：'en' → 'en'，'zh-CN' → 'zh_CN'
     locale = locale.replace('-', '_')
-    # 例: "zh-CN" → "zh_CN", "zh-Hans-CN" → "zh_Hans_CN"
     return locale
 ```
 
@@ -405,6 +472,10 @@ def localeselector():
 | `nl-BE` | `nl` | 比利时荷兰语 → 标准荷兰语 |
 | `zh-HK` | `zh-Hant-TW` | 香港 → 繁体台湾翻译 |
 | `pap` | `pt-BR` | Papiamento → 巴西葡萄牙语 |
+
+#### 为什么选英语做最终兜底？
+
+因为所有翻译的 `messages.pot` 模板文件是以英语 msgid 为锚点生成的。举个例子，模板中的 `msgid "About"`，如果目标语言的 `.mo` 文件里没有对应翻译条目，gettext 会直接返回 msgid 原文（即英语的 `"About"`），不会出现空字符串或翻译键泄漏到页面。这是 GNU gettext 的标准设计——英语天然是所有语言的零配置兜底。
 
 ---
 
@@ -451,20 +522,99 @@ def render(template_name: str, **kwargs):
     return result
 ```
 
-### 4.2 前端 JS 翻译字典
+### 4.2 前端 JS 翻译字典的注入时机与全链路
 
-`get_client_settings()` → `get_translations()` 收集少量供前端 TypeScript 代码直接使用的翻译：
+前端 TypeScript 代码运行在浏览器沙箱中，无法直接调用 Python 侧的 `gettext()`。SearXNG 的方案是**在服务器端渲染时，把前端需要的少量翻译词条打包成 JSON，通过 HTML 的自定义属性注入页面**。整个流程分三个精确时间点：
+
+```
+时间点 1: 路由处理函数内部，调用 render() 之前
+时间点 2: render() 函数内部，get_client_settings() 执行时
+时间点 3: 浏览器加载 HTML，解析到 <script client_settings="..."> 时
+```
+
+#### 时间点 1：Babel 已激活，翻译环境就绪
+
+路由函数（如 `index()`、`search()`、`preferences()`）执行时，Flask 的 `before_request` 钩子 `pre_request()` 已经完成，`Preferences` 已从 Cookie/Accept-Language 中加载完毕。紧接着 Flask-Babel 的 `locale_selector` 回调也已经触发并返回了 locale tag。此时：
+
+- `flask_babel.gettext()` 内部调用 `get_translations()` 已能正确加载对应语言的 `.mo` 文件
+- 在此之后任何位置调用 `gettext('...')` 都会返回正确语言的翻译
+
+#### 时间点 2：render() 内打包翻译字典
+
+[webapp.py:render()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L387-L406) 执行第一行就调用 `get_client_settings()`，此时翻译环境已就绪，所以每个 `gettext()` 调用都能拿到正确译文：
+
+```python
+def render(template_name: str, **kwargs):
+    # ┌─ 在 render_template 之前调用，确保翻译环境已激活 ─┐
+    client_settings = get_client_settings()
+    #                                                    │
+    # 打包为 base64，避免 JSON 中的引号破坏 HTML 属性     │
+    kwargs['client_settings'] = base64.b64encode(        │
+        json.dumps(client_settings).encode()             │
+    ).decode()                                           │
+    #                                                    │
+    kwargs.update(client_settings)  # 同时展开字典，使模板也能访问
+    # └─────────────────────────────────────────────────┘
+    ...
+```
+
+`get_client_settings()` → `get_translations()` 收集前端 TS 代码确实需要的 3 条翻译：
 
 ```python
 def get_translations():
     return {
-        'no_item_found': gettext('No item found'),          # 自动补全无结果
-        'Source': gettext('Source'),                        # 引擎描述来源
-        'error_loading_next_page': gettext('Error loading the next page'),  # 无限滚动
+        'no_item_found': gettext('No item found'),
+        #  被 autocomplete.ts 用在下拉框无搜索建议时显示
+        'Source': gettext('Source'),
+        #  被 preferences.ts 拼在引擎描述后面："Source: Wikipedia"
+        'error_loading_next_page': gettext('Error loading the next page'),
+        #  被 InfiniteScroll.ts 用在无限滚动加载失败时
     }
 ```
 
-最终以 base64 编码形式注入到 `<script client_settings="...">` 属性，由前端 `loader.ts` 解析。
+**为什么只有 3 条**？绝大多数界面文案都在 Jinja 模板中用 `{{ _('...') }}` 渲染，只有用户交互过程中动态生成的 DOM 节点（自动补全下拉框、无限滚动错误提示、偏好设置里动态插入的引擎来源）需要在浏览器侧调用翻译。打包过多词条会增大每个页面的 HTML 体积。
+
+#### 时间点 3：浏览器解析 HTML，前端 TS 提取翻译字典
+
+[base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/templates/simple/base.html#L13) 中 `<script>` 标签携带注入的属性：
+
+```html
+<script type="module" src="{{ url_for('static', filename='sxng-core.min.js') }}"
+        client_settings="{{ client_settings }}"></script>
+```
+
+前端 [toolkit.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/client/simple/src/js/toolkit.ts#L61-L71) 在模块加载时立即解析：
+
+```typescript
+// toolkit.ts 模块顶层作用域，页面加载时立即执行一次
+const getSettings = (): Settings => {
+  const attr = document.querySelector("script[client_settings]")
+    ?.getAttribute("client_settings");
+  if (!attr) return {};
+  try {
+    return JSON.parse(atob(attr));  // base64 解码 → JSON 解析
+  } catch (error) {
+    console.error("Failed to load client_settings:", error);
+    return {};
+  }
+};
+
+// 模块导出的单例，整个前端代码共享这一份 settings
+export const settings: Settings = getSettings();
+```
+
+各 TS 模块通过 `settings.translations?.xxx` 访问翻译，同时附带空值兜底（防止 `client_settings` 解析失败时出现 undefined）：
+
+```typescript
+// autocomplete.ts
+textContent: settings.translations?.no_item_found ?? "No results found"
+// InfiniteScroll.ts
+textContent: settings.translations?.error_loading_next_page ?? "Error loading next page"
+// preferences.ts
+` (<i>${settings.translations?.Source}:&nbsp;${source}</i>)`
+```
+
+**为什么用 base64 编码而不是直接内联 `<script>` 标签**：这是 SearXNG 的 CSP（内容安全策略）设计——内联 `<script>` 需要 nonce 或 hash，而自定义属性携带 JSON + base64 编码能天然避开 CSP 对脚本注入的限制，同时避免 JSON 中的引号、换行符破坏 HTML 属性结构。
 
 ### 4.3 Flask-Babel 自动注入的翻译函数
 
