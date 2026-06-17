@@ -275,6 +275,8 @@ locale (界面语言)                          language (搜索语言)
 
 当用户从未设置过偏好（Cookie 为空），且浏览器 `Accept-Language` 请求头中的语言又全部不被支持时，SearXNG 通过三个阶段串联的多级兜底，最终落到英语 `'en'`。整个过程是嵌套保护结构：上一层失败才触发下一层，每层都有独立保险。
 
+关键理解：**未知语言不是直接应用默认值，而是先逐个跳过、再进入匹配兜底**。`ClientPref.from_http_request()` 遇到 `UnknownLocaleError` 时执行 `continue`（跳过该 tag），只有所有 tag 都跳过后 `pairs` 才为空，`locale` 才变成 `None`，随后由 `match_locale()` 的 `fallback='en'` 接住。
+
 ```
 浏览器 Accept-Language: "xyz-AB, qwe-CD;q=0.9"
 (两种语言 babel 不识别，SearXNG 也没有翻译)
@@ -283,9 +285,10 @@ locale (界面语言)                          language (搜索语言)
 ━━━━━━━━━━━━━━━━ 阶段 A：pre_request 请求处理（webapp.py）━━━━━━━━━━━━━━━━
   A1. ClientPref.from_http_request()
       ├─ 解析 Accept-Language 头
-      ├─ babel.Locale.parse('xyz-AB') → UnknownLocaleError ✗
-      ├─ babel.Locale.parse('qwe-CD') → UnknownLocaleError ✗
-      └─ try/except 兜底: locale = babel.Locale.default → 'en' ← 保险 ①
+      ├─ babel.Locale.parse('xyz-AB') → UnknownLocaleError → continue（跳过）
+      ├─ babel.Locale.parse('qwe-CD') → UnknownLocaleError → continue（跳过）
+      ├─ pairs 为空 → locale = None
+      └─ 返回 ClientPref(locale=None)   ← 不是直接设 'en'！
   A2. Preferences 初始化
       └─ 从 settings_defaults.py 取默认值: locale = '' (空字符串)
   A3. 从 Cookie 加载 preferences.parse_dict(cookies)
@@ -298,23 +301,19 @@ locale (界面语言)                          language (搜索语言)
   ▼
 ━━━━━━━━━━━━━━━━ 阶段 B：match_locale 语言匹配（locales.py）━━━━━━━━━━━━━━━━
   B1. ClientPref.from_http_request(req)
-      └─ 再次解析，但结果已在保险 ① 中设为 'en'
-  B2. match_locale(searxng_locale='en', locale_tag_list, fallback='en')
-      ├─ if not searxng_locale → False（'en' 非空）
-      ├─ locale = get_locale('en') → babel.Locale('en') ✓
-      ├─ build_engine_locales(LOCALE_NAMES.keys)
-      │     包含 'en' → 'en', 'en-US' → 'en-US', ...
-      ├─ get_engine_locale('en', engine_locales, default='en')
-      │     ├─ engine_locales.get('en') → 'en' 直接命中 ✓
-      │     └─ return 'en' ← 匹配成功
-      └─ 返回 'en'
-  B3. 若阶段 B 全部失败（get_locale 返回 None）
-      └─ match_locale 参数 fallback='en' 直接返回 ← 保险 ②
+      └─ 再次解析，结果同 A1：locale = None
+  B2. client.locale_tag
+      └─ locale 为 None → 返回 None
+  B3. match_locale(searxng_locale=None, locale_tag_list, fallback='en')
+      ├─ if not searxng_locale → True（None 是 falsy）
+      └─ 直接返回 fallback='en' ← 兜底触发点
   A7. preferences.parse_dict({"locale": "en"})
       └─ 将匹配结果写入 Preferences，供后续使用
   │
   ▼
 ━━━━━━━━━━━━━━━━ 阶段 C：localeselector Babel 选择器（locales.py）━━━━━━━━━━━━━━━━
+  注意：此阶段不在 pre_request 中主动调用，而是在首次 gettext() 时由
+  Flask-Babel 的 get_locale() 按需触发（lazy evaluation）
   C1. locale 变量声明：locale: str = 'en' ← 保险 ③（初始值就是 'en'）
   C2. has_request_context() → True
   C3. value = preferences.get_value('locale') → 'en'（阶段 B 的结果）
@@ -339,7 +338,7 @@ locale (界面语言)                          language (搜索语言)
 @app.before_request
 def pre_request():
     # ── A1：从 Accept-Language 解析浏览器偏好 ──
-    # 保险 ①：即使请求头全不支持，from_http_request 也会兜底 'en'
+    # 注意：这里不会直接兜底到 'en'，未知语言会被跳过
     client_pref = ClientPref.from_http_request(sxng_request)
 
     # ── A2：构造 Preferences ──
@@ -369,22 +368,46 @@ def pre_request():
         preferences.parse_dict({"locale": locale})
 ```
 
-A1 中的 [ClientPref.from_http_request()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/preferences.py#L359-L387) 有最外层异常捕获：
+A1 中的 [ClientPref.from_http_request()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/preferences.py#L359-L387) **逐个尝试解析，跳过不认识的 tag**，而不是整体兜底：
 
 ```python
 @classmethod
 def from_http_request(cls, http_request: SXNG_Request):
-    try:
-        al_header = http_request.headers.get("Accept-Language")
-        for l in al_header.split(','):
-            lang, qvalue = ...  # 按 ";" 分离 q 值
-            locale = babel.Locale.parse(lang, sep='-')  # 解析每个语言 tag
-            pairs.append((locale, qvalue))
+    al_header = http_request.headers.get("Accept-Language")
+    if not al_header:
+        return cls(locale=None)       # 无请求头 → locale=None
+
+    pairs: list[tuple[babel.Locale, float]] = []
+    for l in al_header.split(','):
+        lang, qvalue = [_.strip() for _ in (l.split(';') + ['q=1',])[:2]]
+        try:
+            qvalue = float(qvalue.split('=')[-1])
+            locale = babel.Locale.parse(lang, sep='-')   # 尝试解析
+        except (ValueError, babel.core.UnknownLocaleError):
+            continue    # ← 关键：跳过该 tag，不中断，继续尝试下一个
+        pairs.append((locale, qvalue))
+
+    locale = None
+    if pairs:
         pairs.sort(reverse=True, key=lambda x: x[1])
         locale = pairs[0][0]          # 取 q 值最高的那个 Locale 对象
-    except Exception:
-        locale = babel.Locale.default  # ← 保险 ①：babel 全局默认 = 'en'
+    # pairs 为空（所有 tag 都跳过了）→ locale 保持 None
     return cls(locale=locale)
+```
+
+这意味着：如果 `Accept-Language: "xyz-AB, en;q=0.5"`，`xyz-AB` 会被跳过，但 `en` 仍能被解析，`pairs` 不为空，最终 `locale = Locale('en')`。**只有所有 tag 都无法解析时**，`locale` 才为 `None`。
+
+[ClientPref.locale_tag](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/preferences.py#L350-L357) 属性将 `locale=None` 转换为 `None` 返回：
+
+```python
+@property
+def locale_tag(self):
+    if self.locale is None:
+        return None
+    tag = self.locale.language
+    if self.locale.territory:
+        tag += '-' + self.locale.territory
+    return tag
 ```
 
 #### 阶段 B 代码追踪：match_locale 语言匹配
@@ -393,18 +416,18 @@ def from_http_request(cls, http_request: SXNG_Request):
 
 ```python
 def _get_browser_language(req, lang_list):
-    # 再次解析，但阶段 A1 的结果已缓存了兜底逻辑
+    # 再次解析（结果同 A1），client_pref.locale_tag 可能为 None
     client = ClientPref.from_http_request(req)
     # 保险 ②：fallback='en' 作为 match_locale 的最后参数
     locale = match_locale(client.locale_tag, lang_list, fallback='en')
     return locale
 ```
 
-`match_locale` 内部两级前置判断，任一命中就直接返回 `fallback`：
+`match_locale` 内部两级前置判断，当 `searxng_locale` 为 `None`（来自阶段 A 的"全部跳过"结果）时直接命中第一级：
 
 ```python
 def match_locale(searxng_locale, locale_tag_list, fallback=None):
-    # 判断 1：如果传入空字符串 → 直接返回 fallback（不往下走任何匹配逻辑）
+    # 判断 1：searxng_locale 为 None（falsy）→ 直接返回 fallback
     if not searxng_locale:
         return fallback
 
@@ -415,13 +438,35 @@ def match_locale(searxng_locale, locale_tag_list, fallback=None):
 
     # （正常匹配：构造 engine_locales 字典 → 调用 get_engine_locale）
     ...
-    # get_engine_locale 内部所有匹配规则都不命中时 → 再返回 default=fallback
     return get_engine_locale(searxng_locale, engine_locales, default=fallback)
 ```
 
+当 `Accept-Language` 中有部分语言能解析（如 `"xyz-AB, zh-CN;q=0.5"`），`ClientPref.from_http_request()` 只跳过 `xyz-AB`，保留 `zh-CN`。此时 `client.locale_tag = 'zh-CN'`，`match_locale('zh-CN', ...)` 进入正常的 `get_engine_locale` 匹配流程，**不会触发兜底**。
+
 #### 阶段 C 代码追踪：localeselector Babel 选择器
 
-阶段 A+B 的结果已写入 `sxng_request.preferences`。当 Flask-Babel 在首次调用 `gettext()` 前需要确定 locale 时，触发注册的 `locale_selector` 回调：
+阶段 A+B 的结果已写入 `sxng_request.preferences`。Flask-Babel 的 `locale_selector` 回调**不在 pre_request 中主动调用**，而是在首次调用 `gettext()` 时由 Flask-Babel 内部的 `get_locale()` 按需触发（lazy evaluation），且结果缓存到 `ctx.babel_locale`，同一请求内只计算一次。
+
+Flask-Babel `get_locale()` 源码核心逻辑：
+
+```python
+def get_locale():
+    ctx = _get_current_context()
+    locale = getattr(ctx, 'babel_locale', None)
+    if locale is None:
+        # 首次调用 → 触发 locale_selector 回调
+        babel = get_babel()
+        if babel.locale_selector is None:
+            locale = babel.instance.default_locale
+        else:
+            rv = babel.locale_selector()     # ← 调用 SearXNG 注册的 localeselector()
+            if rv is None:
+                locale = babel.instance.default_locale
+            else:
+                locale = Locale.parse(rv)
+        ctx.babel_locale = locale            # ← 缓存结果，后续不再触发
+    return locale
+```
 
 注册位置：[webapp.py:L154-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L154-L160)
 
@@ -522,40 +567,66 @@ def render(template_name: str, **kwargs):
     return result
 ```
 
-### 4.2 前端 JS 翻译字典的注入时机与全链路
+### 4.2 前端翻译字典全链路：服务端生成 → 注入页面 → 浏览器解码使用
 
-前端 TypeScript 代码运行在浏览器沙箱中，无法直接调用 Python 侧的 `gettext()`。SearXNG 的方案是**在服务器端渲染时，把前端需要的少量翻译词条打包成 JSON，通过 HTML 的自定义属性注入页面**。整个流程分三个精确时间点：
+前端 TypeScript 代码运行在浏览器沙箱中，无法直接调用 Python 侧的 `gettext()`。SearXNG 的方案是**在服务器端渲染时，把前端需要的少量翻译词条打包成 JSON，通过 HTML 的自定义属性注入页面**。整条链路分为三个严格有序的阶段，每个阶段的时机不能错位：
 
 ```
-时间点 1: 路由处理函数内部，调用 render() 之前
-时间点 2: render() 函数内部，get_client_settings() 执行时
-时间点 3: 浏览器加载 HTML，解析到 <script client_settings="..."> 时
+服务端进程：Flask 请求响应周期内
+  │
+  ├── 阶段 ①：render() 内首次 gettext() 调用时，触发 localeselector 确定语言
+  │
+  ├── 阶段 ②：render() 第一行，get_client_settings() 生成翻译字典
+  │       └─ 打包为 base64 → 塞进模板变量 client_settings
+  │
+  └── Jinja2 渲染 → base.html 输出：
+          <script src="sxng-core.min.js" client_settings="eyJ0cmFuc...">
+              ↑                                    ↑
+              │                                    │
+           阶段 ③：浏览器侧                       base64 编码后的
+           toolkit.ts 在此处                      JSON，包含
+           读取属性并解码                          translations 字典
 ```
 
-#### 时间点 1：Babel 已激活，翻译环境就绪
+#### 阶段 ①：服务端生成时机 — 首次 gettext() 调用时确定语言
 
-路由函数（如 `index()`、`search()`、`preferences()`）执行时，Flask 的 `before_request` 钩子 `pre_request()` 已经完成，`Preferences` 已从 Cookie/Accept-Language 中加载完毕。紧接着 Flask-Babel 的 `locale_selector` 回调也已经触发并返回了 locale tag。此时：
+路由函数（如 `index()`、`search()`、`preferences()`）执行时，Flask 的 `before_request` 钩子 `pre_request()` 已经完成，`Preferences` 已从 Cookie/Accept-Language 中加载完毕。
 
-- `flask_babel.gettext()` 内部调用 `get_translations()` 已能正确加载对应语言的 `.mo` 文件
-- 在此之后任何位置调用 `gettext('...')` 都会返回正确语言的翻译
+紧接着 Flask-Babel 会在**第一次调用任何翻译函数时**，通过注册的 `locale_selector` 回调触发 `localeselector()` 并返回 locale tag。这个回调时机非常关键——必须早于 `render()` 内的 `gettext()` 调用，否则翻译字典会拿到英文原文。
 
-#### 时间点 2：render() 内打包翻译字典
+SearXNG 的时序保证是天然正确的，因为：
+- `pre_request` 把 locale 写入了 `sxng_request.preferences`
+- `localeselector()` 从 preferences 中读取值，只要后续调用 `gettext()` 时 babel 才会延迟加载 `.mo` 文件
+- 因此在 `render()` 内部第一次调用 `gettext('No item found')` 时，babel 会完成 locale 解析并加载正确的 `.mo` 文件
 
-[webapp.py:render()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L387-L406) 执行第一行就调用 `get_client_settings()`，此时翻译环境已就绪，所以每个 `gettext()` 调用都能拿到正确译文：
+#### 阶段 ②：塞入页面 — render() 打包，模板输出到 HTML 属性
+
+[webapp.py:render()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/webapp.py#L387-L406) 执行第一行调用 `get_client_settings()`，首次 `gettext()` 在此触发 localeselector 确定语言，后续翻译直接使用缓存：
 
 ```python
 def render(template_name: str, **kwargs):
-    # ┌─ 在 render_template 之前调用，确保翻译环境已激活 ─┐
-    client_settings = get_client_settings()
-    #                                                    │
-    # 打包为 base64，避免 JSON 中的引号破坏 HTML 属性     │
-    kwargs['client_settings'] = base64.b64encode(        │
-        json.dumps(client_settings).encode()             │
-    ).decode()                                           │
-    #                                                    │
-    kwargs.update(client_settings)  # 同时展开字典，使模板也能访问
-    # └─────────────────────────────────────────────────┘
+    # ┌─ 步骤 1：收集所有客户端设置（含 3 条翻译）──────────────────┐
+    client_settings = get_client_settings()                        │
+    #                                                                │
+    # ┌─ 步骤 2：整体打包为 base64 字符串 ────────────────────────┐ │
+    # │ 输入：{"theme": "simple", "translations": {"no_item_found"│ │
+    # │        : "无结果", ...}, ...}                             │ │
+    # │ 过程：json.dumps → UTF-8 bytes → base64 bytes → str      │ │
+    # │ 输出："eyJ0aGVtZSI6InNpbXBsZSIsInRyYW5zbGF0aW9ucyI6...    │ │
+    kwargs['client_settings'] = base64.b64encode(                  │ │
+        json.dumps(client_settings).encode('utf-8')                │ │
+    ).decode('ascii')                                              │ │
+    # └────────────────────────────────────────────────────────────┘ │
+    #                                                                │
+    # ┌─ 步骤 3：同时展开字典，模板内直接访问各个字段 ────────────┐ │
+    # │ 例如模板内可写 {{ theme }}、{{ autocomplete }} 等         │ │
+    kwargs.update(client_settings)                                 │ │
+    # └────────────────────────────────────────────────────────────┘ │
+    # └─────────────────────────────────────────────────────────────┘
     ...
+    # 步骤 4：Jinja2 渲染 → client_settings 字符串被写入 HTML 属性
+    result = render_template('simple/' + template_name, **kwargs)
+    return result
 ```
 
 `get_client_settings()` → `get_translations()` 收集前端 TS 代码确实需要的 3 条翻译：
@@ -563,58 +634,96 @@ def render(template_name: str, **kwargs):
 ```python
 def get_translations():
     return {
+        # 被 autocomplete.ts：搜索建议下拉框显示 "无匹配结果"
         'no_item_found': gettext('No item found'),
-        #  被 autocomplete.ts 用在下拉框无搜索建议时显示
+
+        # 被 preferences.ts：引擎描述后拼 "来源: Wikipedia"
         'Source': gettext('Source'),
-        #  被 preferences.ts 拼在引擎描述后面："Source: Wikipedia"
+
+        # 被 InfiniteScroll.ts：无限滚动加载失败提示
         'error_loading_next_page': gettext('Error loading the next page'),
-        #  被 InfiniteScroll.ts 用在无限滚动加载失败时
     }
 ```
 
-**为什么只有 3 条**？绝大多数界面文案都在 Jinja 模板中用 `{{ _('...') }}` 渲染，只有用户交互过程中动态生成的 DOM 节点（自动补全下拉框、无限滚动错误提示、偏好设置里动态插入的引擎来源）需要在浏览器侧调用翻译。打包过多词条会增大每个页面的 HTML 体积。
+**为什么只有 3 条**？绝大多数界面文案都在 Jinja 模板中用 `{{ _('...') }}` 渲染（在服务端已经翻译完了），只有用户交互过程中动态生成的 DOM 节点才需要浏览器侧的翻译。打包过多词条会增大每个页面的 HTML 体积。
 
-#### 时间点 3：浏览器解析 HTML，前端 TS 提取翻译字典
-
-[base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/templates/simple/base.html#L13) 中 `<script>` 标签携带注入的属性：
+模板 [base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/searx/templates/simple/base.html#L13) 中把 base64 字符串写入自定义属性：
 
 ```html
-<script type="module" src="{{ url_for('static', filename='sxng-core.min.js') }}"
+<script type="module"
+        src="{{ url_for('static', filename='sxng-core.min.js') }}"
         client_settings="{{ client_settings }}"></script>
 ```
 
-前端 [toolkit.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/client/simple/src/js/toolkit.ts#L61-L71) 在模块加载时立即解析：
+**为什么用 base64 编码而不是直接内联 `<script>` 标签**：
+1. **CSP 规避**：SearXNG 默认启用严格的内容安全策略，内联 `<script>` 需要 nonce 或 hash 值。而自定义 HTML 属性不受此限制。
+2. **引号安全**：`gettext()` 返回的翻译可能包含单引号、双引号甚至 HTML 字符实体。直接写 `const s = {{ translations|tojson }}` 会因为引号嵌套破坏页面结构。base64 输出只有 `[A-Za-z0-9+/=]` 字符，天然无转义问题。
+3. **体积恒定**：base64 编码后的长度是原数据的 4/3，固定可预测，不影响 HTML 解析器的字符计数。
+
+#### 阶段 ③：浏览器解码使用 — toolkit.ts 模块顶层一次性执行
+
+浏览器按顺序解析 HTML 文档：
+
+1. 解析到 `<script type="module" src="sxng-core.min.js" client_settings="...">`
+2. 此时 `client_settings` **属性本身已经在 DOM 树上**，但 JS 模块代码还没有开始执行
+3. 浏览器启动 ES 模块加载流程，下载并解析 `sxng-core.min.js`
+4. 模块内部的依赖图按拓扑序执行，`toolkit.ts` 是最底层依赖，最先执行
+
+[toolkit.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-searxng/client/simple/src/js/toolkit.ts#L61-L71) 在**模块顶层作用域**立即执行 `getSettings()`：
 
 ```typescript
-// toolkit.ts 模块顶层作用域，页面加载时立即执行一次
+// ── 模块加载时立即执行，且只执行一次 ──
 const getSettings = (): Settings => {
+  // 从 DOM 中取属性值（此时 <script> 标签已解析完毕，一定存在）
   const attr = document.querySelector("script[client_settings]")
     ?.getAttribute("client_settings");
-  if (!attr) return {};
+
+  if (!attr) return {};              // 属性不存在 → 返回空对象兜底
+
   try {
-    return JSON.parse(atob(attr));  // base64 解码 → JSON 解析
+    return JSON.parse(atob(attr));   // 逆过程：base64 → UTF-8 bytes → JSON 对象
   } catch (error) {
     console.error("Failed to load client_settings:", error);
-    return {};
+    return {};                       // 解析失败 → 空对象兜底
   }
 };
 
-// 模块导出的单例，整个前端代码共享这一份 settings
+// 导出单例：所有 TS 模块 import { settings } 时拿到的都是同一个对象引用
 export const settings: Settings = getSettings();
 ```
 
-各 TS 模块通过 `settings.translations?.xxx` 访问翻译，同时附带空值兜底（防止 `client_settings` 解析失败时出现 undefined）：
+`settings` 对象的类型定义（toolkit.ts 第 5-22 行）与 Python 端 `get_client_settings()` 返回结构一一对应：
 
 ```typescript
-// autocomplete.ts
-textContent: settings.translations?.no_item_found ?? "No results found"
-// InfiniteScroll.ts
-textContent: settings.translations?.error_loading_next_page ?? "Error loading next page"
-// preferences.ts
-` (<i>${settings.translations?.Source}:&nbsp;${source}</i>)`
+// synced with searx/webapp.py get_client_settings  ← 注释注明需要和 Python 端同步
+type Settings = {
+  plugins?: string[];
+  autocomplete?: string;
+  ...
+  translations?: Record<string, string>;  // ← 翻译字典在这里
+  ...
+};
 ```
 
-**为什么用 base64 编码而不是直接内联 `<script>` 标签**：这是 SearXNG 的 CSP（内容安全策略）设计——内联 `<script>` 需要 nonce 或 hash，而自定义属性携带 JSON + base64 编码能天然避开 CSP 对脚本注入的限制，同时避免 JSON 中的引号、换行符破坏 HTML 属性结构。
+各业务模块直接使用 `settings.translations`，并附带空值兜底（防止解析失败时页面报错）：
+
+```typescript
+// ── autocomplete.ts：搜索输入框建议无结果时 ──
+const emptyEl = document.createElement("div");
+emptyEl.textContent =
+  settings.translations?.no_item_found ?? "No results found";
+  // 如果 translations 不存在，用英文原文兜底
+
+// ── InfiniteScroll.ts：无限滚动下一页请求失败 ──
+errorEl.textContent =
+  settings.translations?.error_loading_next_page ?? "Error loading next page";
+
+// ── preferences.ts：动态插入引擎描述的来源标签 ──
+const sourceHtml =
+  ` (<i>${settings.translations?.Source}:&nbsp;${source}</i>)`;
+```
+
+整条链路的不变式：**只要 Python 端能翻译出某个词条，浏览器端就能拿到对应的译文**。如果中间任何环节失败（base64 损坏、JSON 格式异常、translations 键缺失），代码都会回退到英文原文——这就是 `??` 运算符和 `msgid` 英语原文设计的天然兜底。
 
 ### 4.3 Flask-Babel 自动注入的翻译函数
 
