@@ -11,7 +11,8 @@
 | 路径 | 说明 |
 |------|------|
 | `searx/__init__.py` | 模块顶层：定义全局 `settings = {}`、`logger`；L146 在模块导入时立即执行 `init_settings()` |
-| `searx/engines/__init__.py` | 引擎注册表：`load_engines()`、`load_engine()`、`ENGINE_DEFAULT_ARGS`、全局字典 `engines` |
+| `searx/utils.py` | 通用工具：`load_module()`（L428）使用 `importlib.util.spec_from_file_location` + `exec_module` 新建模块对象，**不注册到 `sys.modules`** |
+| `searx/engines/__init__.py` | 引擎注册表：`load_engines()`（L267）、`load_engine()`（L82）、`update_engine_attributes()`（L179）、全局字典 `engines`；`load_engine()` L124 调用 `load_module()` 创建新模块副本 |
 | `searx/engines/xpath.py` | 通用 XPath 引擎：`request()`（L230）、`response()`（L275） |
 | `searx/engines/json_engine.py` | 通用 JSON 引擎：`request()`（L315）、`extract_response_info()`（L362）、`response()`（L393） |
 | `searx/engines/command.py` | 通用命令行引擎：`search()`（L129）、`_get_results_from_process()`（L156）、`__parse_single_result()`（L224） |
@@ -53,7 +54,39 @@
 - L1 独立发生：只要某测试文件的 import 链经过 `searx`（例如 `from searx.engines import json_engine` 间接触发 `import searx`），L1 就在模块导入阶段先于任何 `setUp` 完成
 - `searx.init_settings()`（L2 步骤 ②）会再次执行 L1 的完整流程，覆盖 L1 阶段加载的 settings 内容
 
-### 2.2 测试运行时的实际执行顺序
+### 2.2 两种模块加载路径与对象身份差异
+
+L3 中 `load_engine()` 通过 `searx.utils.load_module()`（`searx/utils.py` L428-L439）加载引擎 `.py` 文件，其核心实现为：
+
+```python
+spec = importlib.util.spec_from_file_location(modname, modpath)  # 不查 sys.modules
+module = importlib.util.module_from_spec(spec)                   # 全新对象
+spec.loader.exec_module(module)                                   # 执行源码
+return module                                                     # 未写入 sys.modules
+```
+
+这与测试代码中 `from searx.engines import xpath` 的**正常 Python 导入机制**（写入 `sys.modules`、同进程复用唯一对象）是两条完全独立的路径。由此产生**两类完全不同生命周期的模块对象**：
+
+| 维度 | 路径 A：`from searx.engines import xxx`（导入模块） | 路径 B：`load_engines()` → `load_module()`（注册表模块） |
+|------|--------------------------------------------------|------------------------------------------------------|
+| **对象创建机制** | Python `import` 语句，经 `sys.modules` 缓存 | `importlib.util.spec_from_file_location` 直接执行 `.py` |
+| **`sys.modules` 注册** | ✅ 注册为 `searx.engines.xxx`，进程全局唯一 | ❌ 不注册，每次调用都是独立的新对象 |
+| **对象复用性** | 同进程内多次 import 返回同一对象引用 | 每次 `load_engine()` 调用都创建独立副本 |
+| **YAML 属性注入** | ❌ 从未被 `update_engine_attributes()` 处理 | ✅ L179-L194 注入 YAML 属性 + `ENGINE_DEFAULT_ARGS` |
+| **Tor 属性更新** | ❌ 不经过 `update_attributes_for_tor()` | ✅ 按 `using_tor_proxy` 更新 `search_url`/`timeout` |
+| **EngineTraitsMap 注入** | ❌ 未执行 `trait_map.set_traits()` | ✅ L138-L141 设置语言/网络 traits |
+| **`setup()` 回调** | ❌ 未调用 | ✅ L233-L249 调用 `engine.setup()` |
+| **logger 初始化** | 通常由 `set_loggers()` L168-L176 在其他引擎加载时补全，但非时机确定 | ✅ L149 `set_loggers()` 显式设置 |
+
+**根本结论**：路径 A 的导入模块与路径 B 的注册表模块是**两个独立的 Python 对象**，对其中一方修改属性不会影响另一方。二者仅共享模块顶层定义的常量（如 `tineye.FORMAT_NOT_SUPPORTED` 字面量值相同，但对象不相同——每次 `exec_module` 都会重新创建这些常量的新实例）。
+
+对测试体系的直接影响：
+- `TestXpathEngine`/`TestJsonEngine`/`TestCommandEngine` 使用路径 A（`from searx.engines import xxx`），操作的是 `sys.modules` 中**持久存在的唯一对象**
+- `TinEyeTests`/`GithubCodeTests` 使用路径 B（`searx.engines.engines['xxx']`），操作的是**每次 `setUp()` 新建的独立副本**
+- `TinEyeTests.tearDown()` 中 `load_engines([])` 仅清空路径 B 的注册表，与路径 A 对象毫无关系
+- `TestEnginesInit` 中替换 `searx.engines.engines` 字典仅影响路径 B 的使用者
+
+### 2.3 测试运行时的实际执行顺序
 
 以一次完整的测试运行为例，时序如下：
 
@@ -99,30 +132,38 @@
      → tearDown() → searx.search.load_engines([]) 【清空 L3 注册表】
 ```
 
-### 2.3 各测试类生命周期对照表
+### 2.4 各测试类生命周期对照表
 
-| 测试类 | 覆盖 `setUp()` | 调用 `super().setUp()` | 覆盖 `TEST_SETTINGS` | 覆盖 `tearDown()` | L1 基础 settings 是否存在 | L2 完整搜索初始化 | L3 引擎注册表状态 | 模块属性是否重置 |
-|--------|---------------|----------------------|---------------------|-------------------|--------------------------|------------------|-----------------|----------------|
-| **`TestXpathEngine`** (test_xpath.py L15) | ✅ L31 | ✅ L32 | ❌ 否 | ❌ 否 | ✅ 是（导入阶段已触发） | ✅ 每个方法前完整执行 | 每个方法 setUp 后：`dummy engine` + `dummy private engine`（demo_offline） | ❌ 不重置；`xpath.search_url`/`paging`/`categories`/`url_xpath` 等赋值在类内方法间残留 |
-| **`TestJsonEngine`** (test_json_engine.py L15) | ✅ L112 | ❌ **未调用** | ❌ 否 | ❌ 否 | ✅ 是（`from searx.engines import json_engine` 触发 `import searx` → L146 `init_settings()`，已加载 `test_settings.yml`） | ❌ 不执行（无 Flask app、无 test client） | ❌ 不执行（`searx.engines.engines` 字典内容取决于先执行的测试类；但 json_engine 测试从不读取该字典） | ❌ 不重置；`json_engine.*` 属性在类内方法间残留 |
-| **`TestCommandEngine`** (test_command.py L10) | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 继承默认，每个方法前执行 | 每个方法 setUp 后：`dummy engine` + `dummy private engine` | ❌ 不重置；`command_engine.command`/`delimiter` 等赋值在类内方法间残留 |
-| **`TinEyeTests`** (test_engine_tineye.py L15) | ✅ L19 | ✅ L20 | ✅ `"test_tineye.yml"` L17 | ✅ L24 → `load_engines([])` | ✅ 是 | ✅ 每个方法前执行，加载 tineye YAML | setUp 后：`{tineye}`；tearDown 后：`{}`（清空） | ❌ 不重置；tineye 模块属性（常量 `FORMAT_NOT_SUPPORTED` 等）不变 |
-| **`GithubCodeTests`** (test_engine_github_code.py L14) | ✅ L18 | ✅ L19 | ✅ `"test_github_code.yml"` L16 | ✅ L23 → `load_engines([])` | ✅ 是 | ✅ 每个方法前执行，加载 github_code YAML | setUp 后：`{"github code": ...}`；tearDown 后：`{}` | ❌ 不重置；github_code 模块属性不变 |
-| **`TestEnginesInit`** (test_engines_init.py L8) | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 继承默认，每个方法前加载 demo_offline | 双重状态：setUp 后是 `{dummy engine, dummy private engine}`；方法体内部又调用 `load_engines(自定义列表)` 完全替换全局字典 | ❌ 不重置；方法间 `engines` 字典互相覆盖 |
-| **`TestOnlineProcessor`** (test_online.py L13) | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 继承默认，每个方法前执行 | 每个方法 setUp 后：`dummy engine` + `dummy private engine` | ❌ 不重置 |
+> "使用路径"列说明：A = 通过 `from searx.engines import xxx`（路径 A，`sys.modules` 持久对象）；B = 通过 `searx.engines.engines['xxx']`（路径 B，`load_module()` 新建副本）
 
-### 2.4 生命周期关键发现（修正版）
+| 测试类 | 使用路径 | 覆盖 `setUp()` | 调用 `super().setUp()` | 覆盖 `TEST_SETTINGS` | 覆盖 `tearDown()` | L1 基础 settings | L2 完整搜索初始化 | L3 引擎注册表状态 | 模块属性残留范围 |
+|--------|---------|---------------|----------------------|---------------------|-------------------|----------------|-------------------|----------------|----------------|
+| **TestXpathEngine** | **A**（`from searx.engines import xpath`） | ✅ L31 | ✅ L32 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 每个方法前完整执行 | setUp 后：demo_offline 2 实例（路径 B 对象，不被测试使用） | **高风险（路径 A）**：A 对象在 `sys.modules` 中持久存在；`xpath.search_url`/`paging`/`categories`/`url_xpath` 等赋值类内所有方法间、跨测试类持续残留，至进程终止 |
+| **TestJsonEngine** | **A**（`from searx.engines import json_engine`） | ✅ L112 | ❌ 未调用 | ❌ 否 | ❌ 否 | ✅ 是 | ❌ 不执行 | ❌ 不执行（测试仅用路径 A） | **高风险（路径 A）**：A 对象持久存在；所有 `json_engine.*` 属性类内方法间、跨测试类持续残留 |
+| **TestCommandEngine** | **A**（`from searx.engines import command`） | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 继承默认 | setUp 后：demo_offline 2 实例（路径 B，不被测试使用） | **高风险（路径 A）**：A 对象持久存在；`command_engine.command`/`delimiter` 等类内方法间、跨测试类持续残留 |
+| **TinEyeTests** | **B**（`searx.engines.engines['tineye']`） | ✅ L19 | ✅ L20 | ✅ `"test_tineye.yml"` | ✅ L24 `load_engines([])` | ✅ 是 | ✅ 加载 tineye YAML | setUp 后：`{tineye}`（路径 B 新对象）；tearDown 后：`{}` | **无风险（路径 B）**：每个方法 `self.tineye` 都是 `load_module` 新建的独立副本；前一方法修改属性仅存活至 tearDown；路径 A（若被 import）完全不受影响 |
+| **GithubCodeTests** | **B**（`searx.engines.engines['github code']`） | ✅ L18 | ✅ L19 | ✅ `"test_github_code.yml"` | ✅ L23 `load_engines([])` | ✅ 是 | ✅ 加载 github_code YAML | setUp 后：`{"github code": B新对象}`；tearDown 后：`{}` | **无风险（路径 B）**：同 TinEyeTests；注册表对象每次全新；路径 A 不受影响 |
+| **TestEnginesInit** | 混合（仅操作路径 B 注册表字典） | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 加载 demo_offline | setUp → 方法体 `load_engines(自定义)` 覆盖 → 下一 setUp 重置 | **中风险（路径 B 字典引用）**：方法内直接替换全局 `engines` 字典，但下一 setUp 总会重置；仅同方法体内生效；路径 A 完全不受影响 |
+| **TestOnlineProcessor** | 仅路径 B（只读注册表） | ❌ 否 | 继承默认 | ❌ 否 | ❌ 否 | ✅ 是 | ✅ 继承默认 | setUp 后：demo_offline 2 实例 | **低风险**：从不修改引擎对象属性，仅读取注册表 |
+
+### 2.5 生命周期关键发现（修正版）
 
 1. **所有测试类运行时 `searx.settings` 全局字典均已存在**：此前错误地认为 `TestJsonEngine` 无 settings。实际核对代码：`json_engine.py` 通过 `from searx.utils import to_string` 间接触发 `import searx`，而 `searx/__init__.py` L146 的顶层 `init_settings()` 调用会在模块导入阶段完成 settings 初始化。`TestJsonEngine` 跳过的是 **L2（完整搜索初始化：Flask app、plugins、网络层、引擎注册表）**，不是 L1。
 
-2. **全局属性残留的风险范围有限**：
-   - **类内方法间**：所有 7 个测试类均无模块属性 cleanup，属性赋值在同一类的方法间持续残留。风险中等——同一类的方法通常按源码定义顺序执行，后执行方法依赖前方法副作用的情况较难排查。
-   - **跨测试类**：若两个测试类（如 `TestXpathEngine` 和 `TestJsonEngine`）修改的是**不同引擎模块**（`xpath` vs `json_engine`），互不干扰；若修改的是同一模块（目前不存在这种情况），则存在跨类污染。
-   - **全局 `searx.engines.engines` 字典**：`TestEnginesInit` 每个方法内部直接替换该字典，是最严重的跨方法/跨类污染源；`TinEyeTests` 和 `GithubCodeTests` 通过 `tearDown` 中 `load_engines([])` 清零，相对安全；其余 4 个类每个方法 setUp 都会重新执行 `load_engines(YAML_engines)` 覆盖该字典，状态是可预测的。
+2. **全局属性残留风险严格按路径 A/B 分界（根本性修正）**：
+   - **路径 A 类（TestXpathEngine / TestJsonEngine / TestCommandEngine）：高风险**。三者均使用 `from searx.engines import xxx`，操作的是 `sys.modules` 中进程全局唯一的持久对象。这些属性在**同一类的所有方法间、跨所有使用该引擎模块的测试类间**持续残留，直至 Python 进程终止。由于 3 个类各自操作不同的模块（xpath / json_engine / command），互相不污染；但若未来有其他测试类 `from searx.engines import xpath`，会立即继承 TestXpathEngine 留下的所有属性副作用。
+   - **路径 B 类（TinEyeTests / GithubCodeTests）：无风险**。二者均从 `searx.engines.engines['xxx']` 获取对象，而每次 `setUp()` 的 `load_engines()` 都会通过 `load_module()` 创建**全新的独立模块副本**，前一方法通过 `self.tineye.foo = ...` 修改的属性对下一个方法完全不可见。`tearDown()` 中的 `load_engines([])` 甚至是多余的——即使不调用，下一个 `setUp()` 的 `load_engines()` 第一行也会执行 `engines.clear()`（`searx/engines/__init__.py` L269）。
+   - **全局 `searx.engines.engines` 字典替换（TestEnginesInit）：仅影响路径 B 使用者**。该类在方法体内部调用 `load_engines(自定义列表)` 替换的是路径 B 注册表，对路径 A 对象完全无影响。由于每个方法的 `setUp()` 都会重新 `load_engines(YAML_default)` 重置注册表，方法间不存在字典层面的残留，但**通过方法体中 `load_engine()` 新建的路径 B 对象会作为独立模块一直存在于内存中直到 GC**（无 `sys.modules` 引用但可能被其他引用链持有）。
 
-3. **`SearxTestCase.setattr4test()`（`tests/__init__.py` L46-L55）虽已提供但零使用**：该辅助方法通过 `addCleanup` 注册恢复原值的回调，是正确的属性管理方式，7 个测试类 0 个使用。
+3. **路径 A 类从未经过 `update_engine_attributes()` 注入（根本性修正）**：
+   - 路径 A 的导入模块**从未被 `update_engine_attributes()`（`searx/engines/__init__.py` L179-L194）处理**，因此缺少所有 YAML 配置属性注入（如 `categories` 默认值 `['general']`、`timeout`、`paging`、`safesearch`、`shortcut` 等 `ENGINE_DEFAULT_ARGS` 中的字段）。测试代码中显式赋值的 `xpath.categories = ['general']` 等属性实际上是**手动补全了本该由 L3 完成的注入**——这意味着若引擎 `response()` 代码未来引用任何由 YAML 注入的新属性，路径 A 类的测试会因该属性不存在而崩溃，但实际运行时（走路径 B）属性存在。
+   - 路径 B 类无此问题：`load_engine()` L133 显式调用 `update_engine_attributes()`，`ENGINE_DEFAULT_ARGS` 中所有缺省属性在 L192-L194 自动补全。
 
-4. **`TestEnginesInit` 的双重初始化是设计特性而非缺陷**：它测试的就是 `load_engines()` 本身的行为，因此 setUp 加载的 demo_offline 在方法体中被主动覆盖是预期行为——但方法间未清理前方法留下的自定义引擎列表，存在测试顺序依赖风险。
+4. **`SearxTestCase.setattr4test()`（`tests/__init__.py` L46-L55）虽已提供但对路径 A/B 价值不对称**：
+   - 对**路径 A 类**（高风险的 3 个类），该方法通过 `addCleanup` 注册恢复原值，是唯一正确的属性管理方式——但 3 个类 0 个使用。
+   - 对**路径 B 类**（无风险的 2 个类），该方法无实际价值，因为每次 setUp 都会获取全新对象，无需 cleanup。
+
+5. **`TestEnginesInit` 的双重初始化是设计特性而非缺陷**：它测试的就是 `load_engines()` 本身的行为，因此 setUp 加载的 demo_offline 在方法体中被主动覆盖是预期行为。在路径 B 语义下，方法间不存在注册表层面的状态泄漏——但 `load_engine()` 创建的每一个路径 B 对象都是独立模块，若测试用例数量极多可能有轻微的内存累积影响（实际可忽略）。
 
 ---
 
@@ -160,19 +201,23 @@ engines:
 | `GithubCodeTests` | `@parameterized.expand` 入参 | 4 组 `code_matches` 列表，覆盖多 fragment / 表格 / 纯数字 / 无高亮 | `test_engine_github_code.py` L26-L101 |
 | `GithubCodeTests` | 局部变量 `response.json.return_value` | 完整 GitHub Search API v3 返回结构 | `test_engine_github_code.py` L107-L141 |
 
-### 3.3 引擎模块全局属性（可变状态夹具）
+### 3.3 引擎模块属性（可变状态夹具）
 
-测试代码通过**直接赋值引擎模块属性**来配置解析规则。这些赋值行为本身构成夹具，且无 cleanup：
+测试代码通过**直接赋值引擎模块属性**来配置解析规则。这些赋值行为本身构成夹具。需严格按路径 A/B 区分残留行为：
 
-| 测试方法 | 修改的模块属性 | 所在行 |
-|----------|---------------|--------|
-| `TestXpathEngine.test_request` | `xpath.search_url`、`xpath.categories`、`xpath.paging` | `test_xpath.py` L36-L52 |
-| `TestXpathEngine.test_response` | `xpath.url_xpath`、`xpath.title_xpath`、`xpath.content_xpath`、`xpath.cached_xpath`、`xpath.categories` | `test_xpath.py` L59-L94 |
-| `TestXpathEngine.test_response_results_xpath` | `xpath.results_xpath`、`xpath.url_xpath`、`xpath.title_xpath`、`xpath.content_xpath`、`xpath.cached_xpath`、`xpath.categories` | `test_xpath.py` L98-L136 |
-| `TestJsonEngine.test_request` | `json_engine.search_url`、`json_engine.categories`、`json_engine.paging`、`json_engine.request_body` | `test_json_engine.py` L116-L146 |
-| `TestJsonEngine.test_response` | `json_engine.results_query`、`json_engine.url_query`、`json_engine.url_prefix`、`json_engine.title_query`、`json_engine.content_query`、`json_engine.thumbnail_query`、`json_engine.thumbnail_prefix`、`json_engine.title_html_to_text`、`json_engine.content_html_to_text`、`json_engine.categories` | `test_json_engine.py` L150-L199 |
-| `TestJsonEngine.test_response_results_json` | 同上全部属性 + `json_engine.suggestion_query` | `test_json_engine.py` L203-L254 |
-| `TestCommandEngine` 各方法 | `command_engine.command`、`command_engine.delimiter`、`command_engine.result_separator`、`command_engine.parse_regex`、`command_engine.query_type`、`command_engine.query_enum` | `test_command.py` L13-L218 |
+| 测试方法 | 对象路径 | 修改的模块属性 | 所在行 | 属性残留范围 |
+|----------|---------|---------------|--------|-------------|
+| `TestXpathEngine.test_request` | **A**（sys.modules） | `xpath.search_url`、`xpath.categories`、`xpath.paging` | `test_xpath.py` L36-L52 | **进程级**：至 Python 终止，跨所有类/方法 |
+| `TestXpathEngine.test_response` | **A**（sys.modules） | `xpath.url_xpath`、`xpath.title_xpath`、`xpath.content_xpath`、`xpath.cached_xpath`、`xpath.categories` | `test_xpath.py` L59-L94 | **进程级**：同上 |
+| `TestXpathEngine.test_response_results_xpath` | **A**（sys.modules） | `xpath.results_xpath`、`xpath.url_xpath`、`xpath.title_xpath`、`xpath.content_xpath`、`xpath.cached_xpath`、`xpath.categories` | `test_xpath.py` L98-L136 | **进程级**：同上 |
+| `TestJsonEngine.test_request` | **A**（sys.modules） | `json_engine.search_url`、`json_engine.categories`、`json_engine.paging`、`json_engine.request_body` | `test_json_engine.py` L116-L146 | **进程级**：同上 |
+| `TestJsonEngine.test_response` | **A**（sys.modules） | `json_engine.results_query`、`json_engine.url_query`、`json_engine.url_prefix`、`json_engine.title_query`、`json_engine.content_query`、`json_engine.thumbnail_query`、`json_engine.thumbnail_prefix`、`json_engine.title_html_to_text`、`json_engine.content_html_to_text`、`json_engine.categories` | `test_json_engine.py` L150-L199 | **进程级**：同上 |
+| `TestJsonEngine.test_response_results_json` | **A**（sys.modules） | 同上全部 + `json_engine.suggestion_query` | `test_json_engine.py` L203-L254 | **进程级**：同上 |
+| `TestCommandEngine` 各方法 | **A**（sys.modules） | `command_engine.command`、`command_engine.delimiter`、`command_engine.result_separator`、`command_engine.parse_regex`、`command_engine.query_type`、`command_engine.query_enum` | `test_command.py` L13-L218 | **进程级**：同上 |
+| `TinEyeTests.setUp` 方法内 | **B**（load_module 新副本） | `self.tineye.logger.setLevel` | `test_engine_tineye.py` L22 | **方法级**：仅当前 `self.tineye` 对象，tearDown 后注册表清空，对象可 GC |
+| `GithubCodeTests.setUp` 方法内 | **B**（load_module 新副本） | `self.ghc.logger.setLevel` | `test_engine_github_code.py` L21 | **方法级**：同上 |
+
+**补充说明**：路径 A 类中的属性赋值也**未经过 `update_engine_attributes()`**——例如 `xpath.categories = ['general']` 与实际 YAML 注入的语义不同：YAML 注入时若 `categories` 为字符串会先 `split(',')` 为列表（`searx/engines/__init__.py` L182-L185），而测试直接赋列表绕过了该分支。这些属性由测试代码手动补全，与生产环境中路径 B 的注入结果在语义上等价但到达路径不同。
 
 ---
 
@@ -389,12 +434,16 @@ engines:
 
 2. **为 TinEye 补全结构敏感样例**：当前 `test_crawl_date_parses` 仅覆盖 1 个字段。应将夹具补全为包含 `parse_tineye_match()` 全部 10 个字段（`image_url`/`domain`/`score`/`width`/`height`/`size`/`image_format`/`filesize`/`overlay`/`tags`）以及 `response()` 拼接的 9 个结果字段，并使用类似 `GithubCodeTests.test_transforms_response` 的"完整对象比较"断言方式。
 
-3. **统一使用 `SearxTestCase.setattr4test()`** 替代直接修改引擎模块全局属性。7 个测试类 0 个使用该辅助方法；`TestJsonEngine` 未调用 `super().setUp()` 虽不影响 settings（L1 已完成），但缺失 Flask app 与网络层初始化，若后续代码引入这些依赖会静默出错。建议所有测试类显式调用 `super().setUp()` 并使用 `setattr4test()` 管理模块属性。
+3. **路径 A 类优先迁移至路径 B**：TestXpathEngine、TestJsonEngine、TestCommandEngine 三个高风险类应效仿 TinEyeTests/GithubCodeTests 的模式，改为：① 为每个引擎创建独立的 YAML 夹具（`test_xpath.yml` 等）；② `setUp()` 中从 `searx.engines.engines['engine_name']` 获取对象（路径 B，每次 `load_module()` 新建副本）；③ 使用 `TEST_SETTINGS` 声明引擎实例。这样自动解决属性残留问题和 `update_engine_attributes()` 注入缺失问题。
 
-4. **为 XPath 增补显式断言覆盖 `results_xpath` 结构**：在 `test_response_results_xpath` 中增加 `self.assertEqual(len(results), 2)` 的显式断言（目前仅间接地通过 `results[0]`/`results[1]` 索引访问隐含了这一点），并增加"当 HTML 中结果容器 class 名错误时返回空列表"的负面用例。
+4. **迁移至路径 B 前，先在路径 A 类使用 `setattr4test()`**：路径 A 类的属性残留风险最高，立即将所有 `xpath.foo = ...`、`json_engine.foo = ...`、`command_engine.foo = ...` 赋值替换为 `self.setattr4test(xpath, 'foo', ...)`。`TestJsonEngine` 也应补调用 `super().setUp()`，避免 Flask app/网络层缺失导致未来代码引入依赖时静默出错。
 
-5. **为每个引擎补充 `no_result_for_http_status` 夹具**：这是通用引擎抵御特定 HTTP 错误码的重要功能，当前 XPath、JSON、Command 的测试均未覆盖该分支。
+5. **路径 B 类移除多余的 `tearDown()`，在 setUp 前先 `load_engines([])` 防御性清理**：当前 TinEyeTests/GithubCodeTests 的 `tearDown` 调用 `load_engines([])` 是多余的（下一 setUp 首行就是 `engines.clear()`），但建议在 setUp 中 `super().setUp()` 前额外加一行 `searx.search.load_engines([])` 作为防御性清理——避免 `TestEnginesInit` 等测试类在前一方法替换了全局 `engines` 字典而该类 setUp 依赖注册表为空时出现问题。
 
-6. **为 `command` 引擎补全 `mock.patch('subprocess.Popen')` 版本**：`test_basic_seq_command_engine` 和 `test_working_dir_path_query` 依赖 `seq`、`ls` 等 POSIX 命令，在 Windows 与最小化容器中会失败。应将真实系统命令执行作为可选的集成测试，默认走 Mock 版本。
+6. **为 XPath 增补显式断言覆盖 `results_xpath` 结构**：在 `test_response_results_xpath` 中增加 `self.assertEqual(len(results), 2)` 的显式断言（目前仅间接地通过 `results[0]`/`results[1]` 索引访问隐含了这一点），并增加"当 HTML 中结果容器 class 名错误时返回空列表"的负面用例。
 
-7. **将 GitHub Code 的参数化 + 全对象比较模式推广**：`@parameterized.expand` 的"输入-期望对集中管理"模式与完整对象深层比较的断言方式（`assertEqual(results, expected_results)`）应应用到 XPath、JSON、TinEye 测试中，替代当前散落的 `test_*` 方法和单字段断言。
+7. **为每个引擎补充 `no_result_for_http_status` 夹具**：这是通用引擎抵御特定 HTTP 错误码的重要功能，当前 XPath、JSON、Command 的测试均未覆盖该分支。
+
+8. **为 `command` 引擎补全 `mock.patch('subprocess.Popen')` 版本**：`test_basic_seq_command_engine` 和 `test_working_dir_path_query` 依赖 `seq`、`ls` 等 POSIX 命令，在 Windows 与最小化容器中会失败。应将真实系统命令执行作为可选的集成测试，默认走 Mock 版本。
+
+9. **将 GitHub Code 的参数化 + 全对象比较模式推广**：`@parameterized.expand` 的"输入-期望对集中管理"模式与完整对象深层比较的断言方式（`assertEqual(results, expected_results)`）应应用到 XPath、JSON、TinEye 测试中，替代当前散落的 `test_*` 方法和单字段断言。
