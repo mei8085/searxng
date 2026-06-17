@@ -1,6 +1,6 @@
 # SearXNG 主题切换与静态资源组装、压缩、分发完整脉络
 
-本文档按代码执行顺序，拆解主题枚举定义 → 资源打包工具链 → 静态文件分发中间件的三层协同关系。
+本文档按代码执行顺序，拆解主题枚举定义 → 资源打包工具链 → 静态文件分发中间件的三层协同关系。文中所有代码引用使用**仓库相对路径**（如 `searx/webutils.py#L177-L179`），可在 IDE 中直接点击跳转。
 
 ---
 
@@ -10,7 +10,7 @@
 
 可用主题列表并非硬编码枚举，而是运行时扫描模板目录得到：
 
-**入口函数**：[webutils.py#L177-L179](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webutils.py#L177-L179)
+**入口函数**：[searx/webutils.py#L177-L179](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webutils.py#L177-L179)
 
 ```python
 def get_themes(templates_path):
@@ -18,7 +18,7 @@ def get_themes(templates_path):
     return os.listdir(templates_path)
 ```
 
-在 [webapp.py#L131-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L131-L134) 中于进程启动时一次性扫描：
+在 [searx/webapp.py#L131-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L131-L134) 中于进程启动时一次性扫描：
 
 ```python
 default_theme = settings['ui']['default_theme']
@@ -29,7 +29,7 @@ result_templates = get_result_templates(templates_path)
 
 ### 1.2 系统默认主题与样式枚举
 
-**定义位置**：[settings_defaults.py#L25-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/settings_defaults.py#L25-L26) 与 [settings_defaults.py#L232-L247](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/settings_defaults.py#L232-L247)
+**定义位置**：[searx/settings_defaults.py#L25-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/settings_defaults.py#L25-L26) 与 [searx/settings_defaults.py#L232-L247](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/settings_defaults.py#L232-L247)
 
 ```python
 SIMPLE_STYLE = ('auto', 'light', 'dark', 'black')   # 四种子样式（CSS类切换）
@@ -50,7 +50,7 @@ SCHEMA: dict[str, t.Any] = {
 
 ### 1.3 用户偏好中的主题设置项
 
-**定义位置**：[preferences.py#L451-L469](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/preferences.py#L451-L469)
+**定义位置**：[searx/preferences.py#L451-L469](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/preferences.py#L451-L469)
 
 ```python
 'theme': EnumStringSetting(
@@ -78,16 +78,16 @@ Shell 调用链路（自顶向下）：
 ```
 Makefile themes.all
   → ./manage themes.all
-    → lib_sxng_themes.sh: themes.all()
-      → lib_sxng_vite.sh: vite.simple.build()
+    → utils/lib_sxng_themes.sh: themes.all()
+      → utils/lib_sxng_vite.sh: vite.simple.build()
         → 1. templates.simple.pygments()  [生成pygments.less]
-        → 2. node.env()                  [确保npm依赖]
+        → 2. node.env()                   [确保npm依赖]
         → 3. cd client/simple && npm run build
 ```
 
 **关键脚本**：
-- [lib_sxng_themes.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_themes.sh)
-- [lib_sxng_vite.sh#L32-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_vite.sh#L32-L45)
+- [utils/lib_sxng_themes.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_themes.sh)
+- [utils/lib_sxng_vite.sh#L32-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_vite.sh#L32-L45)
 
 ### 2.2 npm build 两阶段流水线
 
@@ -107,7 +107,7 @@ Makefile themes.all
 
 - 从 `node_modules/ionicons/dist/svg/` 和 `src/svg/ionicons/` 收集 30+ 个 SVG
 - 通过 SVGO 优化（去 namespace、加 aria-hidden、去 title）
-- 调用 [jinja_svg_catalog.ts: jinja_svg_sets()](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/jinja_svg_catalog.ts#L98-L118) 使用 Edge.js 模板引擎
+- 调用 [client/simple/tools/jinja_svg_catalog.ts: jinja_svg_sets()](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/jinja_svg_catalog.ts#L98-L118) 使用 Edge.js 模板引擎
 - 输出：`searx/templates/simple/icons.html`，包含 `icon()` / `icon_small()` / `icon_big()` 三个 Jinja macro
 
 #### 阶段二：build:vite → 编译压缩所有前端资源
@@ -149,9 +149,9 @@ rolldownOptions: {
 }
 ```
 
-##### 2.2.3 JS 动态分包与按需加载
+##### 2.2.3 JS 动态分块与按需加载
 
-主入口 [src/js/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/js/index.ts) 仅 3 行：
+主入口 [client/simple/src/js/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/js/index.ts) 仅 3 行：
 
 ```typescript
 void import.meta.glob(["./*.ts", "./util/**/.ts"], { eager: true });
@@ -170,7 +170,7 @@ void import.meta.glob(["./*.ts", "./util/**/.ts"], { eager: true });
 
 CSS 处理器使用 `lightningcss`，目标浏览器由 `browserslistToTargets()` 转换。
 
-**主题切换的核心 CSS 机制**在 [src/less/definitions.less](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/less/definitions.less)：
+**主题切换的核心 CSS 机制**在 [client/simple/src/less/definitions.less](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/less/definitions.less)：
 
 ```less
 :root { /* 亮色主题变量 ~100 个 CSS custom properties */ }
@@ -192,7 +192,7 @@ CSS 处理器使用 `lightningcss`，目标浏览器由 `browserslistToTargets()
 
 ##### 2.2.5 自定义 Vite 插件（SVG 优化与转码）
 
-[tools/plg.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/plg.ts) 定义两个 `writeBundle` 钩子插件：
+[client/simple/tools/plg.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/plg.ts) 定义两个 `writeBundle` 钩子插件：
 
 - **plg_svg2svg**：用 SVGO 优化 SVG，输出到 `img/` 目录
   - `empty_favicon.svg`、`select-dark.svg`、`select-light.svg`
@@ -227,13 +227,15 @@ searx/static/themes/simple/
 └── manifest.json                  # Vite 生成的资源清单
 ```
 
+**注意**：`npm run build`（Vite 层面）**不会**生成 `.gz` 或 `.br` 旁置文件；这些压缩产物只在容器镜像构建阶段才会产出（详见专题 2）。
+
 ---
 
 ## 第三层：静态文件分发中间件（运行时）
 
 ### 3.1 WhiteNoise 中间件挂载
 
-**位置**：[webapp.py#L1385-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1385-L1401)
+**位置**：[searx/webapp.py#L1385-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1385-L1401)
 
 ```python
 def static_headers(headers: Headers, _path: str, _url: str) -> None:
@@ -252,11 +254,11 @@ app.wsgi_app = WhiteNoise(
 )
 ```
 
-**关键点**：WhiteNoise 接管所有 `/static/*` 请求，绕过 Flask 路由层，直接从磁盘高效发送（支持 gzip/brotli 预压缩文件、HTTP 范围请求、长缓存）。
+**关键点**：WhiteNoise 接管所有 `/static/*` 请求，绕过 Flask 路由层，直接从磁盘高效发送（支持 gzip/brotli 预压缩旁置文件、HTTP 范围请求、长缓存）。
 
 ### 3.2 custom_url_for：主题资源路径重写
 
-**位置**：[webapp.py#L256-L294](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L256-L294)
+**位置**：[searx/webapp.py#L256-L294](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L256-L294)
 
 模板中写 `url_for('static', filename='sxng-core.min.js')` 并不能直接命中磁盘，因为真实路径是 `static/themes/<theme_name>/sxng-core.min.js`。`custom_url_for` 做了两层转发：
 
@@ -280,11 +282,11 @@ def custom_url_for(endpoint: str, **values):
     ...
 ```
 
-**辅助函数** [webutils.py#L182-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webutils.py#L182-L197) 递归列出 `searx/static/` 下所有文件，作为白名单校验。
+**辅助函数** [searx/webutils.py#L182-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webutils.py#L182-L197) 递归列出 `searx/static/` 下所有文件，作为白名单校验。
 
 ### 3.3 模板渲染时的资源注入
 
-**基础模板**：[templates/simple/base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html)
+**基础模板**：[searx/templates/simple/base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html)
 
 #### `<html>` 标签主题 class 绑定（行2）：
 
@@ -314,7 +316,7 @@ def custom_url_for(endpoint: str, **values):
         client_settings="{{ client_settings }}"></script>
 ```
 
-`client_settings` 是一个 Base64 编码的 JSON 对象，包含（见 [webapp.py#L366-L384](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L366-L384)）：
+`client_settings` 是一个 Base64 编码的 JSON 对象，包含（见 [searx/webapp.py#L366-L384](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L366-L384)）：
 
 ```python
 {
@@ -329,7 +331,7 @@ JS 端通过读取当前 `<script>` 标签的 `client_settings` 属性获得运�
 
 ### 3.4 偏好保存与主题切换循环
 
-**完整请求处理链**（`@app.before_request` [webapp.py#L457-L517](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L457-L517)）：
+**完整请求处理链**（`@app.before_request` [searx/webapp.py#L457-L517](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L457-L517)）：
 
 ```
 HTTP 请求到达
@@ -342,7 +344,7 @@ pre_request() 钩子
   ↓
 路由处理函数
   ↓
-render() [webapp.py#L387-L454]
+render() [searx/webapp.py#L387-L454](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L387-L454)
   ├─ get_client_settings() → 打包 theme / theme_static_path 等
   ├─ kwargs['url_for'] = custom_url_for   ← 模板内 url_for 被覆盖
   ├─ kwargs['theme'] = prefs.get_value('theme')
@@ -358,7 +360,7 @@ render() [webapp.py#L387-L454]
   └─ 需要时动态 import() 拉取 chunk/*.min.js
 ```
 
-**偏好保存**：在 `/preferences` POST 提交时（[webapp.py#L871-L878](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L871-L878)）调用 `preferences.save(resp)`，将 `theme` 和 `simple_style` 作为 cookie 写入（`max_age=5年`）。
+**偏好保存**：在 `/preferences` POST 提交时（[searx/webapp.py#L871-L878](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L871-L878)）调用 `preferences.save(resp)`，将 `theme` 和 `simple_style` 作为 cookie 写入（`max_age=5年`）。
 
 ---
 
@@ -368,12 +370,12 @@ render() [webapp.py#L387-L454]
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       【构建时：Build-time】                         │
 │                                                                      │
-│  Makefile → manage → lib_sxng_vite.sh                                │
+│  Makefile → manage → utils/lib_sxng_vite.sh                         │
 │       │                                                              │
 │       ├── Phase 1: node theme_icons.ts                              │
 │       │     └─ ionicons SVG → SVGO → Jinja macros (icons.html)      │
 │       │                                                              │
-│       └── Phase 2: vite build (vite.config.ts)                      │
+│       └── Phase 2: vite build (client/simple/vite.config.ts)        │
 │             ├─ Entry: index.ts → sxng-core.min.js + 9 chunk/*.js    │
 │             ├─ Entry: style-ltr.less → sxng-ltr.min.css             │
 │             │        (内嵌 :root.theme-{auto,light,dark,black})     │
@@ -384,16 +386,23 @@ render() [webapp.py#L387-L454]
 │             └─ manifest.json (资源映射清单)                          │
 │                                                                      │
 │                      ↓ 产物落地到 searx/static/themes/simple/       │
+│                                                                      │
+│  ★ 额外：容器镜像构建阶段（仅 container.build 触发）                 │
+│     container/builder.dockerfile#L28-L33                             │
+│     find searx/static/ -name "*.html/css/js/svg"                    │
+│        -exec gzip -9 -k {} +  → 生成 foo.gz 旁置文件                │
+│        -exec brotli -9 -k {} +  → 生成 foo.br 旁置文件              │
 └──────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       【运行时：Run-time】                           │
 │                                                                      │
-│  进程启动 (webapp.py init)                                           │
+│  进程启动 (searx/webapp.py init)                                     │
 │       ├── get_themes(templates/) → ['simple'] (偏好可用选项)         │
 │       ├── WhiteNoise(root=searx/static/, prefix=static/)             │
-│       │   └─ 静态文件高效分发 + gzip/brotli + 缓存头                 │
+│       │   ├─ 若 foo.js.gz / .br 旁置文件存在 → 优先发送预压缩        │
+│       │   └─ 否则 → 内存动态 gzip，brotli 不支持动态                 │
 │       └── custom_url_for = 覆盖 Jinja 原生 url_for('static')         │
 │                                                                      │
 │  HTTP 请求 → pre_request()                                           │
@@ -441,9 +450,9 @@ render() [webapp.py#L387-L454]
 
 **生成脚本**：[searxng_extra/update/update_pygments.py](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searxng_extra/update/update_pygments.py)
 
-在每次 Vite 构建前，由 `lib_sxng_vite.sh` 的 `templates.simple.pygments()` 提前触发（见 [lib_sxng_vite.sh#L78-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_vite.sh#L78-L86)），输出到 `client/simple/generated/pygments.less`。
+在每次 Vite 构建前，由 `lib_sxng_vite.sh` 的 `templates.simple.pygments()` 提前触发（见 [utils/lib_sxng_vite.sh#L78-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_vite.sh#L78-L86)），输出到 `client/simple/generated/pygments.less`。
 
-生成逻辑在 [update_pygments.py#L59-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searxng_extra/update/update_pygments.py#L59-L73)：
+生成逻辑在 [searxng_extra/update/update_pygments.py#L59-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searxng_extra/update/update_pygments.py#L59-L73)：
 
 ```python
 def generat_css(light_style, dark_style) -> str:
@@ -496,11 +505,11 @@ f.write(generat_css('default', 'monokai'))
 }
 ```
 
-**注意**：代码中**没有**为 `:root.theme-black` 单独定义 `.code-highlight-dark()`；它继承 `definitions.less` 中 `:root.theme-black { .dark-themes(); .black-themes(); }` 的黑色背景变量，语法高亮实际复用 monokai 暗色配色（这是当前实现的一个隐式简化）。
+**注意**：代码中**没有**为 `:root.theme-black` 单独定义 `.code-highlight-dark()`；它继承 [client/simple/src/less/definitions.less#L276-L279](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/less/definitions.less#L276-L279) 中 `:root.theme-black { .dark-themes(); .black-themes(); }` 的黑色背景变量，语法高亮实际复用 monokai 暗色配色（这是当前实现的一个隐式简化）。
 
 #### 运行时：HTML 产生的高亮代码
 
-在 [webapp.py#L165-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L165-L226) 的 `do_highlite` / `_pygments_highlight` 函数中，Pygments 的 `HtmlFormatter(cssclass='code-highlight', …)` 生成带 `<span class="k">`、`<span class="s">` 等 token class 的 HTML 片段，外层包裹 `<div class="code-highlight">`——这个 class 正是上面 CSS 选择器的匹配锚点。
+在 [searx/webapp.py#L165-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L165-L226) 的 `do_highlite` / `_pygments_highlight` 函数中，Pygments 的 `HtmlFormatter(cssclass='code-highlight', …)` 生成带 `<span class="k">`、`<span class="s">` 等 token class 的 HTML 片段，外层包裹 `<div class="code-highlight">`——这个 class 正是上面 CSS 选择器的匹配锚点。
 
 ```
 Pygments HtmlFormatter(cssclass='code-highlight')
@@ -513,24 +522,56 @@ Pygments HtmlFormatter(cssclass='code-highlight')
 
 ---
 
-### 专题 2：资源预压缩（gzip / brotli）的产出时间与责任人
+### 专题 2：资源预压缩（gzip / brotli）的产出时间、责任人与发送链路
 
-**结论**：SearXNG **不做预压缩**。磁盘上没有 `.gz` 或 `.br` 旁置文件（见 `searx/static/themes/simple/` 目录列表，全部是原始 `.js` / `.css` / `.map` / 图片）。压缩完全依赖**运行时动态处理**，责任人是两层：
+**结论修正**：预压缩**确实存在**，但**只发生在容器镜像构建阶段**；本地 `make themes.all` 或 `npm run build` **不**会产出旁置压缩文件。
 
-#### 责任人一：WhiteNoise（HTTP 响应层）
+#### 产出时间与责任人
 
-WhiteNoise 的设计中，若磁盘上存在 `foo.js.gz` / `foo.js.br` 旁置文件，它会优先发送这些预压缩产物；否则根据请求的 `Accept-Encoding` 头**在内存里动态 gzip**。WhiteNoise 并**不内置 brotli 动态压缩**（仅支持 brotli 预压缩文件的发送）。
+完整构建链上有两个独立的"构建"动作，压缩只在后者执行：
 
-SearXNG 配置中没有触发预压缩：
-- Vite `build.rollupOptions.output` 没配置 `vite-plugin-compression` 之类插件
-- Makefile / lib_sxng_vite.sh 中没有对产物跑 `gzip -k` 或 `brotli` 命令
-- `searx/static/themes/simple/` 目录中不存在任何 `.gz` / `.br` 文件
+| 构建动作 | 触发方式 | 产出旁置 .gz/.br | 责任人 |
+|---|---|---|---|
+| `make themes.all` / `./manage themes.all` | 本地开发 | ❌ 不产出 | Vite（ Rolldown + LightningCSS 仅做代码级 minify，不做传输压缩） |
+| `make container.build` / `./manage container.build` | CI / Docker 镜像发布 | ✅ 产出 gzip + brotli | [container/builder.dockerfile#L28-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/container/builder.dockerfile#L28-L33) |
 
-因此实际行为：浏览器若支持 gzip，WhiteNoise 每次命中都动态压缩；若只支持 brotli，则回退到未压缩原始文件（这是当前可优化点）。
+**精确代码位置**（`container/builder.dockerfile` 在 `COPY searx/` 之后执行）：
 
-#### 责任人二：部署反向代理层（通常由运维兜底）
+```dockerfile
+RUN set -eux -o pipefail; \
+    python -m compileall -q -f -j 0 --invalidation-mode=unchecked-hash ./searx/; \
+    find ./searx/static/ -type f \
+    \( -name "*.html" -o -name "*.css" -o -name "*.js" -o -name "*.svg" \) \
+    -exec gzip -9 -k {} + \          # gzip 最高压缩，保留原文件 (-k)
+    -exec brotli -9 -k {} + \        # brotli 最高压缩，保留原文件 (-k)
+    -exec gzip --test {}.gz + \      # 校验 gzip 完整性
+    -exec brotli --test {}.br +; \   # 校验 brotli 完整性
+    touch -c --date="@$TIMESTAMP_SETTINGS" ./searx/settings.yml
+```
 
-在生产部署（uwsgi + nginx）环境下，通常由 nginx 的 `gzip on;` 或 `brotli on;` 在 WhiteNoise 外层再做一次压缩，这一层不在 Python 代码中体现。
+压缩覆盖范围：
+- **文件类型**：`*.html`（模板里也有静态 HTML 片段）、`*.css`、`*.js`、`*.svg`
+- **不覆盖**：PNG（已经是二进制压缩格式，再压收益低）、`.map` sourcemap 文件（白名单未列）
+- **压缩级别**：gzip `-9`（最高）、brotli `-9`（最高质量）
+
+#### 发送链路：WhiteNoise 如何匹配旁置压缩文件
+
+WhiteNoise 的静态文件查找逻辑（由其内部 `WhiteNoiseFileToHeaderAdapter` 实现）：
+
+1. 收到请求 `/static/themes/simple/sxng-core.min.js`
+2. 检查请求头 `Accept-Encoding`
+3. **优先级 1（brotil）**：若磁盘上存在 `searx/static/themes/simple/sxng-core.min.js.br` → 发送 `.br` 文件，设置 `Content-Encoding: br`
+4. **优先级 2（gzip）**：若磁盘上存在 `searx/static/themes/simple/sxng-core.min.js.gz` → 发送 `.gz` 文件，设置 `Content-Encoding: gzip`
+5. **回退**：两者都不存在 → 在内存中做动态 gzip 压缩后发送（WhiteNoise 不支持动态 brotli）
+
+因此：
+- **容器镜像部署（生产）**：旁置文件齐全，WhiteNoise 直接零 CPU 开销发送预压缩产物，同时支持 brotli 和 gzip
+- **本地 / uWSGI 直接部署（无前置 nginx）**：旁置文件缺失，WhiteNoise 走动态 gzip，brotli 请求回退到未压缩原始文件
+- **前置 nginx 部署**：通常由 nginx 的 `gzip on;` / `brotli on;` 在 WSGI 层之外再做一次透明压缩，可能覆盖 WhiteNoise 的选择
+
+#### 容器构建时序（证明压缩一定发生在 Vite 产物之后）
+
+[utils/lib_sxng_container.sh#L120-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/utils/lib_sxng_container.sh#L120-L125) 调用 builder.dockerfile 时传参 `.`（当前仓库根目录）作为 build context，而 builder.dockerfile 第 22 行 `COPY --exclude=./searx/version_frozen.py ./searx/ ./searx/` 会把整个 `searx/` 目录（包括已由 Vite 构建完成的 `searx/static/themes/simple/`）完整复制进镜像。之后第 28-33 行才对复制进来的静态文件执行 `find ... -exec gzip/brotli`，因此**压缩一定发生在 Vite 产物落地之后**。
 
 ---
 
@@ -540,7 +581,7 @@ SearXNG 配置中没有触发预压缩：
 
 #### 步骤 A：HTML 头声明 manifest URL
 
-[templates/simple/base.html#L29](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L29)：
+[searx/templates/simple/base.html#L26-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L26-L29)：
 
 ```html
 <link rel="icon" href="{{ url_for('static', filename='img/favicon.png') }}" sizes="any">
@@ -553,7 +594,7 @@ SearXNG 配置中没有触发预压缩：
 
 #### 步骤 B：Flask 路由根据当前主题选择 PWA 颜色
 
-[webapp.py#L1204-L1214](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1204-L1214)：
+[searx/webapp.py#L1204-L1214](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1204-L1214)：
 
 ```python
 @app.route('/manifest.json', methods=['GET'])
@@ -569,7 +610,7 @@ def manifest():
     return resp
 ```
 
-颜色取值来自 [brand.py#L21-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/brand.py#L21-L29) 的 `ThemeColors`：
+颜色取值来自 [searx/brand.py#L21-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/brand.py#L21-L29) 的 `ThemeColors`：
 
 ```python
 class ThemeColors(msgspec.Struct, kw_only=True):
@@ -583,16 +624,16 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 
 #### 步骤 C：Jinja 模板渲染真正的 Web App Manifest
 
-[templates/simple/manifest.json](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/manifest.json)：
+[searx/templates/simple/manifest.json](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/manifest.json)：
 
 ```json
 {
   "name": "{{ instance_name }}",
   "short_name": "{{ instance_name }}",
   "icons": [
-    { "src": "{{ url_for('static', filename='img/favicon.svg', _external=True) }}", "sizes": "any", "type": "image/svg+xml" },
-    { "src": "{{ url_for('static', filename='img/192.png', _external=True) }}",            "sizes": "192x192", "type": "image/png" },
-    { "src": "{{ url_for('static', filename='img/512.png', _external=True) }}",            "sizes": "512x512", "type": "image/png" }
+    { "src": "{{ url_for('static', filename='img/favicon.svg', _external=True) }}", "sizes": "any",       "type": "image/svg+xml" },
+    { "src": "{{ url_for('static', filename='img/192.png', _external=True) }}",     "sizes": "192x192",   "type": "image/png" },
+    { "src": "{{ url_for('static', filename='img/512.png', _external=True) }}",     "sizes": "512x512",   "type": "image/png" }
   ],
   "start_url": "{{ url_for('index') }}",
   "theme_color": "{{ theme_color }}",
@@ -603,16 +644,62 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 
 `_external=True` 确保图标 URL 带完整主机名，符合 W3C Web App Manifest 规范要求（桌面安装 PWA 时，浏览器会按 `src` 分别下载三个尺寸图标缓存到操作系统）。
 
-#### 图标来源：构建时 SVG→PNG 光栅化
+#### 图标来源：SVG→PNG 精确映射
 
-三个 PNG 图标并非手工作坊产物，而是由 [client/simple/tools/plg.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/plg.ts) 的 `plg_svg2png` 插件在 Vite `writeBundle` 阶段用 Sharp 从 `searxng.svg` 自动生成：
+manifest 中的三个图标对应的源图、生成路径、输出尺寸的精确关系如下：
+
+| manifest 声明 | 磁盘目标文件 | 源 SVG 文件 | 生成方式 | 输出尺寸 |
+|---|---|---|---|---|
+| `img/favicon.svg`（sizes=any） | `searx/static/themes/simple/img/favicon.svg` | `client/simple/src/brand/searxng-wordmark.svg` | Vite `plg_svg2svg`（SVGO 优化） | 矢量 |
+| `img/192.png`（192×192） | `searx/static/themes/simple/img/192.png` | `client/simple/src/brand/searxng-wordmark.svg` | Vite `plg_svg2png`（Sharp 光栅化） | 192 × 192 px |
+| `img/512.png`（512×512） | `searx/static/themes/simple/img/512.png` | `client/simple/src/brand/searxng-wordmark.svg` | Vite `plg_svg2png`（Sharp 光栅化） | 512 × 512 px |
+
+**精确代码证据**（[client/simple/vite.config.ts#L124-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/vite.config.ts#L124-L181)）：
 
 ```typescript
-{
-  source: "searxng.svg", target: ["192.png", "512.png"],
-  scale: [1.6, 1.6]
-}
+// favicon.png 和 searxng.png（默认尺寸，不指定 width/height）
+plg_svg2png([
+  { src: `${PATH.brand}/searxng-wordmark.svg`, dest: `${PATH.dist}/img/favicon.png` },
+  { src: `${PATH.brand}/searxng.svg`,          dest: `${PATH.dist}/img/searxng.png`   }
+]),
+
+// ★ PWA 192 图标：显式指定 192×192，源图是 searxng-wordmark.svg
+plg_svg2png(
+  [ { src: `${PATH.brand}/searxng-wordmark.svg`, dest: `${PATH.dist}/img/192.png` } ],
+  192, 192
+),
+
+// ★ PWA 512 图标：显式指定 512×512，源图也是 searxng-wordmark.svg
+plg_svg2png(
+  [ { src: `${PATH.brand}/searxng-wordmark.svg`, dest: `${PATH.dist}/img/512.png` } ],
+  512, 512
+),
+
+// favicon.svg：SVGO 优化 searxng-wordmark.svg → favicon.svg
+plg_svg2svg(
+  [ { src: `${PATH.brand}/searxng-wordmark.svg`, dest: `${PATH.dist}/img/favicon.svg` } ],
+  svg2svg_favicon_opts
+),
 ```
+
+**尺寸实现原理**（[client/simple/tools/img.ts#L24-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/tools/img.ts#L24-L45)）：
+
+```typescript
+export const svg2png = (items: Src2Dest[], width?: number, height?: number): void => {
+  for (const item of items) {
+    sharp(item.src)
+      .png({ force: true, compressionLevel: 9, palette: true })
+      .resize(width, height, { fit: "contain" })  // contain 模式按比例缩放不裁剪
+      .toFile(item.dest)
+  }
+};
+```
+
+- `192.png`：`sharp.resize(192, 192, { fit: "contain" })` → 保证最长边 192px，按比例缩放
+- `512.png`：`sharp.resize(512, 512, { fit: "contain" })` → 保证最长边 512px，按比例缩放
+- 不指定 `width`/`height` 的（如 `favicon.png`）：按 SVG 原始视口尺寸输出
+
+**结论纠正**：之前错误地认为 PWA 图标来自 `searxng.svg`。实际源图**统一**是 `searxng-wordmark.svg`（带文字 wordmark 的完整 Logo），尺寸通过 Sharp `resize` 精确控制为 192×192 与 512×512；`searxng.svg` 只用于生成 `searxng.png`（独立于 PWA 图标的另一产物）。
 
 ---
 
@@ -620,7 +707,7 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 
 #### 定义：`icon()` / `icon_small()` / `icon_big()`
 
-构建时产物 [templates/simple/icons.html#L45-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/icons.html#L45-L55)：
+构建时产物 [searx/templates/simple/icons.html#L45-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/icons.html#L45-L55)：
 
 ```jinja
 {% macro icon(action, alt) -%}
@@ -636,31 +723,31 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 {%- endmacro %}
 ```
 
-三个 macro 的差异仅在于注入不同 CSS class（尺寸由 `style.less#L30-L48` 定义：`icon_small` 1rem、`icon_big` 1.5rem）。
+三个 macro 的差异仅在于注入不同 CSS class（尺寸由 [client/simple/src/less/style.less#L30-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/src/less/style.less#L30-L48) 定义：`icon_small` 1rem、`icon_big` 1.5rem）。
 
 #### 被 include 方式
 
-在 [templates/simple/base.html](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html) 顶部通过 `{% from 'simple/icons.html' import icon, icon_small, icon_big without context %}` 导入（其它子模板也会各自 import）。
+在各模板顶部通过 `{% from 'simple/icons.html' import icon, icon_small, icon_big without context %}` 导入。
 
 #### 各模板调用位置汇总
 
 | 模板文件 | 调用语句 | 用途 |
 |---|---|---|
-| [simple_search.html#L6-L7](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/simple_search.html#L6-L7) | `icon_big('close')` / `icon_big('search')` | 搜索框清除和提交按钮 |
-| [search.html#L10-L11](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/search.html#L10-L11) | `icon_big('close')` / `icon_big('search')` | 同上（完整版搜索页） |
-| [base.html#L47-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L47-L58) | `icon_big('information-circle')` / `icon_big('heart')` / `icon_big('settings')` | 页顶 About / Donate / Preferences 链接 |
-| [categories.html#L25-L34](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/categories.html#L25-L34) | `icon_big(category_icons[category])` / fallback `icon_big('globe')` | 每个分类标签的图标 |
-| [results.html#L73-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/results.html#L73-L109) | `icon_small('navigate-up')` / `icon_small('navigate-left')` / `icon_small('navigate-right')` | 返回顶部、翻页按钮 |
-| [stats.html#L9](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/stats.html#L9) | `icon_big('navigate-down')` | 统计列排序 |
-| [preferences.html#L24-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/preferences.html#L24-L130) | `icon_small('alert')` / `icon_big('alert')` / `icon_big('exclamation-sign')` | 警告提示图标 |
-| [preferences/engines.html#L59](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/preferences/engines.html#L59) | `icon_big('alert', 'No HTTPS')` | 引擎没有 HTTPS 的警告 |
-| [macros.html#L51](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/macros.html#L51) | `icon_small('ellipsis-vertical')` | 结果缓存链接前的菜单图标 |
-| [result_templates/default.html#L6](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/default.html#L6) | `icon_small('play')` | 显示媒体折叠按钮 |
-| [result_templates/images.html#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/images.html#L36-L38) | `icon('close')` / `icon('navigate-left')` / `icon('navigate-right')` | 图片详情模态框控件 |
-| [result_templates/videos.html#L6](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/videos.html#L6) | `icon_small('film')` | 显示视频折叠按钮 |
-| [result_templates/map.html#L43](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/map.html#L43) | `icon_small('globe')` | 显示地图折叠按钮 |
-| [result_templates/torrent.html#L7-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/torrent.html#L7-L19) | `icon_big('magnet')` / `icon_big('download-alt')` / `icon_big('seeder')` / `icon_big('leecher')` / `icon_big('save')` / `icon_big('file')` | 种子资源元数据 |
-| [messages/no_cookies.html#L3](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/messages/no_cookies.html#L3) | `icon('info-sign')` | Cookie 禁用提示 |
+| [searx/templates/simple/simple_search.html#L6-L7](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/simple_search.html#L6-L7) | `icon_big('close')` / `icon_big('search')` | 搜索框清除和提交按钮 |
+| [searx/templates/simple/search.html#L10-L11](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/search.html#L10-L11) | `icon_big('close')` / `icon_big('search')` | 同上（完整版搜索页） |
+| [searx/templates/simple/base.html#L47-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L47-L58) | `icon_big('information-circle')` / `icon_big('heart')` / `icon_big('settings')` | 页顶 About / Donate / Preferences 链接 |
+| [searx/templates/simple/categories.html#L25-L34](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/categories.html#L25-L34) | `icon_big(category_icons[category])` / fallback `icon_big('globe')` | 每个分类标签的图标 |
+| [searx/templates/simple/results.html#L73-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/results.html#L73-L109) | `icon_small('navigate-up')` / `icon_small('navigate-left')` / `icon_small('navigate-right')` | 返回顶部、翻页按钮 |
+| [searx/templates/simple/stats.html#L9](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/stats.html#L9) | `icon_big('navigate-down')` | 统计列排序 |
+| [searx/templates/simple/preferences.html#L24-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/preferences.html#L24-L130) | `icon_small('alert')` / `icon_big('alert')` / `icon_big('exclamation-sign')` | 警告提示图标 |
+| [searx/templates/simple/preferences/engines.html#L59](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/preferences/engines.html#L59) | `icon_big('alert', 'No HTTPS')` | 引擎没有 HTTPS 的警告 |
+| [searx/templates/simple/macros.html#L51](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/macros.html#L51) | `icon_small('ellipsis-vertical')` | 结果缓存链接前的菜单图标 |
+| [searx/templates/simple/result_templates/default.html#L6](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/default.html#L6) | `icon_small('play')` | 显示媒体折叠按钮 |
+| [searx/templates/simple/result_templates/images.html#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/images.html#L36-L38) | `icon('close')` / `icon('navigate-left')` / `icon('navigate-right')` | 图片详情模态框控件 |
+| [searx/templates/simple/result_templates/videos.html#L6](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/videos.html#L6) | `icon_small('film')` | 显示视频折叠按钮 |
+| [searx/templates/simple/result_templates/map.html#L43](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/map.html#L43) | `icon_small('globe')` | 显示地图折叠按钮 |
+| [searx/templates/simple/result_templates/torrent.html#L7-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/result_templates/torrent.html#L7-L19) | `icon_big('magnet')` / `icon_big('seeder')` / `icon_big('leecher')` / `icon_big('save')` 等 | 种子资源元数据 |
+| [searx/templates/simple/messages/no_cookies.html#L3](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/messages/no_cookies.html#L3) | `icon('info-sign')` | Cookie 禁用提示 |
 
 ---
 
@@ -668,10 +755,10 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 
 #### 代码层面的事实依据
 
-- **挂载方式**：在 WSGI 层包装 Flask 应用 [webapp.py#L1393-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1393-L1401)
+- **挂载方式**：在 WSGI 层包装 Flask 应用 [searx/webapp.py#L1393-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L1393-L1401)
 - **自定义头**：`Cache-Control: public, max-age=30, stale-while-revalidate=60` + 配置里的 HTTP 安全头
-- **不支持多主题前缀**：主题目录层级需要 `custom_url_for` 在应用层拼路径（见 [webapp.py#L256-L294](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L256-L294)）
-- **预压缩缺失**：当前仓库无构建期压缩脚本，WhiteNoise 只能走动态 gzip
+- **不支持多主题前缀**：主题目录层级需要 `custom_url_for` 在应用层拼路径（见 [searx/webapp.py#L256-L294](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/webapp.py#L256-L294)）
+- **压缩发送策略**：若有旁置 `.gz` / `.br` 则优先直接发送（容器镜像部署时有）；否则动态 gzip；不支持动态 brotli
 
 #### 利（优点）
 
@@ -679,13 +766,14 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 2. **请求链最短**：在 WSGI 层就完成响应，不经过 Flask 的路由匹配、请求上下文构建、before_request 钩子链，开销远低于用 `@app.route('/static/<path>')` 手写分发。
 3. **自动 Range 请求、ETag、304**：内置 `If-Modified-Since` / `If-None-Match` 条件判断和 HTTP 断点续传，无需开发者重复实现。
 4. **与 Flask 生命周期融合**：`add_headers_function` 钩子可统一注入 CSP、Referrer-Policy 等安全头，保持静态与动态响应一致的安全策略。
+5. **旁置压缩零开销发送**：配合 `container/builder.dockerfile#L28-L33` 预压缩产物，容器内部署时 WhiteNoise 直接 sendfile 发送 `.gz` / `.br`，CPU 零消耗。
 
 #### 弊（缺点）
 
 1. **仍比纯文件服务器慢**：无论怎么优化，WSGI 中间件相比 nginx 的 sendfile() 零拷贝仍有 2~5 倍延迟差距，大文件（图片、sourcemap）上差距更明显。高并发生产部署通常会前置 nginx 绕过 WhiteNoise。
-2. **预压缩支持有短板**：WhiteNoise 只发送旁置 `.gz` / `.br`，自身不产出预压缩文件。当前 SearXNG 没配合产出，实际命中的是动态 gzip（CPU 开销），brotli 用户根本拿不到压缩。
+2. **预压缩依赖外部构建链**：WhiteNoise 自身不产出旁置压缩文件，必须依赖容器构建阶段的 `find ... -exec gzip/brotli`。本地开发、裸机部署时若没有前置 nginx，就只能走动态 gzip（CPU 开销），brotli 用户根本拿不到压缩。
 3. **多主题目录无原生支持**：WhiteNoise 的 `root` / `prefix` 是扁平一维结构。多主题架构下需要应用层 `custom_url_for` 重写路径；如果未来有独立静态 CDN，CDN 侧也得同步这套路径映射规则。
-4. **max-age=30 过短**：构建产物文件名带 hash（`sxng-core.min.js` 当前未带，但 chunk 已带 hash），理论上可设 1 年缓存。当前 30 秒的短缓存是保守选择，错失了内容寻址资源的最佳缓存实践。
+4. **max-age=30 过短**：构建产物文件名带 hash（chunk 已带 hash），理论上可设 1 年缓存。当前 30 秒的短缓存是保守选择，错失了内容寻址资源的最佳缓存实践。
 
 ---
 
@@ -693,7 +781,7 @@ class ThemeColors(msgspec.Struct, kw_only=True):
 
 #### 代码层面的事实依据
 
-Vite 配置的 `rolldownOptions.input` 包含四个入口（[vite.config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/vite.config.ts)）：
+Vite 配置的 `rolldownOptions.input` 包含四个入口（[client/simple/vite.config.ts#L48-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/client/simple/vite.config.ts#L48-L56)）：
 
 ```typescript
 input: {
@@ -704,7 +792,7 @@ input: {
 }
 ```
 
-其中 RTL 与 LTR 是互斥加载（由模板 `{% if rtl %}` 分支判断，见 [base.html#L15-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L15-L19)）；`rss.less` 独立服务 RSS 页面，不被搜索结果页引用。
+其中 RTL 与 LTR 是互斥加载（由模板 `{% if rtl %}` 分支判断，见 [searx/templates/simple/base.html#L15-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/8-searxng/searx/templates/simple/base.html#L15-L19)）；`rss.less` 独立服务 RSS 页面，不被搜索结果页引用。
 
 #### 利（优点）
 
