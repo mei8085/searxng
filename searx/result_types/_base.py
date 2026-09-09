@@ -34,6 +34,215 @@ from searx import logger as log
 WHITESPACE_REGEX = re.compile('( |\t|\n)+', re.M | re.U)
 UNSET = object()
 
+# Query parameters that do not identify the resource and are commonly added by
+# analytics / link-tracking systems.  Only parameters whose meaning is
+# unambiguous are listed here in order not to merge different resources.
+TRACKING_QUERY_PARAMS = frozenset(
+    [
+        # Google Analytics / generic Urchin Tracking Module
+        "utm_id",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_cid",
+        "utm_name",
+        "utm_referrer",
+        "utm_social",
+        "utm_social-type",
+        # Matomo
+        "mtm_cid",
+        "mtm_keyword",
+        "mtm_source",
+        "mtm_medium",
+        "mtm_campaign",
+        "mtm_content",
+        "mtm_group",
+        "mtm_placement",
+        "pk_campaign",
+        "pk_kwd",
+        "pk_keyword",
+        # ad / social click identifiers
+        "gclid",
+        "gclsrc",
+        "dclid",
+        "fbclid",
+        "msclkid",
+        "yclid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "_hsenc",
+        "_hsmi",
+        "vero_conv",
+        "vero_id",
+        "ref",
+        "referrer",
+        "spm",
+    ]
+)
+
+# default ports that do not need to be part of the identity of an URL
+_DEFAULT_PORTS: dict[str, int] = {
+    "http": 80,
+    "https": 443,
+    "ftp": 21,
+    "ws": 80,
+    "wss": 443,
+}
+
+# percent-encodings of characters that RFC 3986 classifies as "unreserved"
+# (ALPHA / DIGIT / "-" / "." / "_" / "~") and therefore never need encoding
+_PERCENT_UNRESERVED: dict[str, str] = {
+    f"{i:02x}": c
+    for i in range(256)
+    for c in (chr(i),)
+    if c.isascii() and (c.isalnum() or c in "-._~")
+}
+_PERCENT_UNRESERVED.update({k.upper(): v for k, v in _PERCENT_UNRESERVED.items()})
+
+
+def _is_tracking_query_param(name: str) -> bool:
+    return name in TRACKING_QUERY_PARAMS or name.startswith("utm_")
+
+
+def _normalize_percent_encoding(value: str) -> str:
+    """Upper-case percent escapes and decode percent-encodings of unreserved
+    characters (RFC 3986, section 2.3).  Any other encoding is left untouched,
+    even when it looks redundant, because decoding a reserved character can
+    change the semantics of the URL."""
+
+    if "%" not in value:
+        return value
+    parts = value.split("%")
+    out = [parts[0]]
+    for part in parts[1:]:
+        if len(part) >= 2:
+            decoded = _PERCENT_UNRESERVED.get(part[:2])
+            if decoded is not None:
+                out.append(decoded + part[2:])
+            else:
+                # upper-case the hex digits, keep the encoded byte
+                out.append("%" + part[:2].upper() + part[2:])
+        else:
+            out.append("%" + part)
+    return "".join(out)
+
+
+def _remove_dot_segments(path: str) -> str:
+    """RFC 3986, section 5.2.4 remove_dot_segments algorithm."""
+
+    inp = path
+    out: list[str] = []
+    while inp:
+        if inp.startswith("../"):
+            inp = inp[3:]
+        elif inp.startswith("./"):
+            inp = inp[2:]
+        elif inp.startswith("/./"):
+            inp = "/" + inp[3:]
+        elif inp == "/.":
+            inp = "/"
+        elif inp.startswith("/../"):
+            inp = "/" + inp[4:]
+            if out:
+                out.pop()
+        elif inp == "/..":
+            inp = "/"
+            if out:
+                out.pop()
+        elif inp in (".", ".."):
+            inp = ""
+        else:
+            # move the first path segment (including a leading slash) to out
+            if inp.startswith("/"):
+                idx = inp.find("/", 1)
+                seg, inp = (inp, "") if idx == -1 else (inp[:idx], inp[idx:])
+            else:
+                idx = inp.find("/")
+                seg, inp = (inp, "") if idx == -1 else (inp[:idx], inp[idx:])
+            out.append(seg)
+    return "".join(out)
+
+
+def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
+    """Build a conservative identity key for an URL.
+
+    Results whose URL differs only in the normalized spelling are considered
+    duplicates.  The normalization is deliberately conservative to avoid
+    merging different resources:
+
+    - ``http`` and ``https`` share one identity (the merge prefers the
+      original HTTPS URL for display), other schemes are compared literally;
+    - host names are lower-cased, a trailing dot is stripped and IDN names
+      are compared by their ASCII (IDNA) form;
+    - the default port of a scheme is ignored;
+    - percent-encoding is harmonized (upper-case hex, unreserved characters
+      decoded) and ``.`` / ``..`` path segments are resolved;
+    - query parameters are sorted (their order is ignored, including that
+      of repeated parameters) and well-known tracking parameters
+      (``utm_*`` and click identifiers) are ignored.
+
+    Values that are not safe to normalize across the board (``www.``
+    prefixes, trailing slashes on non-empty paths, fragments) are kept
+    as-is.  The function never modifies the passed URL.
+    """
+
+    scheme = (parsed_url.scheme or "http").lower()
+    try:
+        hostname = parsed_url.hostname or ""
+        port = parsed_url.port
+    except ValueError:
+        # malformed netloc (e.g. invalid port): fall back to the raw values
+        # and only compare the scheme case-insensitively
+        return (
+            "https" if scheme in ("http", "https") else scheme,
+            parsed_url.netloc,
+            parsed_url.path,
+            parsed_url.params,
+            parsed_url.query,
+            parsed_url.fragment,
+        )
+
+    hostname = hostname.rstrip(".")
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass  # keep the (already ASCII) host name if IDNA encoding fails
+
+    # userinfo (user:pass@) is part of the resource authority
+    userinfo = ""
+    netloc = parsed_url.netloc
+    if "@" in netloc:
+        userinfo = netloc.rsplit("@", 1)[0]
+
+    netloc_key = hostname
+    if userinfo:
+        netloc_key = f"{userinfo}@{netloc_key}"
+    if port is not None and port != _DEFAULT_PORTS.get(scheme):
+        netloc_key = f"{netloc_key}:{port}"
+
+    path = _normalize_percent_encoding(_remove_dot_segments(parsed_url.path))
+    if parsed_url.netloc and path == "":
+        # RFC 3986: an empty path is equivalent to "/" in an URI with authority
+        path = "/"
+
+    query_pairs = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+    query_pairs = [(k, v) for k, v in query_pairs if not _is_tracking_query_param(k)]
+    query = urllib.parse.urlencode(sorted(query_pairs), doseq=True)
+
+    fragment = _normalize_percent_encoding(parsed_url.fragment)
+
+    return (
+        "https" if scheme in ("http", "https") else scheme,
+        netloc_key,
+        path,
+        parsed_url.params,
+        query,
+        fragment,
+    )
+
 
 def _normalize_url_fields(result: "Result | LegacyResult"):
 
@@ -404,18 +613,15 @@ class MainResult(Result):  # pylint: disable=missing-class-docstring
 
     def __hash__(self) -> int:
         """Ordinary url-results are equal if their values for
-        :py:obj:`Result.template`, :py:obj:`Result.parsed_url` (without scheme)
-        and :py:obj:`MainResult.img_src` are equal.
+        :py:obj:`Result.template`, their canonical URL identity (see
+        :py:func:`_url_identity_key`, built from
+        :py:obj:`Result.parsed_url`) and :py:obj:`MainResult.img_src` are
+        equal.
         """
         if not self.parsed_url:
             raise ValueError(f"missing a value in field 'parsed_url': {self}")
 
-        url = self.parsed_url
-        return hash(
-            f"{self.template}"
-            + f"|{url.netloc}|{url.path}|{url.params}|{url.query}|{url.fragment}"
-            + f"|{self.img_src}"
-        )
+        return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
 
     def normalize_result_fields(self):
         super().normalize_result_fields()
@@ -531,18 +737,14 @@ class LegacyResult(dict[str, t.Any]):
 
         if not any(cls in self for cls in ["suggestion", "correction", "infobox", "number_of_results", "engine_data"]):
             # Ordinary url-results are equal if their values for template,
-            # parsed_url (without schema) and img_src` are equal.
+            # the canonical URL identity (`_url_identity_key`, ignoring
+            # cosmetic spelling differences) and `img_src` are equal.
 
             # Code copied from with MainResult.__hash__:
             if not self.parsed_url:
                 raise ValueError(f"missing a value in field 'parsed_url': {self}")
 
-            url = self.parsed_url
-            return hash(
-                f"{self.template}"
-                + f"|{url.netloc}|{url.path}|{url.params}|{url.query}|{url.fragment}"
-                + f"|{self.img_src}"
-            )
+            return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
 
         return id(self)
 
