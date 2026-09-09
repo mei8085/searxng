@@ -216,7 +216,10 @@ def _query_identity(query: str) -> tuple:
     - a bare parameter name (``a``) is different from an empty value
       (``a=``);
     - equivalent percent-encodings of the same bytes are merged;
-    - ``&`` and ``;`` are both accepted as parameter separators;
+    - only ``&`` separates parameters: a ``;`` is part of the value
+      (``a=1;b=2`` is one parameter with the value ``1;b=2`` and must not
+      be split into ``a`` and ``b``; the W3C deprecated ``;`` as a query
+      separator in 2014);
     - well-known tracking parameters are ignored (matched
       case-insensitively);
     - a query that contains only tracking parameters has the same identity
@@ -228,9 +231,9 @@ def _query_identity(query: str) -> tuple:
 
     single: dict[str, str | None] = {}
     repeated: dict[str, list[str | None]] = {}
-    for piece in re.split(r"[&;]", query):
+    for piece in query.split("&"):
         if piece == "":
-            # a trailing/duplicate separator carries no content
+            # a trailing/duplicate "&" carries no content
             continue
         if "=" in piece:
             name, value = piece.split("=", 1)
@@ -271,13 +274,13 @@ def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
     - the default port of a scheme is ignored;
     - percent-encoding is harmonized (upper-case hex, unreserved characters
       decoded) and ``.`` / ``..`` path segments are resolved;
-    - single-occurrence query parameters are order-insensitive (``&`` and
-      ``;`` both separate parameters); the order of values of a repeated
-      parameter name is preserved (see :py:func:`_query_identity`),
-      equivalent percent-encodings are merged and well-known tracking
-      parameters (``utm_*`` and click identifiers, matched
-      case-insensitively) are ignored -- a tracking-only query has the
-      same identity as no query;
+    - single-occurrence query parameters are order-insensitive (only ``&``
+      separates parameters, a ``;`` is part of the value); the order of
+      values of a repeated parameter name is preserved (see
+      :py:func:`_query_identity`), equivalent percent-encodings are merged
+      and well-known tracking parameters (``utm_*`` and click identifiers,
+      matched case-insensitively) are ignored -- a tracking-only query has
+      the same identity as no query;
     - a literal ``+`` is never treated as an encoded space, so ``a+b`` and
       ``a%2Bb`` keep different query values.
 

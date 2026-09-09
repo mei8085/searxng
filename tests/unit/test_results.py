@@ -117,13 +117,21 @@ class URLIdentityKeyTestCase(SearxTestCase):
     def test_tracking_parameter_match_is_case_insensitive(self):
         self.assertSameIdentity("https://example.org/p?id=7&UTM_SOURCE=x", "https://example.org/p?id=7")
 
-    def test_semicolon_is_a_parameter_separator(self):
-        self.assertSameIdentity(
+    def test_semicolon_in_query_value_is_content(self):
+        # the W3C deprecated ";" as a query separator in 2014; it must be
+        # treated as part of the value so different content is not merged
+        self.assertDifferentIdentity(
+            "https://example.org/p?a=1;b=2", "https://example.org/p?a=1&b=2"
+        )
+        self.assertDifferentIdentity(
             "https://example.org/p?id=7;utm_source=x", "https://example.org/p?id=7"
         )
-        # but content separated by ";" is still content
         self.assertDifferentIdentity(
-            "https://example.org/p?id=7", "https://example.org/p?id=8;utm_source=x"
+            "https://example.org/p?a=1;b=2", "https://example.org/p?a=1;b=3"
+        )
+        # an identical spelling with a semicolon is of course equivalent
+        self.assertSameIdentity(
+            "https://example.org/p?a=1;b=2&z=0", "https://example.org/p?z=0&a=1;b=2"
         )
 
     def test_generic_ref_parameters_are_significant(self):
@@ -303,10 +311,16 @@ class ResultContainerTestCase(SearxTestCase):
     def test_merge_tracking_only_query_against_no_query(self):
         self._assert_merged("https://example.org/page", "https://example.org/page?gclid=abc")
 
-    def test_merge_semicolon_separated_tracking_parameter(self):
-        self._assert_merged(
+    def test_no_merge_semicolon_in_query_value(self):
+        # a ";" is part of the value and must not be read as a separator
+        # hiding a tracking parameter
+        self._assert_not_merged(
             "https://example.org/p?id=7",
             "https://example.org/p?id=7;utm_source=newsletter",
+        )
+        self._assert_not_merged(
+            "https://example.org/p?a=1&b=2",
+            "https://example.org/p?a=1;b=2",
         )
 
     def test_non_default_template_keeps_raw_url_identity(self):
