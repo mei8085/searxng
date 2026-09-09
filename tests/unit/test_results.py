@@ -105,6 +105,36 @@ class URLIdentityKeyTestCase(SearxTestCase):
             "https://example.org/p?fbclid=abc&gclid=xyz&id=7", "https://example.org/p?id=7"
         )
 
+    def test_tracking_only_query_equals_no_query(self):
+        # a page URL that only carries tracking parameters is the same page
+        # as the one without any query string
+        self.assertSameIdentity("https://example.org/p?utm_source=x", "https://example.org/p")
+        self.assertSameIdentity("https://example.org/p?gclid=A", "https://example.org/p?gclid=B")
+        self.assertSameIdentity(
+            "https://example.org/p?id=7&gbraid=1&twclid=2", "https://example.org/p?id=7"
+        )
+
+    def test_tracking_parameter_match_is_case_insensitive(self):
+        self.assertSameIdentity("https://example.org/p?id=7&UTM_SOURCE=x", "https://example.org/p?id=7")
+
+    def test_semicolon_is_a_parameter_separator(self):
+        self.assertSameIdentity(
+            "https://example.org/p?id=7;utm_source=x", "https://example.org/p?id=7"
+        )
+        # but content separated by ";" is still content
+        self.assertDifferentIdentity(
+            "https://example.org/p?id=7", "https://example.org/p?id=8;utm_source=x"
+        )
+
+    def test_generic_ref_parameters_are_significant(self):
+        # "ref" / "referrer" are generic names that carry content on some
+        # sites; different values must not be merged away
+        self.assertDifferentIdentity("https://example.org/p?ref=homepage", "https://example.org/p")
+        self.assertDifferentIdentity("https://example.org/p?ref=a", "https://example.org/p?ref=b")
+        self.assertDifferentIdentity("https://example.org/p?referrer=x", "https://example.org/p")
+        # unambiguous vendor-specific tracking tokens are still ignored
+        self.assertSameIdentity("https://example.org/p?spm=a.b.c", "https://example.org/p")
+
     def test_meaningful_query_parameters_are_significant(self):
         self.assertDifferentIdentity("https://example.org/p?a=1", "https://example.org/p?a=2")
         self.assertDifferentIdentity("https://example.org/p?a=1", "https://example.org/p?b=1")
@@ -259,6 +289,26 @@ class ResultContainerTestCase(SearxTestCase):
     def test_no_merge_plus_and_percent_2b(self):
         self._assert_not_merged("https://example.org/p?q=a+b", "https://example.org/p?q=a%2Bb")
 
+    def test_no_merge_different_generic_ref_values(self):
+        self._assert_not_merged("https://example.org/p?ref=a", "https://example.org/p?ref=b")
+        self._assert_not_merged("https://example.org/p?ref=home", "https://example.org/p")
+
+    def test_merge_tracking_only_differences(self):
+        res = self._assert_merged(
+            "https://example.org/p?id=7",
+            "https://example.org/p?id=7&UTM_SOURCE=news&gbraid=123",
+        )
+        self.assertEqual(set(res.engines), {"google", "duckduckgo"})
+
+    def test_merge_tracking_only_query_against_no_query(self):
+        self._assert_merged("https://example.org/page", "https://example.org/page?gclid=abc")
+
+    def test_merge_semicolon_separated_tracking_parameter(self):
+        self._assert_merged(
+            "https://example.org/p?id=7",
+            "https://example.org/p?id=7;utm_source=newsletter",
+        )
+
     def test_non_default_template_keeps_raw_url_identity(self):
         # file results only merge on literally identical URL spellings; a
         # different query parameter order must stay two results
@@ -304,6 +354,39 @@ class ResultContainerTestCase(SearxTestCase):
         self.assertEqual(len(result_list), 1)
         self.assertEqual(result_list[0].url, "https://example.org/f.pdf")
         self.assertEqual(set(result_list[0].engines), {"google", "duckduckgo"})
+
+    def test_file_merge_prefers_ftps_scheme(self):
+        # legacy behavior: on an ftp/ftps match the secure scheme wins by
+        # upgrading the scheme of the original (ftp) URL
+        container = ResultContainer()
+        container.extend(
+            "google",
+            [File(url="ftp://example.org/pub/f.tar.gz", title="f", filename="f.tar.gz")],
+        )
+        container.extend(
+            "duckduckgo",
+            [File(url="ftps://example.org/pub/f.tar.gz", title="f", filename="f.tar.gz")],
+        )
+        container.close()
+        result_list = container.get_ordered_results()
+        self.assertEqual(len(result_list), 1)
+        self.assertEqual(result_list[0].url, "ftps://example.org/pub/f.tar.gz")
+        self.assertEqual(result_list[0].parsed_url.scheme, "ftps")
+
+    def test_legacy_file_merge_prefers_ftps_scheme(self):
+        container = ResultContainer()
+        container.extend(
+            "google",
+            [dict(template="torrent.html", url="ftp://example.org/f.torrent", engine="google")],
+        )
+        container.extend(
+            "duckduckgo",
+            [dict(template="torrent.html", url="ftps://example.org/f.torrent", engine="duckduckgo")],
+        )
+        container.close()
+        result_list = container.get_ordered_results()
+        self.assertEqual(len(result_list), 1)
+        self.assertEqual(result_list[0].url, "ftps://example.org/f.torrent")
 
     def test_merge_prefers_original_https_url(self):
         # the engine-returned HTTPS URL is kept verbatim (here even with its

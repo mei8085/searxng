@@ -42,7 +42,9 @@ DEFAULT_RESULT_TEMPLATE = "default.html"
 
 # Query parameters that do not identify the resource and are commonly added by
 # analytics / link-tracking systems.  Only parameters whose meaning is
-# unambiguous are listed here in order not to merge different resources.
+# unambiguous are listed here in order not to merge different resources:
+# generic names such as "ref" or "referrer" are intentionally absent because
+# some sites use them as content-bearing parameters.
 TRACKING_QUERY_PARAMS = frozenset(
     [
         # Google Analytics / generic Urchin Tracking Module
@@ -57,7 +59,7 @@ TRACKING_QUERY_PARAMS = frozenset(
         "utm_referrer",
         "utm_social",
         "utm_social-type",
-        # Matomo
+        # Matomo / Piwik
         "mtm_cid",
         "mtm_keyword",
         "mtm_source",
@@ -72,19 +74,27 @@ TRACKING_QUERY_PARAMS = frozenset(
         # ad / social click identifiers
         "gclid",
         "gclsrc",
+        "gbraid",
+        "wbraid",
         "dclid",
         "fbclid",
+        "fb_action_ids",
         "msclkid",
         "yclid",
+        "twclid",
+        "ttclid",
+        "li_fat_id",
         "igshid",
         "mc_cid",
         "mc_eid",
+        "mkt_tok",
         "_hsenc",
         "_hsmi",
+        "hsctatracking",
+        "wickedid",
         "vero_conv",
         "vero_id",
-        "ref",
-        "referrer",
+        "_branch_match_id",
         "spm",
     ]
 )
@@ -110,6 +120,7 @@ _PERCENT_UNRESERVED.update({k.upper(): v for k, v in _PERCENT_UNRESERVED.items()
 
 
 def _is_tracking_query_param(name: str) -> bool:
+    name = name.lower()
     return name in TRACKING_QUERY_PARAMS or name.startswith("utm_")
 
 
@@ -204,7 +215,12 @@ def _query_identity(query: str) -> tuple:
       describe a different order of content and are not merged);
     - a bare parameter name (``a``) is different from an empty value
       (``a=``);
-    - equivalent percent-encodings of the same bytes are merged.
+    - equivalent percent-encodings of the same bytes are merged;
+    - ``&`` and ``;`` are both accepted as parameter separators;
+    - well-known tracking parameters are ignored (matched
+      case-insensitively);
+    - a query that contains only tracking parameters has the same identity
+      as an empty query.
     """
 
     if query == "":
@@ -212,9 +228,9 @@ def _query_identity(query: str) -> tuple:
 
     single: dict[str, str | None] = {}
     repeated: dict[str, list[str | None]] = {}
-    for piece in query.split("&"):
+    for piece in re.split(r"[&;]", query):
         if piece == "":
-            # a trailing/duplicate "&" carries no content
+            # a trailing/duplicate separator carries no content
             continue
         if "=" in piece:
             name, value = piece.split("=", 1)
@@ -231,6 +247,10 @@ def _query_identity(query: str) -> tuple:
             repeated[name_key].append(value_key)
         else:
             single[name_key] = value_key
+
+    if not single and not repeated:
+        # only tracking parameters were present
+        return ()
 
     single_items = tuple(sorted(single.items()))
     repeated_items = tuple(sorted((name, tuple(values)) for name, values in repeated.items()))
@@ -251,11 +271,13 @@ def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
     - the default port of a scheme is ignored;
     - percent-encoding is harmonized (upper-case hex, unreserved characters
       decoded) and ``.`` / ``..`` path segments are resolved;
-    - single-occurrence query parameters are order-insensitive; the order of
-      values of a repeated parameter name is preserved (see
-      :py:func:`_query_identity`), equivalent percent-encodings are merged
-      and well-known tracking parameters (``utm_*`` and click identifiers)
-      are ignored;
+    - single-occurrence query parameters are order-insensitive (``&`` and
+      ``;`` both separate parameters); the order of values of a repeated
+      parameter name is preserved (see :py:func:`_query_identity`),
+      equivalent percent-encodings are merged and well-known tracking
+      parameters (``utm_*`` and click identifiers, matched
+      case-insensitively) are ignored -- a tracking-only query has the
+      same identity as no query;
     - a literal ``+`` is never treated as an encoded space, so ``a+b`` and
       ``a%2Bb`` keep different query values.
 

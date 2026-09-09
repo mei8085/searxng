@@ -374,16 +374,20 @@ def merge_two_main_results(origin: MainResult | LegacyResult, other: MainResult 
     # add engine to list of result-engines
     origin.engines.add(other.engine or "")
 
-    # Prefer a link over HTTPS: if the other engine returned an original
-    # HTTPS URL for an equivalent resource, adopt that URL (and its parsed
-    # form) instead of synthesizing one by just swapping the scheme.  http
-    # and https are the only schemes that share an URL identity, see
-    # searx.result_types._base._url_identity_key.
-    if (
-        origin.parsed_url
-        and other.parsed_url
-        and origin.parsed_url.scheme == "http"
-        and other.parsed_url.scheme == "https"
-    ):
-        origin.parsed_url = other.parsed_url
-        origin.url = other.url or other.parsed_url.geturl()
+    if origin.parsed_url and other.parsed_url:
+
+        if origin.parsed_url.scheme == "http" and other.parsed_url.scheme == "https":
+            # For http/https equivalents prefer the original URL an engine
+            # returned over HTTPS instead of synthesizing one by just
+            # swapping the scheme (http and https share one URL identity,
+            # see searx.result_types._base._url_identity_key).
+            origin.parsed_url = other.parsed_url
+            origin.url = other.url or other.parsed_url.geturl()
+
+        elif not origin.parsed_url.scheme.endswith("s") and other.parsed_url.scheme.endswith("s"):
+            # use https, ftps, wss, .. if possible: upgrade the scheme on
+            # the original URL (this is in particular the behavior of
+            # non-default result types, e.g. file results on an ftp/ftps
+            # mirror).
+            origin.parsed_url = origin.parsed_url._replace(scheme=other.parsed_url.scheme)
+            origin.url = origin.parsed_url.geturl()
