@@ -1,0 +1,5 @@
+-r requirements.txt
+aiounittest==1.5.0
+mock==5.2.0
+nose2[coverage_plugin]==0.16.0
+parameterized==0.9.0

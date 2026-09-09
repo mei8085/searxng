@@ -27,3 +27,11 @@ searx/version_frozen.py
 .dir-locals.el
 
 .python-version
+
+# Local Python development environment and credentials
+.venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
