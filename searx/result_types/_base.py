@@ -34,6 +34,12 @@ from searx import logger as log
 WHITESPACE_REGEX = re.compile('( |\t|\n)+', re.M | re.U)
 UNSET = object()
 
+# template of ordinary web page results; only these use the canonical URL
+# identity (_url_identity_key) when detecting duplicates.  Other result
+# types (files, papers, torrents, maps, ..) keep their template-specific
+# / raw-URL based identity.
+DEFAULT_RESULT_TEMPLATE = "default.html"
+
 # Query parameters that do not identify the resource and are commonly added by
 # analytics / link-tracking systems.  Only parameters whose meaning is
 # unambiguous are listed here in order not to merge different resources.
@@ -166,6 +172,71 @@ def _remove_dot_segments(path: str) -> str:
     return "".join(out)
 
 
+def _normalize_query_component(value: str) -> str:
+    """Normalize the spelling of one query parameter name or value.
+
+    In a form-urlencoded query a literal ``+`` means a space (as does a
+    raw space / ``%20``), so these three spellings collapse to the same
+    value; the percent-encoded ``%2B`` (a real plus sign) stays distinct.
+    Apart from that, the same conservative rule as for paths applies:
+    percent-encodings of unreserved characters are decoded, hex digits are
+    upper-cased, but percent-encodings of reserved characters keep their
+    encoding boundary (``a/b`` and ``a%2Fb`` are not the same query).
+    Raw non-ASCII characters are UTF-8 percent-encoded.
+    """
+
+    value = value.replace("+", "%20")
+    result = _normalize_percent_encoding(value)
+    return "".join(
+        ch if ord(ch) < 128 else "".join(f"%{b:02X}" for b in ch.encode("utf-8"))
+        for ch in result
+    ).replace(" ", "%20")
+
+
+def _query_identity(query: str) -> tuple:
+    """Build an identity value for a query string that distinguishes real
+    content differences while ignoring purely cosmetic spelling:
+
+    - parameters may appear in any order *as long as every parameter name
+      occurs at most once*;
+    - if a parameter name occurs more than once, the values keep their
+      original order for that name (``tag=x&tag=y`` and ``tag=y&tag=x``
+      describe a different order of content and are not merged);
+    - a bare parameter name (``a``) is different from an empty value
+      (``a=``);
+    - equivalent percent-encodings of the same bytes are merged.
+    """
+
+    if query == "":
+        return ()
+
+    single: dict[str, str | None] = {}
+    repeated: dict[str, list[str | None]] = {}
+    for piece in query.split("&"):
+        if piece == "":
+            # a trailing/duplicate "&" carries no content
+            continue
+        if "=" in piece:
+            name, value = piece.split("=", 1)
+            value_key: str | None = _normalize_query_component(value)
+        else:
+            name, value_key = piece, None
+        name_key = _normalize_query_component(name)
+        if _is_tracking_query_param(name_key):
+            continue
+        if name_key in single:
+            bucket = repeated.setdefault(name_key, [single.pop(name_key)])
+            bucket.append(value_key)
+        elif name_key in repeated:
+            repeated[name_key].append(value_key)
+        else:
+            single[name_key] = value_key
+
+    single_items = tuple(sorted(single.items()))
+    repeated_items = tuple(sorted((name, tuple(values)) for name, values in repeated.items()))
+    return single_items, repeated_items
+
+
 def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
     """Build a conservative identity key for an URL.
 
@@ -180,9 +251,13 @@ def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
     - the default port of a scheme is ignored;
     - percent-encoding is harmonized (upper-case hex, unreserved characters
       decoded) and ``.`` / ``..`` path segments are resolved;
-    - query parameters are sorted (their order is ignored, including that
-      of repeated parameters) and well-known tracking parameters
-      (``utm_*`` and click identifiers) are ignored.
+    - single-occurrence query parameters are order-insensitive; the order of
+      values of a repeated parameter name is preserved (see
+      :py:func:`_query_identity`), equivalent percent-encodings are merged
+      and well-known tracking parameters (``utm_*`` and click identifiers)
+      are ignored;
+    - a literal ``+`` is never treated as an encoded space, so ``a+b`` and
+      ``a%2Bb`` keep different query values.
 
     Values that are not safe to normalize across the board (``www.``
     prefixes, trailing slashes on non-empty paths, fragments) are kept
@@ -228,9 +303,7 @@ def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
         # RFC 3986: an empty path is equivalent to "/" in an URI with authority
         path = "/"
 
-    query_pairs = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
-    query_pairs = [(k, v) for k, v in query_pairs if not _is_tracking_query_param(k)]
-    query = urllib.parse.urlencode(sorted(query_pairs), doseq=True)
+    query = _query_identity(parsed_url.query)
 
     fragment = _normalize_percent_encoding(parsed_url.fragment)
 
@@ -241,6 +314,22 @@ def _url_identity_key(parsed_url: urllib.parse.ParseResult) -> tuple:
         parsed_url.params,
         query,
         fragment,
+    )
+
+
+def _raw_url_identity_hash(template: str, parsed_url: urllib.parse.ParseResult, img_src: str) -> int:
+    """Identity of a non-ordinary result type (file, paper, torrent, map, ..).
+
+    Historically results were duplicates when their values for template,
+    the raw ``parsed_url`` components (except the scheme) and ``img_src``
+    were literally equal.  This spelling-sensitive behavior is kept for
+    every non-default template so result-type specific dedup is unchanged.
+    """
+
+    return hash(
+        f"{template}"
+        + f"|{parsed_url.netloc}|{parsed_url.path}|{parsed_url.params}|{parsed_url.query}|{parsed_url.fragment}"
+        + f"|{img_src}"
     )
 
 
@@ -612,16 +701,22 @@ class MainResult(Result):  # pylint: disable=missing-class-docstring
     category: str = ""
 
     def __hash__(self) -> int:
-        """Ordinary url-results are equal if their values for
-        :py:obj:`Result.template`, their canonical URL identity (see
-        :py:func:`_url_identity_key`, built from
-        :py:obj:`Result.parsed_url`) and :py:obj:`MainResult.img_src` are
-        equal.
+        """Ordinary web page results (``default.html`` template) are equal if
+        their :py:obj:`MainResult.img_src` and their canonical URL identity
+        (see :py:func:`_url_identity_key`, built from
+        :py:obj:`Result.parsed_url`) are equal.
+
+        Result types with their own template (files, papers, torrents, maps,
+        ..) keep the spelling-sensitive raw-URL identity
+        (:py:func:`_raw_url_identity_hash`) so their type specific behavior
+        is unchanged.
         """
         if not self.parsed_url:
             raise ValueError(f"missing a value in field 'parsed_url': {self}")
 
-        return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
+        if self.template == DEFAULT_RESULT_TEMPLATE:
+            return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
+        return _raw_url_identity_hash(self.template, self.parsed_url, self.img_src)
 
     def normalize_result_fields(self):
         super().normalize_result_fields()
@@ -736,15 +831,18 @@ class LegacyResult(dict[str, t.Any]):
             return hash(f"{self.template}|{self.url}|{self.img_src}")
 
         if not any(cls in self for cls in ["suggestion", "correction", "infobox", "number_of_results", "engine_data"]):
-            # Ordinary url-results are equal if their values for template,
-            # the canonical URL identity (`_url_identity_key`, ignoring
-            # cosmetic spelling differences) and `img_src` are equal.
+            # Ordinary web page results (default.html template) use the
+            # canonical URL identity (`_url_identity_key`, ignoring cosmetic
+            # spelling differences); results with their own template (file,
+            # paper, torrent, map, ..) keep the spelling-sensitive raw-URL
+            # identity (`_raw_url_identity_hash`).
 
-            # Code copied from with MainResult.__hash__:
             if not self.parsed_url:
                 raise ValueError(f"missing a value in field 'parsed_url': {self}")
 
-            return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
+            if self.template == DEFAULT_RESULT_TEMPLATE:
+                return hash((self.template, _url_identity_key(self.parsed_url), self.img_src))
+            return _raw_url_identity_hash(self.template, self.parsed_url, self.img_src)
 
         return id(self)
 

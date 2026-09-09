@@ -4,7 +4,7 @@
 
 from urllib.parse import urlparse
 
-from searx.result_types import LegacyResult, MainResult
+from searx.result_types import LegacyResult, MainResult, File
 from searx.result_types._base import _url_identity_key
 from searx.results import ResultContainer
 from tests import SearxTestCase
@@ -68,6 +68,34 @@ class URLIdentityKeyTestCase(SearxTestCase):
     def test_query_parameter_order(self):
         self.assertSameIdentity("https://example.org/p?b=2&a=1", "https://example.org/p?a=1&b=2")
         self.assertSameIdentity("https://example.org/p?q=a+b", "https://example.org/p?q=a%20b")
+        self.assertSameIdentity("https://example.org/p?q=a%20b", "https://example.org/p?q=a+b")
+
+    def test_query_bare_name_and_blank_value(self):
+        # a bare name, a blank value and a missing parameter are three
+        # different things and must not collapse into one another
+        self.assertSameIdentity("http://h/?a&b=1", "http://h/?b=1&a")
+        self.assertDifferentIdentity("http://h/?a", "http://h/?a=")
+        self.assertDifferentIdentity("http://h/?a", "http://h/")
+        self.assertDifferentIdentity("http://h/?a=", "http://h/")
+
+    def test_repeated_parameters_order_is_significant(self):
+        self.assertDifferentIdentity("http://h/?tag=x&tag=y", "http://h/?tag=y&tag=x")
+        # the same values repeated in the same order are still equivalent
+        self.assertSameIdentity("http://h/?tag=x&tag=y&a=1", "http://h/?a=1&tag=x&tag=y")
+
+    def test_query_value_encoding(self):
+        # form-encoded space ('+' / '%20') spellings are equivalent, a real
+        # plus sign ('%2B') is different content
+        self.assertDifferentIdentity("http://h/?q=a+b", "http://h/?q=a%2Bb")
+        self.assertSameIdentity("http://h/?q=%41", "http://h/?q=A")
+        self.assertSameIdentity("http://h/?q=%C3%A9", "http://h/?q=%c3%a9")
+        # different percent-encoded bytes are different content
+        self.assertDifferentIdentity("http://h/?q=%ff", "http://h/?q=%fe")
+        # encodings of reserved characters keep their boundary
+        self.assertDifferentIdentity("http://h/?q=a/b", "http://h/?q=a%2Fb")
+        self.assertDifferentIdentity("http://h/?q=a;", "http://h/?q=a%3B")
+        # raw non-ASCII characters are compared by their UTF-8 bytes
+        self.assertSameIdentity("http://h/?q=é", "http://h/?q=%C3%A9")
 
     def test_tracking_parameters_ignored(self):
         self.assertSameIdentity(
@@ -216,6 +244,66 @@ class ResultContainerTestCase(SearxTestCase):
 
     def test_no_merge_different_hosts(self):
         self._assert_not_merged("https://example.org/a", "https://www.example.org/a")
+
+    def test_no_merge_different_query_values(self):
+        self._assert_not_merged("https://example.org/p?a=1", "https://example.org/p?a=2")
+
+    def test_no_merge_repeated_parameter_order(self):
+        self._assert_not_merged(
+            "https://example.org/p?tag=x&tag=y", "https://example.org/p?tag=y&tag=x"
+        )
+
+    def test_no_merge_bare_name_and_blank_value(self):
+        self._assert_not_merged("https://example.org/p?a", "https://example.org/p?a=")
+
+    def test_no_merge_plus_and_percent_2b(self):
+        self._assert_not_merged("https://example.org/p?q=a+b", "https://example.org/p?q=a%2Bb")
+
+    def test_non_default_template_keeps_raw_url_identity(self):
+        # file results only merge on literally identical URL spellings; a
+        # different query parameter order must stay two results
+        container = ResultContainer()
+        container.extend(
+            "google",
+            [File(url="https://example.org/f.pdf?b=2&a=1", title="f", filename="f.pdf")],
+        )
+        container.extend(
+            "duckduckgo",
+            [File(url="https://example.org/f.pdf?a=1&b=2", title="f", filename="f.pdf")],
+        )
+        container.close()
+        self.assertEqual(len(container.get_ordered_results()), 2)
+
+    def test_non_default_legacy_template_keeps_raw_url_identity(self):
+        container = ResultContainer()
+        container.extend(
+            "google",
+            [dict(template="torrent.html", url="https://example.org/t?b=2&a=1", engine="google")],
+        )
+        container.extend(
+            "duckduckgo",
+            [dict(template="torrent.html", url="https://example.org/t?a=1&b=2", engine="duckduckgo")],
+        )
+        container.close()
+        self.assertEqual(len(container.get_ordered_results()), 2)
+
+    def test_non_default_template_still_merges_identical_url(self):
+        # exactly identical raw URLs still merge, and the original HTTPS URL
+        # is preferred over HTTP
+        container = ResultContainer()
+        container.extend(
+            "google",
+            [File(url="http://example.org/f.pdf", title="f", filename="f.pdf")],
+        )
+        container.extend(
+            "duckduckgo",
+            [File(url="https://example.org/f.pdf", title="f", filename="f.pdf")],
+        )
+        container.close()
+        result_list = container.get_ordered_results()
+        self.assertEqual(len(result_list), 1)
+        self.assertEqual(result_list[0].url, "https://example.org/f.pdf")
+        self.assertEqual(set(result_list[0].engines), {"google", "duckduckgo"})
 
     def test_merge_prefers_original_https_url(self):
         # the engine-returned HTTPS URL is kept verbatim (here even with its
